@@ -51,12 +51,65 @@ full_calendar_grid = pd.date_range(start_date, end_date)
 # print(df["sales"].max())
 
 agg_by_dates = df.groupby(["date"])
-print(agg_by_dates["sales"].sum().idxmax())
+summed = agg_by_dates["sales"].sum()
+# print(summed.idxmax())
+# print(summed.head())
 
-print(df["sales"].describe(percentiles=[0.1, 0.5, 0.9, 0.95, 0.99]))
+print(summed.head(1347))
+print(summed.tail(337))
 
-max_sales = df["sales"].max()
-print(max_sales)
+mid_march_2017 = pd.Timestamp("2017-03-15")
+mid_april_2017 = pd.Timestamp("2017-04-15")
 
-mask = df["sales"] == max_sales
-print(df[mask])
+# mask = (summed.index >= mid_march_2017) & (summed.index <= mid_april_2017)
+# print(summed[mask])
+
+onprom_sum = agg_by_dates["onpromotion"].sum()
+# mask = onprom_sum.index == pd.Timestamp("2017-04-01")
+
+# store = df["store_nbr"] == 33
+# print(df[store].describe())
+
+
+# print(df["sales"].describe(percentiles=[0.1, 0.5, 0.9, 0.95, 0.99]))
+
+# max_sales = df["sales"].max()
+# print(max_sales)
+
+# mask = df["sales"] == max_sales
+# print(df[mask])
+
+# x = df["sales"].nsmallest(n=10)
+# mask = df["sales"].isin(x)
+# print(df[mask])
+
+TRAIN_END = pd.Timestamp("2016-03-27")  # train     = [ ...            , TRAIN_END ]
+VALID_END = pd.Timestamp("2016-09-11")  # valid     = ( TRAIN_END      , VALID_END ]
+# local test = ( VALID_END     , ... ]
+
+train_mask = df["date"] <= TRAIN_END
+valid_mask = (df["date"] > TRAIN_END) & (df["date"] <= VALID_END)
+local_test_mask = df["date"] > VALID_END
+
+predicted_share = {"train": 0.70, "valid": 0.10, "local_test": 0.20}
+
+for name, mask in [
+    ("train", train_mask),
+    ("valid", valid_mask),
+    ("local_test", local_test_mask),
+]:
+    block = df.loc[mask]
+    share = len(block) / len(df)
+    print(
+        f"{name:<10}",
+        "rows:",
+        len(block),
+        "share:",
+        f"{share:.1%}",
+        "dates:",
+        block["date"].min().date(),
+        "..",
+        block["date"].max().date(),
+    )
+
+assert (train_mask.astype(int) + valid_mask.astype(int) + local_test_mask.astype(int)).eq(1).all()
