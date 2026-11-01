@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
@@ -55,8 +58,8 @@ summed = agg_by_dates["sales"].sum()
 # print(summed.idxmax())
 # print(summed.head())
 
-print(summed.head(1347))
-print(summed.tail(337))
+# print(summed.head(1347))
+# print(summed.tail(337))
 
 mid_march_2017 = pd.Timestamp("2017-03-15")
 mid_april_2017 = pd.Timestamp("2017-04-15")
@@ -91,8 +94,6 @@ train_mask = df["date"] <= TRAIN_END
 valid_mask = (df["date"] > TRAIN_END) & (df["date"] <= VALID_END)
 local_test_mask = df["date"] > VALID_END
 
-predicted_share = {"train": 0.70, "valid": 0.10, "local_test": 0.20}
-
 for name, mask in [
     ("train", train_mask),
     ("valid", valid_mask),
@@ -113,3 +114,67 @@ for name, mask in [
     )
 
 assert (train_mask.astype(int) + valid_mask.astype(int) + local_test_mask.astype(int)).eq(1).all()
+
+saves_dir = Path("splits")
+saves_dir.mkdir(exist_ok=True)
+
+# Clean-frame save: the typed whole file, so future missions load parquet
+# instead of re-reading train.csv with the dtype dict every run.
+df.to_parquet(saves_dir / "frame_full.parquet", index=False)
+back_full = pd.read_parquet(saves_dir / "frame_full.parquet")
+assert len(back_full) == len(df)
+assert back_full.dtypes.equals(df.dtypes)
+print(
+    "saved",
+    "frame_full ",
+    "rows:",
+    len(back_full),
+    "| dtypes:",
+    list(back_full.dtypes),
+    "->",
+    saves_dir / "frame_full.parquet",
+)
+
+blocks = {
+    "train": df.loc[train_mask],
+    "valid": df.loc[valid_mask],
+    "local_test": df.loc[local_test_mask],
+}
+
+for name, block in blocks.items():
+    block.to_parquet(saves_dir / f"{name}.parquet", index=False)
+    back = pd.read_parquet(saves_dir / f"{name}.parquet")
+    assert len(back) == len(block)
+    assert back["date"].min() == block["date"].min()
+    assert back["date"].max() == block["date"].max()
+    assert back.dtypes.equals(block.dtypes)
+    print(
+        "saved",
+        f"{name:<10}",
+        "rows:",
+        len(block),
+        "| dtypes:",
+        list(back.dtypes),
+        "->",
+        saves_dir / f"{name}.parquet",
+    )
+
+manifest = {
+    "created": pd.Timestamp.now().isoformat(),
+    "rounding_choice": "raw date boundaries are (2016-03-28, 2016-09-12), and not month borders",
+    "bounds": {
+        name: [str(block["date"].min().date()), str(block["date"].max().date())]
+        for name, block in blocks.items()
+    },
+    "rows": {name: len(block) for name, block in blocks.items()},
+    "total": len(df),
+    "shares": {name: f"{len(block) / len(df):.1%}" for name, block in blocks.items()},
+    "why": {
+        "train": "oldest 70% of dates, fits the model",
+        "valid": "next 10% in time, tunes it",
+        "local_test": "newest 20%, scored once after the design is frozen; never tuned on, and the submission model retrains on all 1,684 dates post-freeze",
+    },
+    "naming_rule": "local_test is not the competition's test.csv",
+}
+(saves_dir / "split_manifest.json").write_text(json.dumps(manifest, indent=2))
+print("saved split_manifest.json ->", saves_dir / "split_manifest.json")

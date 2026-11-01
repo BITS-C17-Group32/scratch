@@ -1,0 +1,35 @@
+{
+  "created": "2026-11-01T16:01:38.636157",
+  "rounding_choice": "raw date boundaries are (2016-03-28, 2016-09-12), and not month borders",
+  "bounds": {
+    "train": [
+      "2013-01-01",
+      "2016-03-27"
+    ],
+    "valid": [
+      "2016-03-28",
+      "2016-09-11"
+    ],
+    "local_test": [
+      "2016-09-12",
+      "2017-08-15"
+    ]
+  },
+  "rows": {
+    "train": 2100978,
+    "valid": 299376,
+    "local_test": 600534
+  },
+  "total": 3000888,
+  "shares": {
+    "train": "70.0%",
+    "valid": "10.0%",
+    "local_test": "20.0%"
+  },
+  "why": {
+    "train": "oldest 70% of dates, fits the model",
+    "valid": "next 10% in time, tunes it",
+    "local_test": "newest 20%, scored once after the design is frozen; never tuned on, and the submission model retrains on all 1,684 dates post-freeze"
+  },
+  "naming_rule": "local_test is not the competition's test.csv; that file holds the 16 future days with hidden sales"
+}
