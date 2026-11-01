@@ -51,4 +51,12 @@ full_calendar_grid = pd.date_range(start_date, end_date)
 # print(df["sales"].max())
 
 agg_by_dates = df.groupby(["date"])
-print(agg_by_dates["sales"].sum())
+print(agg_by_dates["sales"].sum().idxmax())
+
+print(df["sales"].describe(percentiles=[0.1, 0.5, 0.9, 0.95, 0.99]))
+
+max_sales = df["sales"].max()
+print(max_sales)
+
+mask = df["sales"] == max_sales
+print(df[mask])
