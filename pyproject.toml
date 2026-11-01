@@ -5,6 +5,7 @@ requires-python = ">=3.12,<3.14"
 dependencies = [
     "numpy>=2.0",
     "pandas>=2.2",
+    "pyarrow>=26.0.0",
 ]
 
 [tool.basedpyright]
