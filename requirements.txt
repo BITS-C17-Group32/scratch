@@ -10,7 +10,7 @@ python-dateutil==3.0.0
     # via pandas
 six==1.17.0
     # via python-dateutil
-tzdata==2026.6
+tzdata==2026.5
     # via
     #   pandas
     #   python-dateutil
