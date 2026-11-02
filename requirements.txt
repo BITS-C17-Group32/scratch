@@ -9,7 +9,7 @@ pandas==3.1.0
     # via demand-forecasting-lstm
 pandas-stubs==3.1.0.261029
     # via demand-forecasting-lstm
-pyarrow==26.0.0
+pyarrow==25.0.1
     # via demand-forecasting-lstm
 python-dateutil==3.0.0
     # via pandas
