@@ -1,7 +1,7 @@
 import pandas as pd
 
-# Parse dates as timestamps. The 'type' values repeat, so a category can store
-# them as codes instead of repeating the same strings in every row.
+# Parse dates as timestamps. Storing repeated 'type' strings as categorical
+# codes reduces memory usage.
 # Ref: https://pandas.pydata.org/docs/reference/api/pandas.read_csv.html
 df = pd.read_csv(
     "holidays_events.csv",
@@ -32,9 +32,9 @@ dates = [
 # Ref: https://pandas.pydata.org/docs/reference/api/pandas.Series.isin.html
 dates_bool = df["date"].isin(dates)
 
-# Non-empty strings are truthy, so bool("True") is True. This is equivalent to
-# dates_bool directly: .isin([True]) keeps rows whose date matched the list.
+# Non-empty strings are truthy, so bool("True") evaluates to True; .isin([True])
+# filters for rows where dates_bool is True.
 mask = dates_bool.isin([bool("True")])
 
-# Display only the holiday records matching the target dates mask.
+# Display holiday records matching the target dates mask.
 print(df[mask])

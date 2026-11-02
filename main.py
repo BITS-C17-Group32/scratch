@@ -47,8 +47,8 @@ grouped_family = df.groupby(["family", "store_nbr"])
 # print(grouped_family["date"].nunique().describe())
 
 # Set up a date/store grouping for the optional diagnostics below.
-groupedAgain = df.groupby(["date", "store_nbr"])
-# print(groupedAgain.size().describe())
+grouped_date_store = df.groupby(["date", "store_nbr"])
+# print(grouped_date_store.size().describe())
 
 # Compare observed dates with a complete daily calendar to find gaps.
 dates_from_file = pd.DatetimeIndex(df["date"])
@@ -87,7 +87,6 @@ onprom_sum = agg_by_dates["onpromotion"].sum()
 # store = df["store_nbr"] == 33
 # print(df[store].describe())
 
-
 # print(df["sales"].describe(percentiles=[0.1, 0.5, 0.9, 0.95, 0.99]))
 
 # max_sales = df["sales"].max()
@@ -114,7 +113,8 @@ train_mask = df["date"] <= TRAIN_END
 valid_mask = (df["date"] > TRAIN_END) & (df["date"] <= VALID_END)
 local_test_mask = df["date"] > VALID_END
 
-# Iterate over each split mask to report row counts, dataset percentage shares, and date ranges.
+# Iterate over each split mask to report row counts, dataset percentage
+# shares, and date ranges.
 for name, mask in [
     ("train", train_mask),
     ("valid", valid_mask),
@@ -136,7 +136,9 @@ for name, mask in [
 
 # Each row must belong to exactly one split. Boolean masks become 0/1, so their
 # row-wise sum must be 1 (no overlap and no omitted rows).
-assert (train_mask.astype(int) + valid_mask.astype(int) + local_test_mask.astype(int)).eq(1).all()
+assert (
+    train_mask.astype(int) + valid_mask.astype(int) + local_test_mask.astype(int)
+).eq(1).all()
 
 # Ensure the output directory for serialized partitions exists.
 saves_dir = Path("splits")
@@ -192,7 +194,9 @@ for name, block in blocks.items():
 # Document split metadata, partition boundaries, row proportions, and design rationale.
 manifest = {
     "created": pd.Timestamp.now().isoformat(),
-    "rounding_choice": "raw date boundaries are (2016-03-28, 2016-09-12), and not month borders",
+    "rounding_choice": (
+        "raw date boundaries are (2016-03-28, 2016-09-12), and not month borders"
+    ),
     "bounds": {
         name: [str(block["date"].min().date()), str(block["date"].max().date())]
         for name, block in blocks.items()
@@ -203,7 +207,10 @@ manifest = {
     "why": {
         "train": "oldest 70% of dates, fits the model",
         "valid": "next 10% in time, tunes it",
-        "local_test": "newest 20%, scored once after the design is frozen; never tuned on, and the submission model retrains on all 1,684 dates post-freeze",
+        "local_test": (
+            "newest 20%, scored once after the design is frozen; never tuned on, "
+            "and the submission model retrains on all 1,684 dates post-freeze"
+        ),
     },
     "naming_rule": "local_test is not the competition's test.csv",
 }
