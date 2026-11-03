@@ -4,7 +4,7 @@ import pandas as pd
 # codes reduces memory usage.
 # Ref: https://pandas.pydata.org/docs/reference/api/pandas.read_csv.html
 df = pd.read_csv(
-    "rawdata/holidays_events.csv",
+    "data/raw/holidays_events.csv",
     parse_dates=["date"],
     dtype={
         "type": "category",

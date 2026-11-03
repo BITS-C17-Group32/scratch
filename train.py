@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 
 train_df = pd.read_csv(
-    "rawdata/train.csv",
+    "data/raw/train.csv",
     parse_dates=["date"],
     dtype={
         "store_nbr": np.int8,

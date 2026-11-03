@@ -14,7 +14,7 @@ import pandas as pd
 # usecols keeps columns 1-5 and skips the unused sequential ID column.
 # Ref: https://pandas.pydata.org/docs/reference/api/pandas.read_csv.html
 df = pd.read_csv(
-    "rawdata/train.csv",
+    "data/raw/train.csv",
     parse_dates=["date"],
     dtype={
         "store_nbr": np.int8,

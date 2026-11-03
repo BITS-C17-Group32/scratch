@@ -2,7 +2,7 @@
 import pandas as pd
 import numpy as np
 
-oil_df = pd.read_csv("rawdata/oil.csv", parse_dates=['date'], dtype={'dcoilwtico': np.float32})
+oil_df = pd.read_csv("data/raw/oil.csv", parse_dates=['date'], dtype={'dcoilwtico': np.float32})
 
 #2013-01-01 00:00:00
 #2017-08-31 00:00:00
