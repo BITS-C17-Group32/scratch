@@ -5,7 +5,7 @@ import pandas as pd
 # memory usage.
 # Ref: https://pandas.pydata.org/docs/reference/api/pandas.read_csv.html
 df = pd.read_csv(
-    "transactions.csv",
+    "rawdata/transactions.csv",
     parse_dates=["date"],
     dtype={
         "store_nbr": np.int8,
