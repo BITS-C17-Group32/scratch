@@ -9,9 +9,35 @@ dependencies = [
     "pyarrow>=25.0.1",
 ]
 
+# Dev tooling shared by all teammates. uv installs this group automatically
+# with `uv sync`. pip users: `pip install -r requirements-dev.txt`.
+[dependency-groups]
+dev = [
+    "ruff>=0.17.3,<0.18",
+]
+
 [tool.basedpyright]
 typeCheckingMode = "strict"
 reportUnknownArgumentType = false
 reportUnknownMemberType = false
 reportUnknownVariableType = false
 reportAny = false
+
+# Ruff: the de-facto standard for Python lint+format (Black-compatible).
+# One config, shared by IDEs, CLI, and CI. Docs: https://docs.astral.sh/ruff
+# line-length matches the current codebase (lines run up to ~98 chars);
+# set to 88 for strict Black parity.
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.format]
+quote-style = "double"
+docstring-code-format = true
+
+[tool.ruff.lint]
+# E/W pycodestyle, F pyflakes, I isort, UP pyupgrade, B bugbear, C4 comprehensions, RUF ruff-specific
+select = ["E", "W", "F", "I", "UP", "B", "C4", "RUF"]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
