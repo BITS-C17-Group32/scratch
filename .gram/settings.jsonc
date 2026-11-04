@@ -1,0 +1,15 @@
+// Gram's project settings (jsonc). Ruff formats and lints via `ruff server`,
+// reading pyproject.toml [tool.ruff]. Same Python config as .zed/settings.json.
+{
+  "languages": {
+    "Python": {
+      "format_on_save": "on",
+      "formatter": {
+        "language_server": { "name": "ruff" }
+      },
+      "code_actions_on_format": {
+        "source.organizeImports.ruff": true
+      }
+    }
+  }
+}
