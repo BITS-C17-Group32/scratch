@@ -68,9 +68,6 @@ df["is_holiday"] = (
     df["is_national_holiday"] | df["is_regional_holiday"] | df["is_local_holiday"]
 ).astype(int)
 
-for col in ("is_national_holiday", "is_regional_holiday", "is_local_holiday"):
-    assert df[col].sum() > 0, f"{col} sum is unexpectedly zero!"
-
 print(df.columns)
 
 df = df.sort_values(by=["store_nbr", "family", "date"], kind="mergesort").reset_index(drop=True)
@@ -100,3 +97,31 @@ df["earthquake_decay"] = np.where(
 )
 
 print(df.columns)
+
+for col in [
+    "is_national_holiday",
+    "is_national_holiday_tomorrow",
+    "is_national_holiday_in_2days",
+    "is_regional_holiday",
+    "is_regional_holiday_tomorrow",
+    "is_regional_holiday_in_2days",
+    "is_local_holiday",
+    "is_local_holiday_tomorrow",
+    "is_local_holiday_in_2days",
+    "is_holiday",
+    "is_holiday_tomorrow",
+    "is_holiday_in_2days",
+    "is_event",
+    "is_earthquake_impact_window",
+]:
+    assert df[col].sum() > 0, f"{col} sum is unexpectedly zero!"
+    assert df[col].isna().sum() == 0, f"{col} sum has NaN values!"
+    assert df[col].isin([0, 1]).all(), f"{col} has non-binary values!"
+
+assert (
+    df["is_holiday"]
+    == (df["is_national_holiday"] | df["is_regional_holiday"] | df["is_local_holiday"])
+).all(), "is_holiday does not match the scope union!"
+
+assert df["earthquake_decay"].max() == 1.0
+assert df["earthquake_decay"].min() == 0.0
