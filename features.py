@@ -73,15 +73,15 @@ for col in ("is_national_holiday", "is_regional_holiday", "is_local_holiday"):
 
 print(df.columns)
 
-# holiday lead feature (National + Regional + Local)
-for scope in ["national", "regional", "local"]:
-    df[f"is_{scope}_holiday_tomorrow"] = (
-        df.groupby(["store_nbr", "family"])[f"is_{scope}_holiday"].shift(-1).fillna(0).astype(int)
-    )
+df = df.sort_values(by=["store_nbr", "family", "date"], kind="mergesort").reset_index(drop=True)
 
-for scope in ["national", "regional", "local"]:
-    df[f"is_{scope}_holiday_in_2days"] = (
-        df.groupby(["store_nbr", "family"])[f"is_{scope}_holiday"].shift(-2).fillna(0).astype(int)
+# holiday lead feature (National + Regional + Local + (any) Holiday)
+for col in ["national_holiday", "regional_holiday", "local_holiday", "holiday"]:
+    df[f"is_{col}_tomorrow"] = (
+        df.groupby(["store_nbr", "family"])[f"is_{col}"].shift(-1).fillna(0).astype(int)
+    )
+    df[f"is_{col}_in_2days"] = (
+        df.groupby(["store_nbr", "family"])[f"is_{col}"].shift(-2).fillna(0).astype(int)
     )
 
 # EARTHQUAKE IMPACT FEATURES
