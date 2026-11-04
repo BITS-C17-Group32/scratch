@@ -51,6 +51,22 @@ df["is_holiday"] = (
 
 print(df.columns)
 
+# EARTHQUAKE IMPACT FEATURES
 
+earthquake_date = pd.to_datetime("2016-04-16")
+#Binary indicator for the immediate high-impact relief window (4 weeks following)
+df["is_earthquake_impact_window"] = (
+    (df["date"] >= earthquake_date)
+    & (df["date"] <= earthquake_date + pd.Timedelta(days=28))
+).astype(int)
+
+# Continuous decay feature (captures fading impact intensity)
+# Value starts at 1 on the earthquake day and linearly decays to 0 over 30 days
+days_since_eq = (df["date"] - earthquake_date).dt.days
+df["earthquake_decay"] = np.where(
+    (days_since_eq >= 0) & (days_since_eq <= 30), 1 - (days_since_eq / 30), 0
+)
+
+print(df.columns)
 
 
