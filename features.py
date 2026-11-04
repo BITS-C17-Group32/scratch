@@ -23,6 +23,11 @@ holidays = holidays[~holidays["transferred"]].copy()
 # or this
 # holidays = holidays[holidays["transferred"].eq(False)].copy()
 
+events_dates = set(holidays[holidays["type"].eq("Event")]["date"])
+
+holidays_filter = holidays["type"].isin(["Holiday", "Transfer", "Additional", "Bridge"])
+holidays = holidays[holidays_filter]
+
 # sorting holidays
 national_holidays = holidays[holidays["locale"] == "National"].copy()
 regional_holidays = holidays[holidays["locale"] == "Regional"].copy()
@@ -31,6 +36,8 @@ local_holidays = holidays[holidays["locale"] == "Local"].copy()
 # Merge store data into train set
 df = train.merge(stores, on="store_nbr", how="left")
 print(df.columns)
+
+df["is_event"] = df["date"].isin(events_dates).astype(int)
 
 # Map National Holidays
 national_dates = set(national_holidays["date"])
