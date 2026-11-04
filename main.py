@@ -22,7 +22,7 @@ df = pd.read_csv(
         "sales": np.float32,
         "onpromotion": np.uint16,
     },
-    usecols=[1, 2, 3, 4, 5],
+    usecols=["date", "store_nbr", "family", "sales", "onpromotion"],
 )
 # print("The dtyped One:")
 # print(df.shape)

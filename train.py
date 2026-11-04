@@ -13,7 +13,7 @@ def clean_train_data():
             "sales": np.float32,
             "onpromotion": np.uint16,
         },
-        usecols=[1, 2, 3, 4, 5],
+        usecols=["date", "store_nbr", "family", "sales", "onpromotion"],
     )
 
     # Identify unique stores, families, and complete date range
