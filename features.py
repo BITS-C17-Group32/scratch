@@ -68,6 +68,9 @@ df["is_holiday"] = (
     df["is_national_holiday"] | df["is_regional_holiday"] | df["is_local_holiday"]
 ).astype(int)
 
+for col in ("is_national_holiday", "is_regional_holiday", "is_local_holiday"):
+    assert df[col].sum() > 0, f"{col} sum is unexpectedly zero!"
+
 print(df.columns)
 
 # holiday lead feature (National + Regional + Local)
