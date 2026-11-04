@@ -51,6 +51,23 @@ df["is_holiday"] = (
 
 print(df.columns)
 
+# holiday lead feature (National + Regional + Local)
+for scope in ["national", "regional", "local"]:
+    df[f"is_{scope}_holiday_tomorrow"] = (
+        df.groupby(["store_nbr", "family"])[f"is_{scope}_holiday"]
+        .shift(-1)
+        .fillna(0)
+        .astype(int)
+    )
+
+for scope in ["national", "regional", "local"]:
+    df[f"is_{scope}_holiday_in_2days"] = (
+        df.groupby(["store_nbr", "family"])[f"is_{scope}_holiday"]
+        .shift(-2)
+        .fillna(0)
+        .astype(int)
+    )
+
 # EARTHQUAKE IMPACT FEATURES
 
 earthquake_date = pd.to_datetime("2016-04-16")
@@ -68,5 +85,7 @@ df["earthquake_decay"] = np.where(
 )
 
 print(df.columns)
+
+
 
 
