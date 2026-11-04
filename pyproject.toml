@@ -25,10 +25,9 @@ reportAny = false
 
 # Ruff: the de-facto standard for Python lint+format (Black-compatible).
 # One config, shared by IDEs, CLI, and CI. Docs: https://docs.astral.sh/ruff
-# line-length matches the current codebase (lines run up to ~98 chars);
-# set to 88 for strict Black parity.
+# 88 is Black's line length; ruff format matches it exactly.
 [tool.ruff]
-line-length = 100
+line-length = 88
 target-version = "py312"
 
 [tool.ruff.format]
