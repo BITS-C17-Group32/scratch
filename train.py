@@ -16,7 +16,7 @@ def clean_train_data():
             "store_nbr": np.int8,
             "family": "category",
             "sales": np.float32,
-            "onpromotion": np.uint32,
+            "onpromotion": np.uint16,
         },
     )
 
@@ -49,6 +49,10 @@ def clean_train_data():
     contiguous_train["onpromotion"] = (
         contiguous_train["onpromotion"].fillna(0).astype(np.uint16)
     )
+
+    # Raw CSV column max is far below the uint16 ceiling; assert it so a
+    # future refresh fails loudly instead of silently wrapping.
+    assert contiguous_train["onpromotion"].max() <= np.iinfo(np.uint16).max
 
     # Sort chronologically to preserve time sequence integrity
     contiguous_train = contiguous_train.sort_values(
