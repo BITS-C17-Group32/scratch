@@ -18,7 +18,7 @@ def load_stores() -> pd.DataFrame:
             "city": "category",
             "state": "category",
             "type": "category",
-            "cluster": "category",
+            "cluster": np.int8,
         },
     ).rename(columns={"type": "store_type"})
 
@@ -190,7 +190,7 @@ def build_features() -> pd.DataFrame:
     # was considered and deferred.
     # This is an a-priori shape from the published post-disaster response
     # (Figueroa 2020 ICEDEG; Abe 2014 DP14-1), not an empirically fitted decay.
-    # The competing binary window (F6) was a nested threshold of this one and was removed.
+    # The competing binary window was a nested threshold of this one and was removed.
     # This feature is zero for the whole August 2017 forecast horizon by construction.
     days_since_eq = (df["date"] - earthquake_date).dt.days
     df["earthquake_decay"] = np.where(
