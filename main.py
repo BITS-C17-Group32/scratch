@@ -206,8 +206,13 @@ manifest = {
         "valid": "next 10% in time, tunes it",
         "local_test": (
             "newest 20%, scored once after the design is frozen; never tuned on, "
-            "and the submission model retrains on all 1,684 dates post-freeze"
+            "and the submission model retrains on all 1,688 dates post-freeze"
         ),
+        "universe": (
+            "balanced grid: 1,688 dates x 54 stores x 33 families = 3,008,016 rows; "
+            "four Christmas closure days carry sales=0 with id=NA"
+        ),
+        "grid_fill_rows": {"train": 5346, "valid": 0, "local_test": 1782},
     },
     "naming_rule": "local_test is not the competition's test.csv",
 }
