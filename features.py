@@ -1,12 +1,18 @@
 import numpy as np
 import pandas as pd
 
+from pathlib import Path
+
 from train import clean_train_data
+
+REPO_ROOT = Path(__file__).resolve().parent
+RAW = REPO_ROOT / "data" / "raw"
+OUT_FRAME = REPO_ROOT / "splits" / "frame_features.parquet"
 
 
 def load_stores() -> pd.DataFrame:
     return pd.read_csv(
-        "data/raw/stores.csv",
+        RAW / "stores.csv",
         dtype={
             "store_nbr": np.int8,
             "city": "category",
@@ -19,7 +25,7 @@ def load_stores() -> pd.DataFrame:
 
 def load_holidays() -> pd.DataFrame:
     return pd.read_csv(
-        "data/raw/holidays_events.csv",
+        RAW / "holidays_events.csv",
         dtype={
             "type": "category",
             "locale": "category",
@@ -247,7 +253,8 @@ def build_features() -> pd.DataFrame:
 
 
 def main() -> None:
-    build_features()
+    df = build_features()
+    df.to_parquet(OUT_FRAME, index=False)
 
 
 if __name__ == "__main__":

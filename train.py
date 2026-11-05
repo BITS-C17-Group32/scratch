@@ -1,11 +1,15 @@
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
+
+ROOT = Path(__file__).resolve().parent
 
 
 def clean_train_data():
 
     train_df = pd.read_csv(
-        "data/raw/train.csv",
+        ROOT / "data" / "raw" / "train.csv",
         parse_dates=["date"],
         dtype={
             "id": "UInt32",
