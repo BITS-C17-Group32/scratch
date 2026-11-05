@@ -136,7 +136,11 @@ for name, mask in [
 
 # Each row must belong to exactly one split. Boolean masks become 0/1, so their
 # row-wise sum must be 1 (no overlap and no omitted rows).
-assert (train_mask.astype(int) + valid_mask.astype(int) + local_test_mask.astype(int)).eq(1).all()
+assert (
+    (train_mask.astype(int) + valid_mask.astype(int) + local_test_mask.astype(int))
+    .eq(1)
+    .all()
+)
 
 # Ensure the output directory for serialized partitions exists.
 saves_dir = Path("splits")
@@ -192,7 +196,9 @@ for name, block in blocks.items():
 # Document split metadata, partition boundaries, row proportions, and design rationale.
 manifest = {
     "created": pd.Timestamp.now().isoformat(),
-    "rounding_choice": ("raw date boundaries are (2016-03-28, 2016-09-12), and not month borders"),
+    "rounding_choice": (
+        "raw date boundaries are (2016-03-28, 2016-09-12), and not month borders"
+    ),
     "bounds": {
         name: [str(block["date"].min().date()), str(block["date"].max().date())]
         for name, block in blocks.items()

@@ -1,0 +1,13 @@
+{
+  // Ruff formats and lints Python on save; config lives in pyproject.toml [tool.ruff].
+  // Install the recommended extensions (charliermarsh.ruff picks up the repo config automatically).
+  "[python]": {
+    "editor.defaultFormatter": "charliermarsh.ruff",
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+      "source.fixAll.ruff": "explicit",
+      "source.organizeImports.ruff": "explicit"
+    },
+    "editor.rulers": [88]
+  }
+}
