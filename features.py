@@ -24,7 +24,7 @@ holidays = pd.read_csv(
         "locale": "category",
         "locale_name": "category",
         "description": "category",
-        "transferred": np.bool,
+        "transferred": "bool",
     },
     parse_dates=["date"],
 )
