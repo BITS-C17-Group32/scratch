@@ -272,6 +272,7 @@ def build_features() -> pd.DataFrame:
 
 def main() -> None:
     df = build_features()
+    OUT_FRAME.parent.mkdir(exist_ok=True)
     df.to_parquet(OUT_FRAME, index=False)
 
 
