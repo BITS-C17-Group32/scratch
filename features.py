@@ -7,6 +7,7 @@ from train import clean_train_data
 
 REPO_ROOT = Path(__file__).resolve().parent
 RAW = REPO_ROOT / "data" / "raw"
+EARTHQUAKE_DATE = pd.to_datetime("2016-04-16")
 
 
 def load_stores() -> pd.DataFrame:
@@ -178,7 +179,7 @@ def build_features() -> pd.DataFrame:
 
     # EARTHQUAKE FEATURE
 
-    earthquake_date = pd.to_datetime("2016-04-16")
+    earthquake_date = EARTHQUAKE_DATE
 
     # Post-quake relief-window decay.
     # Day 0 = 2016-04-16 (M 7.8, 27 km SSE of Muisne, Ecuador).
@@ -242,29 +243,75 @@ def build_features() -> pd.DataFrame:
             | df["is_local_holiday"]
         )
     ).all(), "is_holiday does not match the scope union!"
-    assert df["id"].isna().sum() == 7128, (
-        "expected exactly 7,128 fill rows from the four Christmas dates"
-    )
 
+    # Grid completeness: every (store, family) series spans every date.
+    series = df.groupby(["store_nbr", "family"], observed=True).ngroups
+    n_dates = df["date"].nunique()
+    assert len(df) == series * n_dates, "grid is not the date x store x family product"
+    assert (
+        df.groupby(["store_nbr", "family"], observed=True)["date"]
+        .nunique()
+        .eq(n_dates)
+        .all()
+    ), "a (store, family) series is missing dates"
+
+    # Calendar-shape invariants: flagged dates must match the scoped,
+    # non-transferred calendar intersected with the frame's range.
+    # (All regional names appear in stores.state and all local ones in stores.city;
+    # a refresh breaking that fails loudly by design.)
+    dmin, dmax = df["date"].min(), df["date"].max()
+
+    def in_range(dates):
+        return {d for d in dates if dmin <= d <= dmax}
+
+    for col, dates in [
+        ("is_national_holiday", set(national_holidays["date"])),
+        ("is_regional_holiday", set(regional_holidays["date"])),
+        ("is_local_holiday", set(local_holidays["date"])),
+        ("is_event", events_dates),
+    ]:
+        assert set(df.loc[df[col] == 1, "date"].unique()) == in_range(dates), (
+            f"{col} dates diverge from the scoped calendar"
+        )
+
+    # Scoped flags are date/store-level; they never vary within a family.
+    for col in [
+        "is_national_holiday",
+        "is_regional_holiday",
+        "is_local_holiday",
+        "is_event",
+    ]:
+        assert (
+            df.groupby(["date", "store_nbr"], observed=True)[col].nunique().max() == 1
+        ), f"{col} varies within a (date, store) group"
+
+    # Grid-fill rows are full-calendar closures; everything in them is a fill.
+    missing = df["id"].isna()
+    per_date = missing.groupby(df["date"]).sum()
+    assert per_date.isin([0, series]).all(), (
+        "grid gaps are not full-calendar closure days"
+    )
+    assert (
+        df.loc[missing, "sales"].eq(0).all()
+        and df.loc[missing, "onpromotion"].eq(0).all()
+    ), "id=NA rows must be the sales/onpromotion fills"
     assert df["earthquake_decay"].max() == 1.0
     assert df["earthquake_decay"].min() == 0.0
     assert df["earthquake_decay"].between(0, 1).all()
     assert (
-        df.loc[df["date"] < pd.Timestamp("2016-04-16"), "earthquake_decay"].eq(0).all()
+        df.loc[df["date"] < EARTHQUAKE_DATE, "earthquake_decay"].eq(0).all()
     )
     assert (
-        df.loc[df["date"] > pd.Timestamp("2016-05-16"), "earthquake_decay"].eq(0).all()
+        df.loc[df["date"] > EARTHQUAKE_DATE + pd.Timedelta(days=30), "earthquake_decay"].eq(0).all()
     )
     assert (
-        df.loc[df["date"].eq(pd.Timestamp("2016-04-16")), "earthquake_decay"]
+        df.loc[df["date"].eq(EARTHQUAKE_DATE), "earthquake_decay"]
         .eq(1.0)
         .all()
     )
-    active = df["earthquake_decay"].gt(0).groupby(df["date"]).any()
-    assert int(active.sum()) == 30
-
-    assert df["is_event"].sum() == 44550
-    assert df["is_event"].ne(0).groupby(df["date"]).any().sum() == 25
+    assert set(df.loc[df["earthquake_decay"].gt(0), "date"].unique()) == {
+        EARTHQUAKE_DATE + pd.Timedelta(days=i) for i in range(30)
+    }, "earthquake_decay violates the day 0..29 positive design"
 
     return df
 

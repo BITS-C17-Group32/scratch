@@ -164,10 +164,9 @@ def main() -> None:
         "local_test": df.loc[local_test_mask],
     }
 
-    assert len(df) == 3_008_016
-    assert df["date"].nunique() == 1_688
-    assert df["id"].isna().sum() == 7_128
-    expected_fill = {"train": 5_346, "valid": 0, "local_test": 1_782}
+    n_dates = df["date"].nunique()
+    n_series = df.groupby(["store_nbr", "family"], observed=True).ngroups
+    assert len(df) == n_dates * n_series, "grid is not complete"
 
     # Write and verify each split one at a time.
     for name, block in blocks.items():
@@ -179,7 +178,9 @@ def main() -> None:
         assert back["date"].min() == block["date"].min()
         assert back["date"].max() == block["date"].max()
         assert back.dtypes.equals(block.dtypes)
-        assert int(block["id"].isna().sum()) == expected_fill[name]
+        assert block.loc[block["id"].isna(), "sales"].eq(0).all(), (
+            f"{name}: id=NA rows keep sales!=0"
+        )
         print(
             "saved",
             f"{name:<10}",
@@ -194,7 +195,7 @@ def main() -> None:
     # Document split metadata, partition boundaries, row proportions, and design rationale.
     manifest = {
         "created": pd.Timestamp.now().isoformat(),
-        "source": "features.build_features; 26 columns; flags int8; id UInt32",
+        "source": f"features.build_features; {len(df.columns)} columns; flags int8; id UInt32",
         "columns": list(df.columns),
         "rounding_choice": (
             "raw date boundaries are (2016-03-28, 2016-09-12), and not month borders"
@@ -211,13 +212,16 @@ def main() -> None:
             "valid": "next 10% in time, tunes it",
             "local_test": (
                 "newest 20%, scored once after the design is frozen; never tuned on, "
-                "and the submission model retrains on all 1,688 dates post-freeze"
+                "and the submission model retrains on the full calendar post-freeze"
             ),
             "universe": (
-                "balanced grid: 1,688 dates x 54 stores x 33 families = 3,008,016 rows; "
-                "four Christmas closure days carry sales=0 with id=NA"
+                f"balanced grid: {df['date'].nunique()} dates x {df['store_nbr'].nunique()} stores x "
+                f"{df['family'].nunique()} families = {len(df)} rows; full-calendar closure days "
+                "carry sales=0 with id=NA"
             ),
-            "grid_fill_rows": {"train": 5346, "valid": 0, "local_test": 1782},
+            "grid_fill_rows": {
+                name: int(block["id"].isna().sum()) for name, block in blocks.items()
+            },
         },
         "naming_rule": "local_test is not the competition's test.csv",
     }
