@@ -7,7 +7,6 @@ from train import clean_train_data
 
 REPO_ROOT = Path(__file__).resolve().parent
 RAW = REPO_ROOT / "data" / "raw"
-OUT_FRAME = REPO_ROOT / "splits" / "frame_features.parquet"
 
 
 def load_stores() -> pd.DataFrame:
@@ -271,9 +270,14 @@ def build_features() -> pd.DataFrame:
 
 
 def main() -> None:
+    # Single writer: main.py produces splits/frame_full.parquet, the split
+    # partitions and the manifest. This entry only build-validates, so
+    # `python3 features.py` stays a cheap smoke check against the data.
     df = build_features()
-    OUT_FRAME.parent.mkdir(exist_ok=True)
-    df.to_parquet(OUT_FRAME, index=False)
+    feature_cols = [c for c in df.columns if c.startswith(("is_", "earthquake_"))]
+    print(f"validated frame: {len(df)} rows x {len(df.columns)} columns")
+    print("positive counts:", {c: int(df[c].sum()) for c in feature_cols})
+    print("next: python3 main.py  (writes frame_full.parquet + splits + manifest)")
 
 
 if __name__ == "__main__":
