@@ -32,28 +32,28 @@ def main() -> None:
     # print(df["date"].nunique())
 
     # Extract dataset date boundaries and calculate the total elapsed duration.
-    start_date = pd.Timestamp(df["date"].min())
-    end_date = pd.Timestamp(df["date"].max())
-    span: pd.Timedelta = end_date - start_date
+    # start_date = pd.Timestamp(df["date"].min())
+    # end_date = pd.Timestamp(df["date"].max())
+    # span: pd.Timedelta = end_date - start_date
     # print(span)
 
     # Group by product family and store number to inspect time-series depth per series.
     # Ref: https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.groupby.html
-    grouped_family = df.groupby(["family", "store_nbr"])
+    # grouped_family = df.groupby(["family", "store_nbr"])
     # print(grouped_family.size())
     # print(grouped_family.size().describe())
     # print(grouped_family.ngroup())
     # print(grouped_family["date"].nunique().describe())
 
     # Set up a date/store grouping for the optional diagnostics below.
-    grouped_date_store = df.groupby(["date", "store_nbr"])
+    # grouped_date_store = df.groupby(["date", "store_nbr"])
     # print(grouped_date_store.size().describe())
 
     # Compare observed dates with a complete daily calendar to find gaps.
-    dates_from_file = pd.DatetimeIndex(df["date"])
+    # dates_from_file = pd.DatetimeIndex(df["date"])
     # Generate full expected date range from start_date to end_date.
     # Ref: https://pandas.pydata.org/docs/reference/api/pandas.date_range.html
-    full_calendar_grid = pd.date_range(start_date, end_date)
+    # full_calendar_grid = pd.date_range(start_date, end_date)
     # print(full_calendar_grid.difference(dates_from_file))
     # pair_mins = grouped_family.min()
     # print(pair_mins)
@@ -63,9 +63,9 @@ def main() -> None:
     # print(df["sales"].max())
 
     # Group by date to aggregate daily store-wide metrics.
-    agg_by_dates = df.groupby(["date"])
+    # agg_by_dates = df.groupby(["date"])
     # Compute aggregate sales per calendar day across all stores and product families.
-    summed = agg_by_dates["sales"].sum()
+    # summed = agg_by_dates["sales"].sum()
     # print(summed.idxmax())
     # print(summed.head())
 
@@ -73,14 +73,14 @@ def main() -> None:
     # print(summed.tail(337))
 
     # Boundary timestamps for inspecting specific seasonal windows.
-    mid_march_2017 = pd.Timestamp("2017-03-15")
-    mid_april_2017 = pd.Timestamp("2017-04-15")
+    # mid_march_2017 = pd.Timestamp("2017-03-15")
+    # mid_april_2017 = pd.Timestamp("2017-04-15")
 
     # mask = (summed.index >= mid_march_2017) & (summed.index <= mid_april_2017)
     # print(summed[mask])
 
     # Compute total items on promotion per calendar day.
-    onprom_sum = agg_by_dates["onpromotion"].sum()
+    # onprom_sum = agg_by_dates["onpromotion"].sum()
     # mask = onprom_sum.index == pd.Timestamp("2017-04-01")
 
     # store = df["store_nbr"] == 33
@@ -138,7 +138,8 @@ def main() -> None:
     saves_dir = ROOT / "splits"
     saves_dir.mkdir(exist_ok=True)
 
-    # Save the complete typed frame to Parquet to preserve schema and speed up future loads.
+    # Save the complete typed frame to Parquet to
+    # preserve schema and speed up future loads.
     # Ref: https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.to_parquet.html
     df.to_parquet(saves_dir / "frame_full.parquet", index=False)
     # Read it back and check that row count and column types survived the round trip.
@@ -172,7 +173,8 @@ def main() -> None:
     for name, block in blocks.items():
         # Save partition without the default integer index.
         block.to_parquet(saves_dir / f"{name}.parquet", index=False)
-        # Read back partition to validate row count, temporal boundaries, and data types.
+        # Read back partition to validate row count,
+        # temporal boundaries, and data types.
         back = pd.read_parquet(saves_dir / f"{name}.parquet")
         assert len(back) == len(block)
         assert back["date"].min() == block["date"].min()
@@ -192,10 +194,14 @@ def main() -> None:
             saves_dir / f"{name}.parquet",
         )
 
-    # Document split metadata, partition boundaries, row proportions, and design rationale.
+    # Document split metadata, partition boundaries,
+    # row proportions, and design rationale.
     manifest = {
         "created": pd.Timestamp.now().isoformat(),
-        "source": f"features.build_features; {len(df.columns)} columns; flags int8; id UInt32",
+        "source": (
+            f"features.build_features; {len(df.columns)} columns; "
+            "flags int8; id UInt32"
+        ),
         "columns": list(df.columns),
         "rounding_choice": (
             "raw date boundaries are (2016-03-28, 2016-09-12), and not month borders"
@@ -206,7 +212,9 @@ def main() -> None:
         },
         "rows": {name: len(block) for name, block in blocks.items()},
         "total": len(df),
-        "shares": {name: f"{len(block) / len(df):.1%}" for name, block in blocks.items()},
+        "shares": {
+            name: f"{len(block) / len(df):.1%}" for name, block in blocks.items()
+        },
         "why": {
             "train": "oldest 70% of dates, fits the model",
             "valid": "next 10% in time, tunes it",
@@ -215,9 +223,10 @@ def main() -> None:
                 "and the submission model retrains on the full calendar post-freeze"
             ),
             "universe": (
-                f"balanced grid: {df['date'].nunique()} dates x {df['store_nbr'].nunique()} stores x "
-                f"{df['family'].nunique()} families = {len(df)} rows; full-calendar closure days "
-                "carry sales=0 with id=NA"
+                f"balanced grid: {df['date'].nunique()} dates x "
+                f"{df['store_nbr'].nunique()} stores x "
+                f"{df['family'].nunique()} families = {len(df)} rows; "
+                "full-calendar closure days carry sales=0 with id=NA"
             ),
             "grid_fill_rows": {
                 name: int(block["id"].isna().sum()) for name, block in blocks.items()
