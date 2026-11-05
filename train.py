@@ -8,7 +8,7 @@ def clean_train_data():
         "data/raw/train.csv",
         parse_dates=["date"],
         dtype={
-            "id": np.uint32,
+            "id": "UInt32",
             "store_nbr": np.int8,
             "family": "category",
             "sales": np.float32,
@@ -35,7 +35,12 @@ def clean_train_data():
         train_df, on=["date", "store_nbr", "family"], how="left", validate="m:1"
     )
 
-    # Fill missing values for closed days (e.g., Christmas Day)
+    # These fill rows are the four Christmas dates the warehouse has no
+    # rows for because Favorita closed nationally: 2013-12-25, 2014-12-25,
+    # 2015-12-25, 2016-12-25. The zeros below are recorded closure, not
+    # measured sales. They are kept as true labels. id is NaN on exactly
+    # the 7,128 of these rows (1,782 store-family pairs x 4 dates), so
+    # df["id"].isna() identifies them.
     contiguous_train["sales"] = contiguous_train["sales"].fillna(0.0)
     contiguous_train["onpromotion"] = (
         contiguous_train["onpromotion"].fillna(0).astype(np.uint16)

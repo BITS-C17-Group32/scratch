@@ -143,6 +143,7 @@ assert (
     df["is_holiday"]
     == (df["is_national_holiday"] | df["is_regional_holiday"] | df["is_local_holiday"])
 ).all(), "is_holiday does not match the scope union!"
+assert df["id"].isna().sum() == 7128, "expected exactly 7,128 fill rows from the four Christmas dates"
 
 assert df["earthquake_decay"].max() == 1.0
 assert df["earthquake_decay"].min() == 0.0
