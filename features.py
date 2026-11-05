@@ -74,6 +74,13 @@ def build_features() -> pd.DataFrame:
     # or this
     # holidays = holidays[holidays["transferred"].eq(False)].copy()
 
+    # Earthquake rows never reach is_event; their effect lives in
+    # earthquake_decay. The remaining Event rows are real demand spikes,
+    # mostly holidays or seasonal events: Black Friday, Cyber Monday,
+    # Mother's Day, World Cup matches. One of them is 2016-05-08, Dia de la
+    # Madre, which is also day 22 of the quake window. is_event and
+    # earthquake_decay are two deliberate signals on that date: retail
+    # lift vs quake disruption.
     terremoto_in_desc = holidays["description"].str.contains(
         "Terremoto Manabi", case=False
     )
