@@ -32,7 +32,7 @@ def clean_train_data():
 
     # Merge original train data into the complete grid
     contiguous_train = grid.merge(
-        train_df, on=["date", "store_nbr", "family"], how="left"
+        train_df, on=["date", "store_nbr", "family"], how="left", validate="m:1"
     )
 
     # Fill missing values for closed days (e.g., Christmas Day)

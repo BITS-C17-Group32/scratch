@@ -35,7 +35,7 @@ regional_holidays = holidays[holidays["locale"] == "Regional"].copy()
 local_holidays = holidays[holidays["locale"] == "Local"].copy()
 
 # Merge store data into train set
-df = train.merge(stores, on="store_nbr", how="left")
+df = train.merge(stores, on="store_nbr", how="left", validate="m:1")
 print(df.columns)
 
 df["is_event"] = df["date"].isin(events_dates).astype(int)
@@ -50,6 +50,7 @@ df = df.merge(
     left_on=["date", "state"],
     right_on=["date", "locale_name"],
     how="left",
+    validate="m:1",
 )
 df["is_regional_holiday"] = df["locale_name"].notna().astype(int)
 df = df.drop(columns=["locale_name"])
@@ -60,6 +61,7 @@ df = df.merge(
     left_on=["date", "city"],
     right_on=["date", "locale_name"],
     how="left",
+    validate="m:1",
 )
 df["is_local_holiday"] = df["locale_name"].notna().astype(int)
 df = df.drop(columns=["locale_name"])
