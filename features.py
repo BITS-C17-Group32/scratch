@@ -29,9 +29,8 @@ holidays = pd.read_csv(
     parse_dates=["date"],
 )
 
-# print(holidays["type"].unique())
-
-# Transferred holidays are moved to a different date; the original date is a normal workday.
+# Transferred holidays are moved to a different date;
+# the original date is a normal workday.
 holidays = holidays[~holidays["transferred"]].copy()
 # or this
 # holidays = holidays[holidays["transferred"].eq(False)].copy()
@@ -48,7 +47,6 @@ local_holidays = holidays[holidays["locale"] == "Local"].copy()
 
 # Merge store data into train set
 df = train.merge(stores, on="store_nbr", how="left", validate="m:1")
-print(df.columns)
 
 df["is_event"] = df["date"].isin(events_dates).astype(np.int8)
 
@@ -82,8 +80,6 @@ df = df.drop(columns=["locale_name"])
 df["is_holiday"] = (
     df["is_national_holiday"] | df["is_regional_holiday"] | df["is_local_holiday"]
 ).astype(np.int8)
-
-print(df.columns)
 
 df = df.sort_values(by=["store_nbr", "family", "date"], kind="mergesort").reset_index(
     drop=True
@@ -123,8 +119,6 @@ days_since_eq = (df["date"] - earthquake_date).dt.days
 df["earthquake_decay"] = np.where(
     (days_since_eq >= 0) & (days_since_eq <= 30), 1 - (days_since_eq / 30), 0
 )
-
-print(df.columns)
 
 for col in [
     "is_national_holiday",
