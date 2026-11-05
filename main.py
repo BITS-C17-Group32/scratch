@@ -17,12 +17,12 @@ df = pd.read_csv(
     "data/raw/train.csv",
     parse_dates=["date"],
     dtype={
+        "id": np.uint32,
         "store_nbr": np.int8,
         "family": "category",
         "sales": np.float32,
         "onpromotion": np.uint16,
     },
-    usecols=["date", "store_nbr", "family", "sales", "onpromotion"],
 )
 # print("The dtyped One:")
 # print(df.shape)

@@ -8,12 +8,12 @@ def clean_train_data():
         "data/raw/train.csv",
         parse_dates=["date"],
         dtype={
+            "id": np.uint32,
             "store_nbr": np.int8,
             "family": "category",
             "sales": np.float32,
-            "onpromotion": np.uint16,
+            "onpromotion": np.uint32,
         },
-        usecols=["date", "store_nbr", "family", "sales", "onpromotion"],
     )
 
     # Identify unique stores, families, and complete date range
