@@ -3,13 +3,20 @@ name = "demand-forecasting-lstm"
 version = "0.1.0"
 requires-python = ">=3.12,<3.14"
 dependencies = [
+    "keras>=3.15.1",
+    "matplotlib>=3.11.2",
     "numpy>=2.0",
     "pandas>=2.2",
     "pandas-stubs>=3.1.0.261029",
+    "plotly>=7.1.0",
     "pyarrow>=25.0.1",
+    "scikit-learn>=1.9.1",
+    "streamlit>=1.66.1",
+    "tensorflow>=2.21.0",
+    "torch>=2.15.0",
 ]
 
-# Dev tooling shared by all teammates. uv installs this group automatically
+# uv installs this group automatically
 # with `uv sync`. pip users: `pip install -r requirements-dev.txt`.
 [dependency-groups]
 dev = [
