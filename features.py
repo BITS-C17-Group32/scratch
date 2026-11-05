@@ -1,7 +1,7 @@
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-
-from pathlib import Path
 
 from train import clean_train_data
 
@@ -74,13 +74,17 @@ def build_features() -> pd.DataFrame:
     # or this
     # holidays = holidays[holidays["transferred"].eq(False)].copy()
 
-    terremoto_in_desc = holidays["description"].str.contains("Terremoto Manabi", case=False)
+    terremoto_in_desc = holidays["description"].str.contains(
+        "Terremoto Manabi", case=False
+    )
 
     events_dates = set(
         holidays[(~terremoto_in_desc) & (holidays["type"].eq("Event"))]["date"]
     )
 
-    holidays_filter = holidays["type"].isin(["Holiday", "Transfer", "Additional", "Bridge"])
+    holidays_filter = holidays["type"].isin(
+        ["Holiday", "Transfer", "Additional", "Bridge"]
+    )
     holidays = holidays[holidays_filter]
 
     # sorting holidays
@@ -124,9 +128,9 @@ def build_features() -> pd.DataFrame:
         df["is_national_holiday"] | df["is_regional_holiday"] | df["is_local_holiday"]
     ).astype(np.int8)
 
-    df = df.sort_values(by=["store_nbr", "family", "date"], kind="mergesort").reset_index(
-        drop=True
-    )
+    df = df.sort_values(
+        by=["store_nbr", "family", "date"], kind="mergesort"
+    ).reset_index(drop=True)
 
     tomorrow = df["date"] + pd.Timedelta(days=1)
     in_2days = df["date"] + pd.Timedelta(days=2)
@@ -149,8 +153,12 @@ def build_features() -> pd.DataFrame:
     df["is_regional_holiday_in_2days"] = calendar_flag(
         in_2days, df["state"], regional_calendar
     )
-    df["is_local_holiday_tomorrow"] = calendar_flag(tomorrow, df["city"], local_calendar)
-    df["is_local_holiday_in_2days"] = calendar_flag(in_2days, df["city"], local_calendar)
+    df["is_local_holiday_tomorrow"] = calendar_flag(
+        tomorrow, df["city"], local_calendar
+    )
+    df["is_local_holiday_in_2days"] = calendar_flag(
+        in_2days, df["city"], local_calendar
+    )
 
     # Same union shortcut as is_holiday: 1 if any scope flags the day.
     df["is_holiday_tomorrow"] = (
@@ -229,7 +237,11 @@ def build_features() -> pd.DataFrame:
 
     assert (
         df["is_holiday"]
-        == (df["is_national_holiday"] | df["is_regional_holiday"] | df["is_local_holiday"])
+        == (
+            df["is_national_holiday"]
+            | df["is_regional_holiday"]
+            | df["is_local_holiday"]
+        )
     ).all(), "is_holiday does not match the scope union!"
     assert df["id"].isna().sum() == 7128, (
         "expected exactly 7,128 fill rows from the four Christmas dates"
@@ -238,10 +250,16 @@ def build_features() -> pd.DataFrame:
     assert df["earthquake_decay"].max() == 1.0
     assert df["earthquake_decay"].min() == 0.0
     assert df["earthquake_decay"].between(0, 1).all()
-    assert df.loc[df["date"] < pd.Timestamp("2016-04-16"), "earthquake_decay"].eq(0).all()
-    assert df.loc[df["date"] > pd.Timestamp("2016-05-16"), "earthquake_decay"].eq(0).all()
     assert (
-        df.loc[df["date"].eq(pd.Timestamp("2016-04-16")), "earthquake_decay"].eq(1.0).all()
+        df.loc[df["date"] < pd.Timestamp("2016-04-16"), "earthquake_decay"].eq(0).all()
+    )
+    assert (
+        df.loc[df["date"] > pd.Timestamp("2016-05-16"), "earthquake_decay"].eq(0).all()
+    )
+    assert (
+        df.loc[df["date"].eq(pd.Timestamp("2016-04-16")), "earthquake_decay"]
+        .eq(1.0)
+        .all()
     )
     active = df["earthquake_decay"].gt(0).groupby(df["date"]).any()
     assert int(active.sum()) == 30
