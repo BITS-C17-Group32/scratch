@@ -89,20 +89,72 @@ df = df.sort_values(by=["store_nbr", "family", "date"], kind="mergesort").reset_
     drop=True
 )
 
-# holiday lead feature (National + Regional + Local + (any) Holiday)
-for col in ["national_holiday", "regional_holiday", "local_holiday", "holiday"]:
-    df[f"is_{col}_tomorrow"] = (
-        df.groupby(["store_nbr", "family"])[f"is_{col}"]
-        .shift(-1)
-        .fillna(0)
-        .astype(np.int8)
-    )
-    df[f"is_{col}_in_2days"] = (
-        df.groupby(["store_nbr", "family"])[f"is_{col}"]
-        .shift(-2)
-        .fillna(0)
-        .astype(np.int8)
-    )
+
+# "Lead" features. For each row, ask: does a special day land tomorrow,
+# or the day after? One column per scope: national, regional, local,
+# any-of-those, and events.
+#
+# Why ask the calendar and not the DataFrame?
+# The earlier version used shift(-1) over rows, which means
+# "what is the next observed row?". At the very end of the data
+# there is no next row, so it produced NaN, which was filled with
+# 0. That invents a fact ("no holiday ahead") that we never
+# checked. Asking the calendar instead always has a correct
+# answer, even in the tail of the frame.
+#
+# Is this leaking the future? No. Holidays and events are known
+# years in advance (official calendars), so at train time and at
+# forecast time these are legitimate, known-in-advance signals.
+def calendar_flag(
+    dates: pd.Series,
+    keys: pd.Series,
+    calendar: set[tuple[pd.Timestamp, str]],
+) -> pd.Series:
+    """Return 1 where the (date, key) pair is in the calendar, else 0."""
+    pairs = pd.Series(list(zip(dates, keys, strict=True)), index=dates.index)
+    return pairs.isin(calendar).astype(np.int8)
+
+
+tomorrow = df["date"] + pd.Timedelta(days=1)
+in_2days = df["date"] + pd.Timedelta(days=2)
+
+# Regional holidays are state-scoped, local holidays are city-scoped.
+# Key each calendar entry by (date, state) or (date, city).
+regional_calendar = set(
+    zip(regional_holidays["date"], regional_holidays["locale_name"], strict=True)
+)
+local_calendar = set(
+    zip(local_holidays["date"], local_holidays["locale_name"], strict=True)
+)
+
+# 1 if tomorrow (or the day after) is a holiday of that scope.
+df["is_national_holiday_tomorrow"] = tomorrow.isin(national_dates).astype(np.int8)
+df["is_national_holiday_in_2days"] = in_2days.isin(national_dates).astype(np.int8)
+df["is_regional_holiday_tomorrow"] = calendar_flag(
+    tomorrow, df["state"], regional_calendar
+)
+df["is_regional_holiday_in_2days"] = calendar_flag(
+    in_2days, df["state"], regional_calendar
+)
+df["is_local_holiday_tomorrow"] = calendar_flag(tomorrow, df["city"], local_calendar)
+df["is_local_holiday_in_2days"] = calendar_flag(in_2days, df["city"], local_calendar)
+
+# Same union shortcut as is_holiday: 1 if any scope flags the day.
+df["is_holiday_tomorrow"] = (
+    df["is_national_holiday_tomorrow"]
+    | df["is_regional_holiday_tomorrow"]
+    | df["is_local_holiday_tomorrow"]
+).astype(np.int8)
+df["is_holiday_in_2days"] = (
+    df["is_national_holiday_in_2days"]
+    | df["is_regional_holiday_in_2days"]
+    | df["is_local_holiday_in_2days"]
+).astype(np.int8)
+
+# Events (e.g. World Cup finals) get the same treatment. People stock
+# up ahead of these, so the 1-2 day lead genuinely carries signal.
+df["is_event_tomorrow"] = tomorrow.isin(events_dates).astype(np.int8)
+df["is_event_in_2days"] = in_2days.isin(events_dates).astype(np.int8)
 
 # EARTHQUAKE FEATURE
 
@@ -138,10 +190,29 @@ for col in [
     "is_holiday_tomorrow",
     "is_holiday_in_2days",
     "is_event",
+    "is_event_tomorrow",
+    "is_event_in_2days",
 ]:
     assert df[col].sum() > 0, f"{col} sum is unexpectedly zero!"
     assert df[col].isna().sum() == 0, f"{col} sum has NaN values!"
     assert df[col].isin([0, 1]).all(), f"{col} has non-binary values!"
+
+assert (
+    df["is_holiday_tomorrow"]
+    == (
+        df["is_national_holiday_tomorrow"]
+        | df["is_regional_holiday_tomorrow"]
+        | df["is_local_holiday_tomorrow"]
+    )
+).all(), "is_holiday_tomorrow does not match the scope union!"
+assert (
+    df["is_holiday_in_2days"]
+    == (
+        df["is_national_holiday_in_2days"]
+        | df["is_regional_holiday_in_2days"]
+        | df["is_local_holiday_in_2days"]
+    )
+).all(), "is_holiday_in_2days does not match the scope union!"
 
 assert (
     df["is_holiday"]
