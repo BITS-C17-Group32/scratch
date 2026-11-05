@@ -4,7 +4,19 @@ import pandas as pd
 from train import clean_train_data
 
 train = clean_train_data()
-stores = pd.read_csv("data/raw/stores.csv")
+
+stores = pd.read_csv(
+    "data/raw/stores.csv",
+    dtype={
+        "store_nbr": np.int8,
+        "city": "category",
+        "state": "category",
+        "type": "category",
+        "cluster": "category",
+    },
+)
+stores = stores.rename(columns={"type": "store_type"})
+
 holidays = pd.read_csv(
     "data/raw/holidays_events.csv",
     dtype={
@@ -38,11 +50,11 @@ local_holidays = holidays[holidays["locale"] == "Local"].copy()
 df = train.merge(stores, on="store_nbr", how="left", validate="m:1")
 print(df.columns)
 
-df["is_event"] = df["date"].isin(events_dates).astype(int)
+df["is_event"] = df["date"].isin(events_dates).astype(np.int8)
 
 # Map National Holidays
 national_dates = set(national_holidays["date"])
-df["is_national_holiday"] = df["date"].isin(national_dates).astype(int)
+df["is_national_holiday"] = df["date"].isin(national_dates).astype(np.int8)
 
 # Map Regional Holidays (matching state)
 df = df.merge(
@@ -52,7 +64,7 @@ df = df.merge(
     how="left",
     validate="m:1",
 )
-df["is_regional_holiday"] = df["locale_name"].notna().astype(int)
+df["is_regional_holiday"] = df["locale_name"].notna().astype(np.int8)
 df = df.drop(columns=["locale_name"])
 
 #  Map Local Holidays (matching city)
@@ -63,13 +75,13 @@ df = df.merge(
     how="left",
     validate="m:1",
 )
-df["is_local_holiday"] = df["locale_name"].notna().astype(int)
+df["is_local_holiday"] = df["locale_name"].notna().astype(np.int8)
 df = df.drop(columns=["locale_name"])
 
 # Combine into a single binary feature
 df["is_holiday"] = (
     df["is_national_holiday"] | df["is_regional_holiday"] | df["is_local_holiday"]
-).astype(int)
+).astype(np.int8)
 
 print(df.columns)
 
@@ -80,10 +92,16 @@ df = df.sort_values(by=["store_nbr", "family", "date"], kind="mergesort").reset_
 # holiday lead feature (National + Regional + Local + (any) Holiday)
 for col in ["national_holiday", "regional_holiday", "local_holiday", "holiday"]:
     df[f"is_{col}_tomorrow"] = (
-        df.groupby(["store_nbr", "family"])[f"is_{col}"].shift(-1).fillna(0).astype(int)
+        df.groupby(["store_nbr", "family"])[f"is_{col}"]
+        .shift(-1)
+        .fillna(0)
+        .astype(np.int8)
     )
     df[f"is_{col}_in_2days"] = (
-        df.groupby(["store_nbr", "family"])[f"is_{col}"].shift(-2).fillna(0).astype(int)
+        df.groupby(["store_nbr", "family"])[f"is_{col}"]
+        .shift(-2)
+        .fillna(0)
+        .astype(np.int8)
     )
 
 # EARTHQUAKE FEATURE

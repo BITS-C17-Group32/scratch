@@ -38,7 +38,7 @@ def clean_train_data():
     # Fill missing values for closed days (e.g., Christmas Day)
     contiguous_train["sales"] = contiguous_train["sales"].fillna(0.0)
     contiguous_train["onpromotion"] = (
-        contiguous_train["onpromotion"].fillna(0).astype(int)
+        contiguous_train["onpromotion"].fillna(0).astype(np.uint16)
     )
 
     # Sort chronologically to preserve time sequence integrity
