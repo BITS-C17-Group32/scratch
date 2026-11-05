@@ -92,6 +92,27 @@ def build_features() -> pd.DataFrame:
     regional_holidays = holidays[holidays["locale"] == "Regional"].copy()
     local_holidays = holidays[holidays["locale"] == "Local"].copy()
 
+    # pandas 3 promotes categorical join keys with unequal category levels to
+    # str. Share the levels between stores and each calendar side so city and
+    # state stay category through the merges.
+    state_levels = sorted(
+        set(stores["state"].cat.categories)
+        | set(regional_holidays["locale_name"].cat.categories)
+    )
+    stores["state"] = stores["state"].cat.set_categories(state_levels)
+    regional_holidays["locale_name"] = regional_holidays[
+        "locale_name"
+    ].cat.set_categories(state_levels)
+
+    city_levels = sorted(
+        set(stores["city"].cat.categories)
+        | set(local_holidays["locale_name"].cat.categories)
+    )
+    stores["city"] = stores["city"].cat.set_categories(city_levels)
+    local_holidays["locale_name"] = local_holidays["locale_name"].cat.set_categories(
+        city_levels
+    )
+
     # Merge store data into train set
     df = train.merge(stores, on="store_nbr", how="left", validate="m:1")
 
@@ -195,7 +216,7 @@ def build_features() -> pd.DataFrame:
     days_since_eq = (df["date"] - earthquake_date).dt.days
     df["earthquake_decay"] = np.where(
         (days_since_eq >= 0) & (days_since_eq <= 30), 1 - (days_since_eq / 30), 0
-    )
+    ).astype(np.float32)
 
     for col in [
         "is_national_holiday",
@@ -308,6 +329,12 @@ def build_features() -> pd.DataFrame:
     assert set(df.loc[df["earthquake_decay"].gt(0), "date"].unique()) == {
         EARTHQUAKE_DATE + pd.Timedelta(days=i) for i in range(30)
     }, "earthquake_decay violates the day 0..29 positive design"
+
+    # Dtype contract: category, uint16, float32. Regression guards.
+    assert isinstance(df["city"].dtype, pd.CategoricalDtype), "city is not category"
+    assert isinstance(df["state"].dtype, pd.CategoricalDtype), "state is not category"
+    assert df["earthquake_decay"].dtype == np.float32, "decay is not float32"
+    assert df["onpromotion"].dtype == np.uint16, "onpromotion is not uint16"
 
     return df
 
