@@ -1,0 +1,15 @@
+{
+  // Zed's built-in `ruff` language server reads pyproject.toml [tool.ruff] automatically.
+  // Project-level copy of format-on-save so it works out of the box for every teammate.
+  "languages": {
+    "Python": {
+      "format_on_save": "on",
+      "formatter": {
+        "language_server": { "name": "ruff" }
+      },
+      "code_actions_on_format": {
+        "source.organizeImports.ruff": true
+      }
+    }
+  }
+}
