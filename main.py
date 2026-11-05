@@ -5,6 +5,8 @@ import pandas as pd
 
 from train import clean_train_data
 
+ROOT = Path(__file__).resolve().parent
+
 # df_before = pd.read_csv("train.csv")
 # print("No Types:")
 # print(df_before.shape)
@@ -132,7 +134,7 @@ assert (
 )
 
 # Ensure the output directory for serialized partitions exists.
-saves_dir = Path("splits")
+saves_dir = ROOT / "splits"
 saves_dir.mkdir(exist_ok=True)
 
 # Save the complete typed frame to Parquet to preserve schema and speed up future loads.
