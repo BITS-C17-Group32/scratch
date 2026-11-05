@@ -298,17 +298,13 @@ def build_features() -> pd.DataFrame:
     assert df["earthquake_decay"].max() == 1.0
     assert df["earthquake_decay"].min() == 0.0
     assert df["earthquake_decay"].between(0, 1).all()
+    assert df.loc[df["date"] < EARTHQUAKE_DATE, "earthquake_decay"].eq(0).all()
     assert (
-        df.loc[df["date"] < EARTHQUAKE_DATE, "earthquake_decay"].eq(0).all()
-    )
-    assert (
-        df.loc[df["date"] > EARTHQUAKE_DATE + pd.Timedelta(days=30), "earthquake_decay"].eq(0).all()
-    )
-    assert (
-        df.loc[df["date"].eq(EARTHQUAKE_DATE), "earthquake_decay"]
-        .eq(1.0)
+        df.loc[df["date"] > EARTHQUAKE_DATE + pd.Timedelta(days=30), "earthquake_decay"]
+        .eq(0)
         .all()
     )
+    assert df.loc[df["date"].eq(EARTHQUAKE_DATE), "earthquake_decay"].eq(1.0).all()
     assert set(df.loc[df["earthquake_decay"].gt(0), "date"].unique()) == {
         EARTHQUAKE_DATE + pd.Timedelta(days=i) for i in range(30)
     }, "earthquake_decay violates the day 0..29 positive design"
