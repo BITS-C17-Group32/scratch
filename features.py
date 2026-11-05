@@ -35,7 +35,11 @@ holidays = holidays[~holidays["transferred"]].copy()
 # or this
 # holidays = holidays[holidays["transferred"].eq(False)].copy()
 
-events_dates = set(holidays[holidays["type"].eq("Event")]["date"])
+terremoto_in_desc = holidays["description"].str.contains("Terremoto Manabi", case=False)
+
+events_dates = set(
+    holidays[(~terremoto_in_desc) & (holidays["type"].eq("Event"))]["date"]
+)
 
 holidays_filter = holidays["type"].isin(["Holiday", "Transfer", "Additional", "Bridge"])
 holidays = holidays[holidays_filter]
@@ -157,3 +161,6 @@ assert (
 )
 active = df["earthquake_decay"].gt(0).groupby(df["date"]).any()
 assert int(active.sum()) == 30
+
+assert df["is_event"].sum() == 44550
+assert df["is_event"].ne(0).groupby(df["date"]).any().sum() == 25
