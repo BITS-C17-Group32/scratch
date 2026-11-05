@@ -137,8 +137,10 @@ for name, mask in [
 # Each row must belong to exactly one split. Boolean masks become 0/1, so their
 # row-wise sum must be 1 (no overlap and no omitted rows).
 assert (
-    train_mask.astype(int) + valid_mask.astype(int) + local_test_mask.astype(int)
-).eq(1).all()
+    (train_mask.astype(int) + valid_mask.astype(int) + local_test_mask.astype(int))
+    .eq(1)
+    .all()
+)
 
 # Ensure the output directory for serialized partitions exists.
 saves_dir = Path("splits")
