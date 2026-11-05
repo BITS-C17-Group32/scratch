@@ -244,3 +244,11 @@ def build_features() -> pd.DataFrame:
     assert df["is_event"].ne(0).groupby(df["date"]).any().sum() == 25
 
     return df
+
+
+def main() -> None:
+    build_features()
+
+
+if __name__ == "__main__":
+    main()
