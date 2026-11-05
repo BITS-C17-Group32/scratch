@@ -58,8 +58,9 @@ def calendar_flag(
     calendar: set[tuple[pd.Timestamp, str]],
 ) -> pd.Series:
     """Return 1 where the (date, key) pair is in the calendar, else 0."""
-    pairs = pd.Series(list(zip(dates, keys, strict=True)), index=dates.index)
-    return pairs.isin(calendar).astype(np.int8)
+    lookup = pd.MultiIndex.from_arrays([dates, keys])
+    known = pd.MultiIndex.from_tuples(calendar)
+    return pd.Series(lookup.isin(known), index=dates.index).astype(np.int8)
 
 
 def build_features() -> pd.DataFrame:
