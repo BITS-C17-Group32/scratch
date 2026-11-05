@@ -3,31 +3,38 @@ import pandas as pd
 
 from train import clean_train_data
 
+
+def load_stores() -> pd.DataFrame:
+    return pd.read_csv(
+        "data/raw/stores.csv",
+        dtype={
+            "store_nbr": np.int8,
+            "city": "category",
+            "state": "category",
+            "type": "category",
+            "cluster": "category",
+        },
+    ).rename(columns={"type": "store_type"})
+
+
+def load_holidays() -> pd.DataFrame:
+    return pd.read_csv(
+        "data/raw/holidays_events.csv",
+        dtype={
+            "type": "category",
+            "locale": "category",
+            "locale_name": "category",
+            "description": "category",
+            "transferred": "bool",
+        },
+        parse_dates=["date"],
+    )
+
+
 train = clean_train_data()
 
-stores = pd.read_csv(
-    "data/raw/stores.csv",
-    dtype={
-        "store_nbr": np.int8,
-        "city": "category",
-        "state": "category",
-        "type": "category",
-        "cluster": "category",
-    },
-)
-stores = stores.rename(columns={"type": "store_type"})
-
-holidays = pd.read_csv(
-    "data/raw/holidays_events.csv",
-    dtype={
-        "type": "category",
-        "locale": "category",
-        "locale_name": "category",
-        "description": "category",
-        "transferred": "bool",
-    },
-    parse_dates=["date"],
-)
+stores = load_stores()
+holidays = load_holidays()
 
 # Transferred holidays are moved to a different date;
 # the original date is a normal workday.
