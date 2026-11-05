@@ -1,8 +1,9 @@
 import json
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
+
+from train import clean_train_data
 
 # df_before = pd.read_csv("train.csv")
 # print("No Types:")
@@ -10,20 +11,8 @@ import pandas as pd
 # print(df_before.info(memory_usage="deep"))
 # print(df_before.memory_usage())
 
-# Parse dates on load and use compact types: int8, category, float32, and uint16.
-# usecols keeps columns 1-5 and skips the unused sequential ID column.
-# Ref: https://pandas.pydata.org/docs/reference/api/pandas.read_csv.html
-df = pd.read_csv(
-    "data/raw/train.csv",
-    parse_dates=["date"],
-    dtype={
-        "id": np.uint32,
-        "store_nbr": np.int8,
-        "family": "category",
-        "sales": np.float32,
-        "onpromotion": np.uint16,
-    },
-)
+df = clean_train_data()
+
 # print("The dtyped One:")
 # print(df.shape)
 # print(df.info(memory_usage="deep"))
@@ -172,6 +161,11 @@ blocks = {
     "local_test": df.loc[local_test_mask],
 }
 
+assert len(df) == 3_008_016
+assert df["date"].nunique() == 1_688
+assert df["id"].isna().sum() == 7_128
+expected_fill = {"train": 5_346, "valid": 0, "local_test": 1_782}
+
 # Write and verify each split one at a time.
 for name, block in blocks.items():
     # Save partition without the default integer index.
@@ -182,6 +176,7 @@ for name, block in blocks.items():
     assert back["date"].min() == block["date"].min()
     assert back["date"].max() == block["date"].max()
     assert back.dtypes.equals(block.dtypes)
+    assert int(block["id"].isna().sum()) == expected_fill[name]
     print(
         "saved",
         f"{name:<10}",
