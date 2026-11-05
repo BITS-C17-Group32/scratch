@@ -199,8 +199,7 @@ def main() -> None:
     manifest = {
         "created": pd.Timestamp.now().isoformat(),
         "source": (
-            f"features.build_features; {len(df.columns)} columns; "
-            "flags int8; id UInt32"
+            f"features.build_features; {len(df.columns)} columns; flags int8; id UInt32"
         ),
         "columns": list(df.columns),
         "rounding_choice": (
