@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from train import clean_train_data
+from features import build_features
 
 ROOT = Path(__file__).resolve().parent
 
@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parent
 # print(df_before.info(memory_usage="deep"))
 # print(df_before.memory_usage())
 
-df = clean_train_data()
+df = build_features()
 
 # print("The dtyped One:")
 # print(df.shape)
@@ -193,6 +193,8 @@ for name, block in blocks.items():
 # Document split metadata, partition boundaries, row proportions, and design rationale.
 manifest = {
     "created": pd.Timestamp.now().isoformat(),
+    "source": "features.build_features; 26 columns; flags int8; id UInt32",
+    "columns": list(df.columns),
     "rounding_choice": (
         "raw date boundaries are (2016-03-28, 2016-09-12), and not month borders"
     ),
