@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+
 from train import clean_train_data
 
 train = clean_train_data()
@@ -70,7 +71,9 @@ df["is_holiday"] = (
 
 print(df.columns)
 
-df = df.sort_values(by=["store_nbr", "family", "date"], kind="mergesort").reset_index(drop=True)
+df = df.sort_values(by=["store_nbr", "family", "date"], kind="mergesort").reset_index(
+    drop=True
+)
 
 # holiday lead feature (National + Regional + Local + (any) Holiday)
 for col in ["national_holiday", "regional_holiday", "local_holiday", "holiday"]:
@@ -81,16 +84,21 @@ for col in ["national_holiday", "regional_holiday", "local_holiday", "holiday"]:
         df.groupby(["store_nbr", "family"])[f"is_{col}"].shift(-2).fillna(0).astype(int)
     )
 
-# EARTHQUAKE IMPACT FEATURES
+# EARTHQUAKE FEATURE
 
 earthquake_date = pd.to_datetime("2016-04-16")
-# Binary indicator for the immediate high-impact relief window (4 weeks following)
-df["is_earthquake_impact_window"] = (
-    (df["date"] >= earthquake_date) & (df["date"] <= earthquake_date + pd.Timedelta(days=28))
-).astype(int)
 
-# Continuous decay feature (captures fading impact intensity)
-# Value starts at 1 on the earthquake day and linearly decays to 0 over 30 days
+# Post-quake relief-window decay.
+# Day 0 = 2016-04-16 (M 7.8, 27 km SSE of Muisne, Ecuador).
+# Linear from 1.0 on day 0 to 0.0 on day 30 (2016-05-16); identically 0 elsewhere.
+# Captures the "several weeks of elevated supermarket sales" after the quake
+# (Corporacion Favorita dataset description). Global across all stores, the
+# relief spike was a nationwide demand shock; a Manabi/Esmeraldas interaction
+# was considered and deferred.
+# This is an a-priori shape from the published post-disaster response
+# (Figueroa 2020 ICEDEG; Abe 2014 DP14-1), not an empirically fitted decay.
+# The competing binary window (F6) was a nested threshold of this one and was removed.
+# This feature is zero for the whole August 2017 forecast horizon by construction.
 days_since_eq = (df["date"] - earthquake_date).dt.days
 df["earthquake_decay"] = np.where(
     (days_since_eq >= 0) & (days_since_eq <= 30), 1 - (days_since_eq / 30), 0
@@ -112,7 +120,6 @@ for col in [
     "is_holiday_tomorrow",
     "is_holiday_in_2days",
     "is_event",
-    "is_earthquake_impact_window",
 ]:
     assert df[col].sum() > 0, f"{col} sum is unexpectedly zero!"
     assert df[col].isna().sum() == 0, f"{col} sum has NaN values!"
@@ -125,3 +132,11 @@ assert (
 
 assert df["earthquake_decay"].max() == 1.0
 assert df["earthquake_decay"].min() == 0.0
+assert df["earthquake_decay"].between(0, 1).all()
+assert df.loc[df["date"] < pd.Timestamp("2016-04-16"), "earthquake_decay"].eq(0).all()
+assert df.loc[df["date"] > pd.Timestamp("2016-05-16"), "earthquake_decay"].eq(0).all()
+assert (
+    df.loc[df["date"].eq(pd.Timestamp("2016-04-16")), "earthquake_decay"].eq(1.0).all()
+)
+active = df["earthquake_decay"].gt(0).groupby(df["date"]).any()
+assert int(active.sum()) == 30
