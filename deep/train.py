@@ -1,9 +1,12 @@
 import argparse
 import json
 import os
-from pathlib import Path
 import random
+import shutil
+import subprocess
 import sys
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import torch
@@ -23,6 +26,65 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def look_for_gpu_tool(name: str) -> bool:
+    """True if a vendor GPU query CLI exists and answers (nvidia-smi, rocm-smi)."""
+    path = shutil.which(name)
+    if path is None:
+        return False
+    try:
+        out = subprocess.run([path], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return out.returncode == 0
+
+
+def resolve_device(preference: str = "auto") -> torch.device:
+    """Resolve the compute device.
+
+    auto: MPS (Apple Silicon) > CUDA (NVIDIA; ROCm builds surface HIP through
+    the cuda API) > CPU. When a GPU is present but this torch build cannot use
+    it, say why instead of silently falling back to CPU.
+    """
+    if preference != "auto":
+        dev = torch.device(preference)
+        if preference == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError(
+                f"--device cuda requested but torch.cuda is unavailable "
+                f"(torch.version.cuda={torch.version.cuda}; this is a CPU-only "
+                "wheel). Install a CUDA build per https://pytorch.org/get-started/locally/"
+            )
+        if preference == "mps" and not torch.backends.mps.is_available():
+            raise RuntimeError(
+                "--device mps requested but MPS is unavailable (requires an "
+                "Apple Silicon Mac with torch's arm64 build)."
+            )
+        return dev
+
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+
+    # On macOS, torch wheels never ship CUDA/ROCm, so skip GPU-aware warnings
+    # there (an Intel Mac legitimately trains on CPU).
+    if sys.platform != "darwin" and look_for_gpu_tool("nvidia-smi"):
+        print(
+            "\nWarning: NVIDIA GPU detected via nvidia-smi, but this torch build "
+            f"has no CUDA support (torch.version.cuda={torch.version.cuda}) — "
+            "on Windows the default `pip install torch` ships CPU-only. Reinstall "
+            "PyTorch with CUDA per https://pytorch.org/get-started/locally/ ; "
+            "training will run on CPU meanwhile."
+        )
+    if sys.platform != "darwin" and look_for_gpu_tool("rocm-smi"):
+        print(
+            "\nWarning: AMD ROCm GPU detected via rocm-smi, but this torch build "
+            "lacks ROCm/HIP support. Reinstall PyTorch from the ROCm wheel per "
+            "https://pytorch.org/get-started/locally/ ; training will run on CPU "
+            "meanwhile."
+        )
+    return torch.device("cpu")
 
 
 def run_audit():
@@ -46,11 +108,7 @@ def run_audit():
 
     total_rows = manifest.get(
         "total_rows",
-        sum(
-            s.get("num_rows", 0)
-            for s in splits_dict.values()
-            if isinstance(s, dict)
-        ),
+        sum(s.get("num_rows", 0) for s in splits_dict.values() if isinstance(s, dict)),
     )
     local_test_rows = (
         splits_dict.get("local_test", {}).get("num_rows", "N/A")
@@ -61,7 +119,8 @@ def run_audit():
     print("=== S4 Audit Summary ===")
     print(f"Manifest total rows: {total_rows}")
     print(
-        f"Train rows: {len(train_df)} | Valid rows: {len(valid_df)} | Local test rows: {local_test_rows}"
+        f"Train rows: {len(train_df)} | Valid rows: {len(valid_df)} | "
+        f"Local test rows: {local_test_rows}"
     )
     print(f"Series count: {series_count}")
     print(f"Store-52 train masked rows dropped: {len(st52_masked)}")
@@ -70,20 +129,15 @@ def run_audit():
     sys.exit(0)
 
 
-def train_single_arch(
-    arch: str,
+def build_datasets(
     cfg: DeepConfig,
     train_df: pd.DataFrame,
     valid_df: pd.DataFrame,
-    device: torch.device,
-) -> dict:
-    set_seed(cfg.seed)
-
-    print(f"\n--- Preparing Dataset for [{arch.upper()}] ---")
+):
+    """Build window datasets once; they are shared across all architectures."""
+    print("\n--- Preparing Dataset ---")
     train_prep, cat_maps, _ = prepare_frame_data(train_df, is_train=True)
-    valid_prep, _, _ = prepare_frame_data(
-        valid_df, is_train=False, cat_maps=cat_maps
-    )
+    valid_prep, _, _ = prepare_frame_data(valid_df, is_train=False, cat_maps=cat_maps)
 
     train_ds = WindowSequenceDataset(
         train_prep,
@@ -99,13 +153,23 @@ def train_single_arch(
         is_train=False,
         stride=cfg.horizon,
     )
+    return train_ds, valid_ds, cat_maps
 
-    train_loader = DataLoader(
-        train_ds, batch_size=cfg.batch_size, shuffle=True
-    )
-    valid_loader = DataLoader(
-        valid_ds, batch_size=cfg.batch_size, shuffle=False
-    )
+
+def train_single_arch(
+    arch: str,
+    cfg: DeepConfig,
+    train_ds: WindowSequenceDataset,
+    valid_ds: WindowSequenceDataset,
+    cat_maps: dict,
+    device: torch.device,
+) -> dict:
+    set_seed(cfg.seed)
+
+    print(f"\n--- Training [{arch.upper()}] ---")
+
+    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
+    valid_loader = DataLoader(valid_ds, batch_size=cfg.batch_size, shuffle=False)
 
     print(f"Train sequences: {len(train_ds):,} | Valid sequences: {len(valid_ds):,}")
 
@@ -127,24 +191,28 @@ def train_single_arch(
 
     best_valid_rmsle = float("inf")
     best_state = None
+    best_metrics = None
     best_epoch = 0
     patience_counter = 0
 
     for epoch in range(1, cfg.max_epochs + 1):
         model.train()
-        train_loss = 0.0
+        # Accumulate batch-mean losses on the device: calling loss.item()
+        # every batch forces a GPU->CPU sync each step (~15% slower).
+        loss_sum = torch.zeros((), device=device)
+        n_batches = len(train_loader)
 
         pbar = tqdm(
             train_loader,
             desc=f"Epoch {epoch}/{cfg.max_epochs} [{arch.upper()} Train]",
             leave=False,
         )
-        for batch in pbar:
+        for step, batch in enumerate(pbar):
             x_num = batch["x_num"].to(device)
             x_cat = batch["x_cat"].to(device)
             y_log = batch["y_log"].to(device)
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             preds = model(x_num, x_cat)
             loss = criterion(preds, y_log)
 
@@ -155,10 +223,11 @@ def train_single_arch(
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-            train_loss += loss.item()
-            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+            loss_sum = loss_sum + loss.detach()
+            if (step + 1) % 25 == 0:
+                pbar.set_postfix({"loss": f"{(loss_sum / (step + 1)).item():.4f}"})
 
-        avg_train_loss = train_loss / max(1, len(train_loader))
+        avg_train_loss = (loss_sum / max(1, n_batches)).item()
 
         model.eval()
         all_preds_raw = []
@@ -188,15 +257,15 @@ def train_single_arch(
         val_rmsle = val_metrics["rmsle"]
 
         print(
-            f"Epoch {epoch:2d}/{cfg.max_epochs:2d} | Train MSE: {avg_train_loss:.4f} | Valid RMSLE: {val_rmsle:.4f}"
+            f"Epoch {epoch:2d}/{cfg.max_epochs:2d} | Train MSE: "
+            f"{avg_train_loss:.4f} | Valid RMSLE: {val_rmsle:.4f}"
         )
 
         if val_rmsle < (best_valid_rmsle - 0.0001):
             best_valid_rmsle = val_rmsle
+            best_metrics = val_metrics
             best_epoch = epoch
-            best_state = {
-                k: v.cpu() for k, v in model.state_dict().items()
-            }
+            best_state = {k: v.cpu() for k, v in model.state_dict().items()}
             patience_counter = 0
         else:
             patience_counter += 1
@@ -213,7 +282,7 @@ def train_single_arch(
         "params": param_count,
         "best_epoch": best_epoch,
         "best_valid_rmsle": best_valid_rmsle,
-        "metrics": val_metrics,
+        "metrics": best_metrics,
     }
 
 
@@ -222,25 +291,34 @@ def main():
     parser.add_argument("--audit", action="store_true")
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--all", action="store_true")
-    parser.add_argument(
-        "--arch", choices=["rnn", "lstm", "gru"], default="lstm"
-    )
+    parser.add_argument("--arch", choices=["rnn", "lstm", "gru"], default="lstm")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-epochs", type=int, default=25)
     parser.add_argument("--train-start", type=str, default=None)
     parser.add_argument("--ablation", type=str, default=None)
+    parser.add_argument(
+        "--device",
+        choices=["auto", "mps", "cuda", "cpu"],
+        default="auto",
+        help="compute device; auto picks MPS > CUDA > CPU",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="override DeepConfig.batch_size for quick throughput experiments",
+    )
     args = parser.parse_args()
 
     if args.audit:
         run_audit()
 
     cfg = DeepConfig(seed=args.seed, max_epochs=args.max_epochs)
-    device = torch.device(
-        "mps"
-        if torch.backends.mps.is_available()
-        else ("cuda" if torch.cuda.is_available() else "cpu")
-    )
-    print(f"Using compute device: {device}")
+    if args.batch_size:
+        cfg.batch_size = args.batch_size
+
+    device = resolve_device(args.device)
+    print(f"Using compute device: {device} | torch {torch.__version__}")
 
     repo_root = Path(".")
     train_df = pd.read_parquet(repo_root / "splits" / "train.parquet")
@@ -271,16 +349,16 @@ def main():
         else {
             "status": "complete",
             "tiers": [],
-            "notes": (
-                "percentage-error metric excluded at 35.2% zeros in train+valid"
-            ),
+            "notes": ("percentage-error metric excluded at 35.2% zeros in train+valid"),
         }
     )
 
     archs_to_run = ["rnn", "lstm", "gru"] if args.all else [args.arch]
 
+    train_ds, valid_ds, cat_maps = build_datasets(cfg, train_df, valid_df)
+
     for arch in archs_to_run:
-        res = train_single_arch(arch, cfg, train_df, valid_df, device)
+        res = train_single_arch(arch, cfg, train_ds, valid_ds, cat_maps, device)
 
         ckpt_path = Path(f"artifacts/deep_{arch}.pt")
         save_obj = {
