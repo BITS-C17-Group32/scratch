@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
+
 import numpy as np
 import pandas as pd
 import torch
@@ -9,15 +10,15 @@ from torch.utils.data import Dataset
 
 def load_split_manifest(repo_root: Path) -> dict:
     manifest_path = repo_root / "splits" / "split_manifest.json"
-    with open(manifest_path, "r", encoding="utf-8") as f:
+    with open(manifest_path, encoding="utf-8") as f:
         return json.load(f)
 
 
 def prepare_frame_data(
     df: pd.DataFrame,
     is_train: bool = True,
-    cat_maps: Optional[Dict[str, Dict[Any, int]]] = None,
-) -> Tuple[pd.DataFrame, Dict[str, Dict[Any, int]], List[str]]:
+    cat_maps: dict[str, dict[Any, int]] | None = None,
+) -> tuple[pd.DataFrame, dict[str, dict[Any, int]], list[str]]:
     df = df.copy()
 
     # Determine available categorical columns present in df
@@ -43,17 +44,13 @@ def prepare_frame_data(
         df["onpromotion"] = 0.0
 
     if "dcoilwtico" in df.columns:
-        df["dcoilwtico"] = (
-            df["dcoilwtico"].ffill().bfill().fillna(0.0).astype(float)
-        )
+        df["dcoilwtico"] = df["dcoilwtico"].ffill().bfill().fillna(0.0).astype(float)
     else:
         df["dcoilwtico"] = 0.0
 
     # Ensure log sales target column
     if "sales" in df.columns:
-        df["sales_log"] = np.log1p(
-            np.clip(df["sales"].fillna(0).values, 0, None)
-        )
+        df["sales_log"] = np.log1p(np.clip(df["sales"].fillna(0).values, 0, None))
     else:
         df["sales_log"] = 0.0
 
@@ -82,7 +79,9 @@ class WindowSequenceDataset(Dataset):
             group = group.sort_values("date").reset_index(drop=True)
             n_rows = len(group)
 
-            sales_raw = group["sales"].values if "sales" in group.columns else np.zeros(n_rows)
+            sales_raw = (
+                group["sales"].values if "sales" in group.columns else np.zeros(n_rows)
+            )
             sales_log = group["sales_log"].values
             onpromo = group["onpromotion"].values
             oil = group["dcoilwtico"].values

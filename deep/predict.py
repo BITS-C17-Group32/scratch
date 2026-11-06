@@ -1,5 +1,6 @@
 import argparse
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import torch
@@ -9,17 +10,13 @@ from deep.metrics import compute_metrics
 from deep.model import DeepForecaster
 
 
-def fit_predict_frozen(
-    df: pd.DataFrame, score_start: str = "2016-03-28"
-) -> np.ndarray:
+def fit_predict_frozen(df: pd.DataFrame, score_start: str = "2016-03-28") -> np.ndarray:
     """Predict horizon sales for frozen evaluation handoff."""
     checkpoint_path = Path("artifacts/deep_lstm.pt")
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}.")
 
-    ckpt = torch.load(
-        checkpoint_path, map_location="cpu", weights_only=False
-    )
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     cat_maps = ckpt["cat_maps"]
     cfg_dict = ckpt["config"]
 
@@ -34,9 +31,7 @@ def fit_predict_frozen(
             f"Frame requires history starting at {req_date}, but got {min_date}"
         )
 
-    df_prep, _, _ = prepare_frame_data(
-        df, is_train=False, cat_maps=cat_maps
-    )
+    df_prep, _, _ = prepare_frame_data(df, is_train=False, cat_maps=cat_maps)
 
     cards = {c: len(m) for c, m in cat_maps.items()}
     model = DeepForecaster(
@@ -97,11 +92,10 @@ def verify_valid(checkpoint_path: str):
     cat_maps = ckpt["cat_maps"]
     cfg_dict = ckpt["config"]
 
-    valid_prep, _, _ = prepare_frame_data(
-        valid_df, is_train=False, cat_maps=cat_maps
-    )
+    valid_prep, _, _ = prepare_frame_data(valid_df, is_train=False, cat_maps=cat_maps)
 
     from torch.utils.data import DataLoader
+
     from deep.data import WindowSequenceDataset
 
     vds = WindowSequenceDataset(

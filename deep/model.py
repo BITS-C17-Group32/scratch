@@ -1,12 +1,11 @@
 import torch
 import torch.nn as nn
-from typing import Dict
 
 
 class DeepForecaster(nn.Module):
     def __init__(
         self,
-        cat_cardinalities: Dict[str, int],
+        cat_cardinalities: dict[str, int],
         arch: str = "lstm",
         lookback: int = 60,
         horizon: int = 16,
@@ -24,7 +23,7 @@ class DeepForecaster(nn.Module):
         self.embeddings = nn.ModuleList()
         total_emb_dim = 0
 
-        for col, card in cat_cardinalities.items():
+        for _col, card in cat_cardinalities.items():
             emb_dim = min(50, max(2, (card + 1) // 2))
             self.embeddings.append(nn.Embedding(card + 1, emb_dim))
             total_emb_dim += emb_dim
@@ -72,7 +71,7 @@ class DeepForecaster(nn.Module):
     def forward(self, x_num: torch.Tensor, x_cat: torch.Tensor) -> torch.Tensor:
         # x_num shape: (batch_size, lookback, num_features)
         # x_cat shape: (batch_size, num_cat_cols)
-        batch_size, seq_len, _ = x_num.shape
+        _batch_size, seq_len, _ = x_num.shape
 
         emb_list = []
         if x_cat.ndim == 2 and x_cat.shape[1] > 0:
@@ -85,7 +84,7 @@ class DeepForecaster(nn.Module):
         if emb_list:
             # Concatenate all embeddings: shape (batch_size, total_emb_dim)
             cat_emb = torch.cat(emb_list, dim=-1)
-            # Expand categorical embeddings across time steps: (batch_size, lookback, total_emb_dim)
+            # Expand cat embeddings across time steps
             cat_emb_expanded = cat_emb.unsqueeze(1).repeat(1, seq_len, 1)
             # Concatenate numerical and categorical features along feature axis
             x = torch.cat([x_num, cat_emb_expanded], dim=-1)
@@ -93,9 +92,9 @@ class DeepForecaster(nn.Module):
             x = x_num
 
         if self.arch == "lstm":
-            out, (h_n, c_n) = self.rnn(x)
+            out, (_h_n, _c_n) = self.rnn(x)
         else:
-            out, h_n = self.rnn(x)
+            out, _h_n = self.rnn(x)
 
         # Extract last hidden state from top layer: shape (batch_size, hidden_dim)
         last_hidden = out[:, -1, :]

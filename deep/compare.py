@@ -17,8 +17,7 @@ def compare_hgb():
         deep_res["comparison"] = {
             "status": "pending_s3",
             "notes": (
-                "S3 classical_results.json missing; re-run within 24h of S3"
-                " landing"
+                "S3 classical_results.json missing; re-run within 24h of S3 landing"
             ),
         }
         with open(results_path, "w") as f:
@@ -29,9 +28,7 @@ def compare_hgb():
     hgb_res = json.load(open(hgb_path))
     hgb_rmsle = hgb_res.get("hgb", {}).get("pooled", {}).get("rmsle", 0.0)
 
-    best_deep = min(
-        deep_res["tiers"], key=lambda x: x["metrics"]["rmsle"]
-    )
+    best_deep = min(deep_res["tiers"], key=lambda x: x["metrics"]["rmsle"])
     deep_rmsle = best_deep["metrics"]["rmsle"]
     delta = deep_rmsle - hgb_rmsle
 
@@ -50,9 +47,7 @@ def compare_hgb():
 
     print("=== Comparison complete ===")
     print(f"HGB pooled RMSLE: {hgb_rmsle:.5f}")
-    print(
-        f"Best deep tier ({best_deep['tier']}) RMSLE: {deep_rmsle:.5f}"
-    )
+    print(f"Best deep tier ({best_deep['tier']}) RMSLE: {deep_rmsle:.5f}")
     print(f"Delta (Deep - HGB): {delta:+.5f}")
 
 
