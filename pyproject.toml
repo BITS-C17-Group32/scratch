@@ -14,6 +14,7 @@ dependencies = [
     "streamlit>=1.66.1",
     "tensorflow>=2.21.0",
     "torch>=2.15.0",
+    "tqdm>=4.70.1",
 ]
 
 # uv installs this group automatically
