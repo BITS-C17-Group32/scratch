@@ -1,4 +1,5 @@
 import argparse
+import copy
 import json
 import os
 import random
@@ -148,6 +149,19 @@ def train_one(arch, cfg, device, train_df, valid_df=None, cat_maps=None, scaler=
         lookback=cfg.lookback_days,
     ).to(device)
 
+    # Manual AMP if enabled: fp16 execution copy driven by fp32 master
+    # weights. torch.amp.autocast never casts the _VF.lstm/gru/rnn kernels
+    # on mps and GradScaler("mps") rejects fp16 parameters, so the cast is
+    # done at the module level here. Loss, clipping and metrics stay fp32.
+    use_amp = bool(cfg.amp) and device.type in ("mps", "cuda")
+    if cfg.amp and not use_amp:
+        print("AMP requested but unsupported on this device; continuing in fp32")
+    exec_model = model
+    exec_params = None
+    if use_amp:
+        exec_model = copy.deepcopy(model).half()
+        exec_params = list(exec_model.parameters())
+
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay
     )
@@ -174,13 +188,27 @@ def train_one(arch, cfg, device, train_df, valid_df=None, cat_maps=None, scaler=
             x_num = batch["x_num"].to(device)
             x_cat = batch["x_cat"].to(device)
             y_log = batch["y_log"].to(device)
+            if use_amp:
+                x_num = x_num.half()
+                # Refresh the fp16 execution copy from the fp32 master.
+                with torch.no_grad():
+                    for p_e, p_m in zip(exec_params, model.parameters()):
+                        p_e.copy_(p_m)
 
             optimizer.zero_grad(set_to_none=True)
-            preds = model(x_num, x_cat)
+            if use_amp:
+                exec_model.zero_grad(set_to_none=True)
+            preds = exec_model(x_num, x_cat)
+            if use_amp:
+                preds = preds.float()
             loss = criterion(preds, y_log)
             if torch.isnan(loss):
                 raise RuntimeError(f"NaN loss encountered at epoch {epoch}")
             loss.backward()
+            if use_amp:
+                for p_e, p_m in zip(exec_params, model.parameters()):
+                    if p_e.grad is not None:
+                        p_m.grad = p_e.grad.detach().to(torch.float32)
             nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             optimizer.step()
             loss_sum = loss_sum + loss.detach()
@@ -273,6 +301,12 @@ def main():
         "--device", choices=["auto", "mps", "cuda", "cpu"], default="auto"
     )
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument(
+        "--amp",
+        action="store_true",
+        help="manual fp16 AMP on gpu devices: fp16 execution copy driven by "
+        "fp32 master weights; loss, clipping and metrics stay fp32",
+    )
     parser.add_argument("--benchmark-steps", type=int, default=0)
     parser.add_argument("--out-dir", type=str, default="artifacts")
     args = parser.parse_args()
@@ -285,6 +319,8 @@ def main():
         cfg.max_epochs = args.max_epochs
     if args.batch_size is not None:
         cfg.batch_size = args.batch_size
+    if args.amp:
+        cfg.amp = True
     if args.ablation is not None:
         cfg.train_start = "2015-01-01"
     if args.train_start is not None:
