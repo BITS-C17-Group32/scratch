@@ -5,99 +5,87 @@ import torch.nn as nn
 class DeepForecaster(nn.Module):
     def __init__(
         self,
-        cat_cardinalities: dict[str, int],
         arch: str = "lstm",
-        lookback: int = 60,
-        horizon: int = 16,
-        hidden_dim: int = 64,
+        num_numeric: int = 22,
+        cat_levels: dict | None = None,
+        embedding_dims: dict | None = None,
+        hidden_size: int = 128,
         num_layers: int = 2,
-        dropout: float = 0.1,
+        dropout: float = 0.2,
+        horizon: int = 16,
+        lookback: int = 60,
     ):
         super().__init__()
         self.arch = arch.lower()
         self.lookback = lookback
         self.horizon = horizon
-        self.hidden_dim = hidden_dim
+        self.hidden_size = hidden_size
 
-        # Categorical embeddings
-        self.embeddings = nn.ModuleList()
-        total_emb_dim = 0
+        if cat_levels is None:
+            cat_levels = {
+                "store_nbr": 54,
+                "family": 33,
+                "city": 22,
+                "state": 16,
+                "store_type": 5,
+                "cluster": 17,
+            }
+        if embedding_dims is None:
+            embedding_dims = {
+                "store_nbr": 8,
+                "family": 8,
+                "city": 4,
+                "state": 4,
+                "store_type": 2,
+                "cluster": 4,
+            }
 
-        for _col, card in cat_cardinalities.items():
-            emb_dim = min(50, max(2, (card + 1) // 2))
-            self.embeddings.append(nn.Embedding(card + 1, emb_dim))
-            total_emb_dim += emb_dim
+        self.cat_cols = list(cat_levels.keys())
+        self.embeddings = nn.ModuleDict()
+        total_emb = 0
+        for col in self.cat_cols:
+            levels = cat_levels[col]
+            dim = embedding_dims[col]
+            emb = nn.Embedding(levels + 1, dim)
+            nn.init.zeros_(emb.weight)
+            self.embeddings[col] = emb
+            total_emb += dim
 
-        # Numerical input features: sales_log (1) + onpromotion (1) + dcoilwtico (1) = 3
-        num_features_dim = 3
-        in_dim = num_features_dim + total_emb_dim
+        self.num_numeric = num_numeric
+        in_dim = num_numeric + total_emb
 
-        # Recurrent core
-        if self.arch == "rnn":
-            self.rnn = nn.RNN(
-                input_size=in_dim,
-                hidden_size=hidden_dim,
-                num_layers=num_layers,
-                batch_first=True,
-                dropout=dropout if num_layers > 1 else 0.0,
-            )
-        elif self.arch == "lstm":
-            self.rnn = nn.LSTM(
-                input_size=in_dim,
-                hidden_size=hidden_dim,
-                num_layers=num_layers,
-                batch_first=True,
-                dropout=dropout if num_layers > 1 else 0.0,
-            )
-        elif self.arch == "gru":
-            self.rnn = nn.GRU(
-                input_size=in_dim,
-                hidden_size=hidden_dim,
-                num_layers=num_layers,
-                batch_first=True,
-                dropout=dropout if num_layers > 1 else 0.0,
-            )
-        else:
-            raise ValueError(f"Unsupported architecture: {arch}")
-
-        # Linear output head mapping last hidden state to horizon
+        rnn_cls = {"rnn": nn.RNN, "lstm": nn.LSTM, "gru": nn.GRU}[self.arch]
+        self.rnn = rnn_cls(
+            input_size=in_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
         self.head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Linear(hidden_size, hidden_size // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, horizon),
+            nn.Linear(hidden_size // 2, horizon),
         )
 
     def forward(self, x_num: torch.Tensor, x_cat: torch.Tensor) -> torch.Tensor:
-        # x_num shape: (batch_size, lookback, num_features)
-        # x_cat shape: (batch_size, num_cat_cols)
-        _batch_size, seq_len, _ = x_num.shape
-
+        # x_num: (B, L, num_numeric); x_cat: (B, num_cat) long
+        b, seq, _ = x_num.shape
         emb_list = []
-        if x_cat.ndim == 2 and x_cat.shape[1] > 0:
-            for idx, emb_layer in enumerate(self.embeddings):
-                if idx < x_cat.shape[1]:
-                    # Extract categorical index and pass through embedding layer
-                    cat_idx = x_cat[:, idx].clamp(0, emb_layer.num_embeddings - 1)
-                    emb_list.append(emb_layer(cat_idx))
-
-        if emb_list:
-            # Concatenate all embeddings: shape (batch_size, total_emb_dim)
-            cat_emb = torch.cat(emb_list, dim=-1)
-            # Expand cat embeddings across time steps
-            cat_emb_expanded = cat_emb.unsqueeze(1).repeat(1, seq_len, 1)
-            # Concatenate numerical and categorical features along feature axis
-            x = torch.cat([x_num, cat_emb_expanded], dim=-1)
-        else:
-            x = x_num
-
+        for i, col in enumerate(self.cat_cols):
+            idx = x_cat[:, i].clamp(0, self.embeddings[col].num_embeddings - 1)
+            emb_list.append(self.embeddings[col](idx))
+        cat_emb = (
+            torch.cat(emb_list, dim=-1)
+            if emb_list
+            else torch.zeros(b, 0, device=x_num.device)
+        )
+        cat_emb = cat_emb.unsqueeze(1).expand(-1, seq, -1)
+        x = torch.cat([x_num, cat_emb], dim=-1)
         if self.arch == "lstm":
-            out, (_h_n, _c_n) = self.rnn(x)
+            out, _ = self.rnn(x)
         else:
-            out, _h_n = self.rnn(x)
-
-        # Extract last hidden state from top layer: shape (batch_size, hidden_dim)
-        last_hidden = out[:, -1, :]
-        preds = self.head(last_hidden)
-
-        return preds
+            out, _ = self.rnn(x)
+        last = out[:, -1, :]
+        return self.head(last)
