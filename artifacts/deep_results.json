@@ -4,60 +4,295 @@
     {
       "tier": "deep-rnn",
       "architecture": "rnn",
-      "params": 65321,
-      "best_epoch": 10,
-      "config_sha256": "5c5ad43844b91401",
-      "device": "cuda",
-      "torch_version": "2.15.0+cu132",
-      "metrics": {
-        "rmsle": 0.5512995298099461,
-        "mae": 100.84902136461712,
-        "rmse": 401.9347035790761,
-        "rmsle_active": 0.48116522338143425,
-        "mae_active": 121.60692964380556,
-        "rmse_active": 441.0399480971837,
-        "n_rows": 171072,
-        "n_rows_active": 139871
-      }
+      "checkpoint": "artifacts\\deep_rnn.pt",
+      "checkpoint_bytes": 276421,
+      "checkpoint_sha256": "904639a1726e6738ca6338911f7e8ff2dede72ee937dcd9f7f0517ce1abc1112",
+      "params": 66572,
+      "status": "complete",
+      "config_sha256": "0e08e34bb74cf54b5ee93edc804caf67d1c2ca0ddbda4ac6ed4cc479728ac21a",
+      "train": {
+        "rows_available": 2067417,
+        "rows_used": 2067417,
+        "rows_masked": 38907,
+        "windows": 243111,
+        "epochs_run": 1,
+        "best_epoch": 1,
+        "stop_reason": "max_epochs",
+        "seconds": 31.7889404296875,
+        "seconds_per_epoch": 31.7889404296875,
+        "device": "cuda",
+        "torch_version": "2.15.0+cu132"
+      },
+      "valid": {
+        "n_rows": 299376,
+        "n_active": 245303,
+        "full_grid": {
+          "rmsle": 0.6175270001093947,
+          "mae": 163.2956371006845,
+          "rmse": 639.4045885599131
+        },
+        "active_slice": {
+          "rmsle": 0.6122206331664874,
+          "mae": 198.39256834977442,
+          "rmse": 705.2986117656392
+        },
+        "per_horizon_rmsle": [
+          0.5792791148505494,
+          0.6048898081374376,
+          0.6266110147679704,
+          0.6287121025249061,
+          0.6132176605527516,
+          0.617278559471121,
+          0.5888857075032577,
+          0.6012498729701884,
+          0.6620070011889578,
+          0.6486698081924102,
+          0.5983034382966261,
+          0.6067028755564784,
+          0.6095740578331066,
+          0.6363451893921727,
+          0.620060012145405,
+          0.6404903481276515
+        ],
+        "inference_seconds": 0.0
+      },
+      "fold_metrics": [
+        {
+          "rmsle": 0.553484032869077,
+          "mae": 144.388671466533,
+          "rmse": 457.8777291112418,
+          "rmsle_active": 0.5840193381081569,
+          "mae_active": 176.4453618778276,
+          "rmse_active": 506.26785776816945,
+          "n_rows": 28512,
+          "n_rows_active": 23322
+        },
+        {
+          "rmsle": 0.7552755171434204,
+          "mae": 113.72231350933028,
+          "rmse": 397.78090897496173,
+          "rmsle_active": 0.5196429658182836,
+          "mae_active": 132.96969772239808,
+          "rmse_active": 427.70940261743476,
+          "n_rows": 28512,
+          "n_rows_active": 23173
+        },
+        {
+          "rmsle": 0.6006165475398151,
+          "mae": 155.14021096299086,
+          "rmse": 555.4369760753034,
+          "rmsle_active": 0.6360090261441964,
+          "mae_active": 192.63556203132885,
+          "rmse_active": 619.1591720401167,
+          "n_rows": 28512,
+          "n_rows_active": 22944
+        }
+      ]
     },
     {
       "tier": "deep-lstm",
       "architecture": "lstm",
-      "params": 230441,
-      "best_epoch": 7,
-      "config_sha256": "5c5ad43844b91401",
-      "device": "cuda",
-      "torch_version": "2.15.0+cu132",
-      "metrics": {
-        "rmsle": 0.5259604225977649,
-        "mae": 102.68135022817687,
-        "rmse": 433.07602366915944,
-        "rmsle_active": 0.4467072611913368,
-        "mae_active": 124.04154479268418,
-        "rmse_active": 476.69597578962555,
-        "n_rows": 171072,
-        "n_rows_active": 139871
-      }
+      "checkpoint": "artifacts\\deep_lstm.pt",
+      "checkpoint_bytes": 952349,
+      "checkpoint_sha256": "9764d570c85d4807809b895d240b87dac1587e0bbdc4a3db6e90a83966a76a62",
+      "params": 235532,
+      "status": "complete",
+      "config_sha256": "0e08e34bb74cf54b5ee93edc804caf67d1c2ca0ddbda4ac6ed4cc479728ac21a",
+      "train": {
+        "rows_available": 2067417,
+        "rows_used": 2067417,
+        "rows_masked": 38907,
+        "windows": 243111,
+        "epochs_run": 1,
+        "best_epoch": 1,
+        "stop_reason": "max_epochs",
+        "seconds": 29.425816774368286,
+        "seconds_per_epoch": 29.425816774368286,
+        "device": "cuda",
+        "torch_version": "2.15.0+cu132"
+      },
+      "valid": {
+        "n_rows": 299376,
+        "n_active": 245303,
+        "full_grid": {
+          "rmsle": 0.5709515612300422,
+          "mae": 148.02545012239622,
+          "rmse": 708.1594646865223
+        },
+        "active_slice": {
+          "rmsle": 0.5492959585997562,
+          "mae": 179.98840205682114,
+          "rmse": 781.8686122528376
+        },
+        "per_horizon_rmsle": [
+          0.534496991589949,
+          0.5254596407169011,
+          0.5473447445273059,
+          0.5366914835763801,
+          0.5772296060462649,
+          0.5786883432200043,
+          0.5943983679888418,
+          0.5840557111538902,
+          0.5707640943198942,
+          0.5737843967549558,
+          0.5335636355361465,
+          0.5671659538705601,
+          0.5891036887459133,
+          0.6041933612778483,
+          0.5975360629423955,
+          0.6188165535502145
+        ],
+        "inference_seconds": 0.0
+      },
+      "fold_metrics": [
+        {
+          "rmsle": 0.5344134361603262,
+          "mae": 158.47357488408645,
+          "rmse": 585.3720116762502,
+          "rmsle_active": 0.5672487676770225,
+          "mae_active": 193.68306729865017,
+          "rmse_active": 647.2362453422327,
+          "n_rows": 28512,
+          "n_rows_active": 23322
+        },
+        {
+          "rmsle": 0.7489137097867823,
+          "mae": 155.48883100224523,
+          "rmse": 548.2806540457673,
+          "rmsle_active": 0.5357644665435332,
+          "mae_active": 186.98514688882847,
+          "rmse_active": 604.8751674679154,
+          "n_rows": 28512,
+          "n_rows_active": 23173
+        },
+        {
+          "rmsle": 0.573335495388689,
+          "mae": 180.85998477434353,
+          "rmse": 716.3691173830028,
+          "rmsle_active": 0.591175177885701,
+          "mae_active": 224.60965853076775,
+          "rmse_active": 798.5712648823395,
+          "n_rows": 28512,
+          "n_rows_active": 22944
+        }
+      ]
     },
     {
       "tier": "deep-gru",
       "architecture": "gru",
-      "params": 175401,
-      "best_epoch": 7,
-      "config_sha256": "5c5ad43844b91401",
-      "device": "cuda",
-      "torch_version": "2.15.0+cu132",
-      "metrics": {
-        "rmsle": 0.5299522305843898,
-        "mae": 108.38278166900339,
-        "rmse": 487.006207450831,
-        "rmsle_active": 0.45946449820703056,
-        "mae_active": 131.07846600177817,
-        "rmse_active": 536.6949954801332,
-        "n_rows": 171072,
-        "n_rows_active": 139871
-      }
+      "checkpoint": "artifacts\\deep_gru.pt",
+      "checkpoint_bytes": 727045,
+      "checkpoint_sha256": "24daaae649c8364c63363a314156888b1ac1b1b569dafd091882da1783796569",
+      "params": 179212,
+      "status": "complete",
+      "config_sha256": "0e08e34bb74cf54b5ee93edc804caf67d1c2ca0ddbda4ac6ed4cc479728ac21a",
+      "train": {
+        "rows_available": 2067417,
+        "rows_used": 2067417,
+        "rows_masked": 38907,
+        "windows": 243111,
+        "epochs_run": 1,
+        "best_epoch": 1,
+        "stop_reason": "max_epochs",
+        "seconds": 23.544735193252563,
+        "seconds_per_epoch": 23.544735193252563,
+        "device": "cuda",
+        "torch_version": "2.15.0+cu132"
+      },
+      "valid": {
+        "n_rows": 299376,
+        "n_active": 245303,
+        "full_grid": {
+          "rmsle": 0.544732851036448,
+          "mae": 107.70607941408959,
+          "rmse": 543.9764564215175
+        },
+        "active_slice": {
+          "rmsle": 0.506268749196883,
+          "mae": 130.70695522527936,
+          "rmse": 600.1468064182645
+        },
+        "per_horizon_rmsle": [
+          0.48666803976805856,
+          0.4920496514020545,
+          0.5236881826092368,
+          0.5377354894119772,
+          0.5722428499933984,
+          0.5510700562538031,
+          0.5579860687782556,
+          0.5273973279393221,
+          0.5455773247931097,
+          0.5655156549146924,
+          0.5416448850313468,
+          0.5584852777312679,
+          0.5530569260607932,
+          0.5810939463267251,
+          0.5538024465689458,
+          0.5681884259240141
+        ],
+        "inference_seconds": 0.0
+      },
+      "fold_metrics": [
+        {
+          "rmsle": 0.4885352412298843,
+          "mae": 99.43747471604334,
+          "rmse": 348.8667666823098,
+          "rmsle_active": 0.5160572081276453,
+          "mae_active": 121.51340287557629,
+          "rmse_active": 385.73618117868955,
+          "n_rows": 28512,
+          "n_rows_active": 23322
+        },
+        {
+          "rmsle": 0.7349824854440667,
+          "mae": 107.54515956459063,
+          "rmse": 376.31776797967166,
+          "rmsle_active": 0.5400405615237491,
+          "mae_active": 127.79929206895255,
+          "rmse_active": 411.5987074997858,
+          "n_rows": 28512,
+          "n_rows_active": 23173
+        },
+        {
+          "rmsle": 0.6059812631674486,
+          "mae": 110.94425112947802,
+          "rmse": 410.8596572904669,
+          "rmsle_active": 0.5125264831741378,
+          "mae_active": 137.3935939012105,
+          "rmse_active": 457.9883701558999,
+          "n_rows": 28512,
+          "n_rows_active": 22944
+        }
+      ]
     }
   ],
-  "notes": "percentage-error metric excluded at 35.2% zeros in train+valid"
+  "notes": "percentage-error metric excluded at 35.2% zeros in train+valid",
+  "track": "S4",
+  "comparison": {
+    "status": "pending_s3",
+    "source_artifact": "artifacts\\classical_results.json",
+    "source_sha256": null,
+    "protocol": "three_tail_folds",
+    "protocol_match": false,
+    "baseline_tier": "hgb",
+    "baseline_full_grid_rmsle": null,
+    "best_deep_tier": "deep-gru",
+    "best_deep_full_grid_rmsle": null,
+    "delta_rmsle": null,
+    "beats_hgb": false,
+    "rows_match": false,
+    "active_comparison": "unavailable",
+    "seed_check": {
+      "status": "not_run",
+      "seeds": [],
+      "rmsle_range": null
+    },
+    "training_cost": {
+      "hgb_seconds": null,
+      "deep_seconds": null,
+      "hgb_params": null,
+      "deep_params": null
+    },
+    "reason": "S3 artifact missing; re-run within 24h of S3 landing"
+  }
 }
