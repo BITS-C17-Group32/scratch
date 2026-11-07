@@ -202,8 +202,6 @@ def train_one(arch, cfg, device, train_df, valid_df=None, cat_maps=None, scaler=
             if use_amp:
                 preds = preds.float()
             loss = criterion(preds, y_log)
-            if torch.isnan(loss):
-                raise RuntimeError(f"NaN loss encountered at epoch {epoch}")
             loss.backward()
             if use_amp:
                 for p_e, p_m in zip(exec_params, model.parameters()):
@@ -217,6 +215,11 @@ def train_one(arch, cfg, device, train_df, valid_df=None, cat_maps=None, scaler=
 
         avg_train_loss = (loss_sum / max(1, n_batches)).item()
         epochs_run = epoch
+
+        # One NaN check per epoch: a per-batch torch.isnan forces a GPU->CPU
+        # sync every step, ~15% slower per epoch on mps.
+        if torch.isnan(loss_sum):
+            raise RuntimeError(f"NaN loss encountered at epoch {epoch}")
 
         if valid_panels is not None:
             model.eval()
