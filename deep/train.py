@@ -163,7 +163,10 @@ def train_one(arch, cfg, device, train_df, valid_df=None, cat_maps=None, scaler=
         exec_params = list(exec_model.parameters())
 
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay
+        model.parameters(),
+        lr=cfg.learning_rate,
+        weight_decay=cfg.weight_decay,
+        fused=device.type in ("mps", "cuda"),
     )
     criterion = nn.MSELoss()
 
