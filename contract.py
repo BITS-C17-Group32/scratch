@@ -1,4 +1,43 @@
-"""Dataset split loaders, truth filtering masks, and RMSLE evaluation scorer."""
+"""Dataset split loaders, truth filtering masks, and RMSLE evaluation scorer.
+
+Contract defines split loaders (load_split, load_frame), truth masks
+(closure_rows, preopening_rows, fit_rows aka training_mask), and the RMSLE
+scorer (score) for demand-forecasting splits under splits/
+(train/valid/local_test parquet + split_manifest.json).
+
+Locked S1 data contract decisions:
+- Pre-opening masking: loaders return full frames — all rows, including
+  pre-opening grid fill rows; loaders never drop or mask anything. Training
+  consumers apply training_mask (fit_rows); cross-validation folds and the
+  frozen local_test assembly apply the mask at assembly time, never inside
+  loaders.
+- Dual evaluation: score() reports each metric over all rows and over the
+  active-demand slice (y_true > 0) via the *_active keys.
+- Closure census: holiday closure grid fills are 5,346 train / 0 valid /
+  1,782 local_test (7,128 total), manifest-pinned under why.grid_fill_rows;
+  every fill row is kept by the training mask (their sales are 0 and their
+  id is NaN).
+- Earthquake caveat: earthquake_decay is a producer-owned feature; the
+  contract pins only its dtype and never re-derives or verifies the decay
+  sweep (the Apr 2016 earthquake sits inside valid).
+- Freeze discipline: local_test is frozen — readable only via FREEZE_RUN=1
+  through the freeze path, scored once after the design is frozen, never
+  tuned on.
+- Masks are index-aligned boolean Series derived from the frame you pass in.
+  NEVER mix positional indexing with these masks; if an index is reset or
+  reordered, recompute or reindex the mask before combining.
+- Importing contract.py is side-effect-free: no file reads, no data parsing,
+  nothing printed; only small module-level constants are constructed.
+- Scoring paths must never apply the mask: pre-opening holdout-context rows
+  (12,804 total: 5,544 valid + 7,260 local_test) are scored as-is, never
+  dropped.
+- Day-2 ledger: loader-level duplicate (store_nbr, family, date), duplicate
+  id, and negative-sales checks are deliberately deferred to Day 2 together
+  with S3/S4.
+- RMSLE is the scoreboard metric, not MAPE; optimize it directly.
+  MAPE is undefined at zero demand and skew-dominated:
+  no MAPE value ever appears in contract outputs.
+"""
 
 from __future__ import annotations
 
