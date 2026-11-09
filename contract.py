@@ -373,12 +373,32 @@ def load_split(split: str) -> pd.DataFrame:
         raise ContractError(
             f"{split}: start bound {start_str!r} invalid: {error}; {RUN_MAIN_POINTER}"
         ) from error
+    if pd.isna(start_ts):
+        raise ContractError(
+            f"{split}: start bound {start_str!r} parses to NaT, not a real date; "
+            f"{RUN_MAIN_POINTER}"
+        )
+    if start_ts.tzinfo is not None:
+        raise ContractError(
+            f"{split}: start bound {start_str!r} carries a timezone "
+            f"(got tz {start_ts.tzinfo!r}); naive timestamps only; {RUN_MAIN_POINTER}"
+        )
     try:
         end_ts = pd.Timestamp(end_str)
     except Exception as error:
         raise ContractError(
             f"{split}: end bound {end_str!r} invalid: {error}; {RUN_MAIN_POINTER}"
         ) from error
+    if pd.isna(end_ts):
+        raise ContractError(
+            f"{split}: end bound {end_str!r} parses to NaT, not a real date; "
+            f"{RUN_MAIN_POINTER}"
+        )
+    if end_ts.tzinfo is not None:
+        raise ContractError(
+            f"{split}: end bound {end_str!r} carries a timezone "
+            f"(got tz {end_ts.tzinfo!r}); naive timestamps only; {RUN_MAIN_POINTER}"
+        )
     actual_start = data["date"].min()
     actual_end = data["date"].max()
     if actual_start != start_ts or actual_end != end_ts:
