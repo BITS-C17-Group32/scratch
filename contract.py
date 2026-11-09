@@ -995,6 +995,106 @@ def _check_scorer() -> None:
         dup = pd.DataFrame([[1, 2]], columns=["date", "date"])
         load_frame(train=dup, valid=dup)
 
+    def _test_closure_rows_dup_col() -> None:
+        dup = pd.concat(
+            [
+                pd.Series([1], dtype="UInt32", name="id"),
+                pd.Series([1], dtype="UInt32", name="id"),
+                pd.Series(
+                    [pd.Timestamp("2016-01-01")],
+                    dtype="datetime64[us]",
+                    name="date",
+                ),
+                pd.Series([1], dtype="int8", name="store_nbr"),
+            ],
+            axis=1,
+        )
+        closure_rows(dup)
+
+    def _test_preopening_rows_dup_col() -> None:
+        dup = pd.concat(
+            [
+                pd.Series([1], dtype="int8", name="store_nbr"),
+                pd.Series([1], dtype="int8", name="store_nbr"),
+                pd.Series(
+                    [pd.Timestamp("2016-01-01")],
+                    dtype="datetime64[us]",
+                    name="date",
+                ),
+            ],
+            axis=1,
+        )
+        preopening_rows(dup)
+
+    def _test_preopening_rows_nullable_na() -> None:
+        df = pd.DataFrame(
+            {
+                "store_nbr": pd.Series([1, pd.NA], dtype="Int64"),
+                "date": pd.Series(
+                    [pd.Timestamp("2016-01-01"), pd.Timestamp("2016-01-02")],
+                    dtype="datetime64[us]",
+                ),
+            }
+        )
+        preopening_rows(df)
+
+    def _test_load_frame_permuted_cols() -> None:
+        cols = list(PINNED_DTYPES)
+        i_fam, i_id = cols.index("family"), cols.index("id")
+        cols[i_fam], cols[i_id] = cols[i_id], cols[i_fam]
+        permuted = pd.DataFrame(
+            {col: pd.Series([], dtype=PINNED_DTYPES[col]) for col in cols}
+        )
+        load_frame(train=permuted, valid=permuted)
+
+    def _test_load_frame_category_mismatch() -> None:
+        cat_a = pd.DataFrame(
+            {
+                col: (
+                    pd.Series(pd.Categorical([], categories=["greeting"]))
+                    if col == "family"
+                    else pd.Series([], dtype=dt)
+                )
+                for col, dt in PINNED_DTYPES.items()
+            }
+        )
+        cat_b = pd.DataFrame(
+            {
+                col: (
+                    pd.Series(pd.Categorical([], categories=["farewell"]))
+                    if col == "family"
+                    else pd.Series([], dtype=dt)
+                )
+                for col, dt in PINNED_DTYPES.items()
+            }
+        )
+        load_frame(train=cat_a, valid=cat_b)
+
+    def _test_tampered_manifest(
+        tamper: Callable[[dict[str, Any]], Any],
+    ) -> None:
+        import json as _json
+        import shutil as _shutil
+        import sys as _sys
+        import tempfile as _tempfile
+        from pathlib import Path as _Path
+        from unittest.mock import patch
+
+        manifest = _json.loads(
+            (REPO_ROOT / "splits" / "split_manifest.json").read_text(encoding="utf-8")
+        )
+        tamper(manifest)
+        tmp = _Path(_tempfile.mkdtemp())
+        try:
+            (tmp / "split_manifest.json").write_text(
+                _json.dumps(manifest), encoding="utf-8"
+            )
+            self_mod = _sys.modules[__name__]
+            with patch.object(self_mod, "SPLITS_DIR", tmp):
+                _load_manifest()
+        finally:
+            _shutil.rmtree(tmp, ignore_errors=True)
+
     dummy_date = pd.Timestamp("2016-01-01")
 
     cases: list[tuple[str, Callable[[], Any]]] = [
@@ -1074,6 +1174,35 @@ def _check_scorer() -> None:
         ("load_split duplicate column", _test_load_split_dup_col),
         ("load_frame extra column", _test_load_frame_extra_col),
         ("load_frame duplicate column", _test_load_frame_dup_col),
+        ("closure_rows duplicate column", _test_closure_rows_dup_col),
+        ("preopening_rows duplicate column", _test_preopening_rows_dup_col),
+        (
+            "preopening_rows nullable store_nbr with NA",
+            _test_preopening_rows_nullable_na,
+        ),
+        ("load_frame permuted columns", _test_load_frame_permuted_cols),
+        (
+            "load_frame category domain mismatch",
+            _test_load_frame_category_mismatch,
+        ),
+        (
+            "load_manifest NaT bound",
+            lambda: _test_tampered_manifest(
+                lambda m: m["bounds"].__setitem__("valid", ["nan", "2016-09-11"])
+            ),
+        ),
+        (
+            "load_manifest timezone bound",
+            lambda: _test_tampered_manifest(
+                lambda m: m["bounds"].__setitem__(
+                    "train", ["2013-01-01+00:00", "2016-03-27"]
+                )
+            ),
+        ),
+        (
+            "load_manifest extra column",
+            lambda: _test_tampered_manifest(lambda m: m["columns"].append("oxygen")),
+        ),
     ]
     for label, call in cases:
         must_refuse(call, label)
