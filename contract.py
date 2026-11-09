@@ -484,12 +484,24 @@ def load_frame(
     return data
 
 
+def _require_unique_columns(df: pd.DataFrame, fn_name: str) -> None:
+    """Refuse duplicated column labels; df[col] would widen to a DataFrame."""
+    names = list(df.columns)
+    dup_names = sorted({name for name in names if names.count(name) > 1})
+    if dup_names:
+        raise ContractError(
+            f"{fn_name}: columns contain duplicates {dup_names}; "
+            "df[col] would not be a Series"
+        )
+
+
 def closure_rows(df: pd.DataFrame) -> pd.Series:
     """Return boolean mask for holiday closure fill rows (id is NaN)."""
     if not isinstance(df, pd.DataFrame):  # pyright: ignore[reportUnnecessaryIsInstance]
         raise ContractError(
             f"closure_rows: input must be a DataFrame, got {type(df).__name__}"
         )
+    _require_unique_columns(df, "closure_rows")
     if "id" not in df.columns:
         raise ContractError("closure_rows: input dataframe missing 'id' column")
     return df["id"].isna()
@@ -501,6 +513,7 @@ def preopening_rows(df: pd.DataFrame) -> pd.Series:
         raise ContractError(
             f"preopening_rows: input must be a DataFrame, got {type(df).__name__}"
         )
+    _require_unique_columns(df, "preopening_rows")
     for col in ("store_nbr", "date"):
         if col not in df.columns:
             raise ContractError(f"preopening_rows: missing {col!r} column")
@@ -508,6 +521,12 @@ def preopening_rows(df: pd.DataFrame) -> pd.Series:
     if not pd.api.types.is_integer_dtype(store_col):
         raise ContractError(
             f"preopening_rows: 'store_nbr' must be integer dtype, got {store_col.dtype}"
+        )
+    if store_col.isna().any():
+        raise ContractError(
+            f"preopening_rows: 'store_nbr' contains {int(store_col.isna().sum())} "
+            "<NA> value(s); nullable integer store_nbr force-resolves masks at "
+            "indexing; use a plain integer dtype"
         )
     date_col = df["date"]
     if (
@@ -532,6 +551,7 @@ def fit_rows(df: pd.DataFrame) -> pd.Series:
         raise ContractError(
             f"fit_rows: input must be a DataFrame, got {type(df).__name__}"
         )
+    _require_unique_columns(df, "fit_rows")
     is_preopen = preopening_rows(df)
     is_closure = closure_rows(df)
     return (~is_preopen) | is_closure
