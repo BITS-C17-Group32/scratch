@@ -7,8 +7,14 @@ import os
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import pyarrow as pa  # pyright: ignore[reportMissingTypeStubs]
+from sklearn.metrics import (  # pyright: ignore[reportMissingTypeStubs]
+    mean_absolute_error,
+    root_mean_squared_error,
+    root_mean_squared_log_error,
+)
 
 __all__ = [
     "PINNED_DTYPES",
@@ -18,6 +24,7 @@ __all__ = [
     "load_frame",
     "load_split",
     "preopening_rows",
+    "score",
     "training_mask",
 ]
 
@@ -243,3 +250,78 @@ def fit_rows(df: pd.DataFrame) -> pd.Series:
 
 
 training_mask = fit_rows
+
+
+def score(
+    y_true: np.ndarray | Any,
+    y_pred: np.ndarray | Any,
+    is_active: np.ndarray | Any | None = None,
+) -> dict[str, float | int]:
+    """Compute RMSLE, MAE, and RMSE on full and active demand slices.
+
+    Predictions are clipped to non-negative values before computing metrics.
+    When n_rows_active == 0, active metrics return 0.0.
+    """
+    for name, raw in (("y_true", y_true), ("y_pred", y_pred)):
+        try:
+            arr = np.asarray(raw)
+        except Exception as error:
+            raise ContractError(
+                f"score: {name} could not be converted to array: {error}"
+            ) from error
+        if arr.dtype.kind not in "fiub":
+            raise ContractError(
+                f"score: {name} must be numeric array; got dtype {arr.dtype}"
+            )
+    try:
+        truth = np.asarray(y_true, dtype=np.float64)
+        pred = np.asarray(y_pred, dtype=np.float64)
+    except (TypeError, ValueError) as error:
+        raise ContractError(
+            f"score: y_true and y_pred must be numeric arrays; {error}"
+        ) from error
+    for name, values in (("y_true", truth), ("y_pred", pred)):
+        if values.ndim != 1:
+            raise ContractError(f"score: {name} must be 1-D, got shape {values.shape}")
+        if not np.isfinite(values).all():
+            raise ContractError(f"score: {name} contains NaN or infinity")
+    if truth.shape != pred.shape:
+        raise ContractError(f"score: shape mismatch {truth.shape} vs {pred.shape}")
+    if truth.size == 0:
+        raise ContractError("score: empty inputs")
+    if (truth < 0).any():
+        raise ContractError(
+            "score: y_true must be non-negative for RMSLE (log1p domain)"
+        )
+    pred = np.clip(pred, 0.0, None)
+    if is_active is None:
+        active = truth > 0
+    else:
+        active = np.asarray(is_active)
+        if active.dtype != np.bool_:
+            raise ContractError(
+                f"score: is_active must be boolean mask; got dtype {active.dtype}"
+            )
+        if active.shape != truth.shape:
+            raise ContractError(
+                f"score: is_active shape {active.shape} != {truth.shape}"
+            )
+    result: dict[str, float | int] = {
+        "rmsle": float(root_mean_squared_log_error(truth, pred)),
+        "mae": float(mean_absolute_error(truth, pred)),
+        "rmse": float(root_mean_squared_error(truth, pred)),
+    }
+    n_active = int(active.sum())
+    if n_active:
+        sub_true = truth[active]
+        sub_pred = pred[active]
+        result["rmsle_active"] = float(root_mean_squared_log_error(sub_true, sub_pred))
+        result["mae_active"] = float(mean_absolute_error(sub_true, sub_pred))
+        result["rmse_active"] = float(root_mean_squared_error(sub_true, sub_pred))
+    else:
+        result["rmsle_active"] = 0.0
+        result["mae_active"] = 0.0
+        result["rmse_active"] = 0.0
+    result["n_rows"] = int(truth.size)
+    result["n_rows_active"] = n_active
+    return result
