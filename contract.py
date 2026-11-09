@@ -327,10 +327,18 @@ def load_split(split: str) -> pd.DataFrame:
         )
     if not data.columns.is_unique:
         raise ContractError(f"{split}: columns contain duplicates; {RUN_MAIN_POINTER}")
-    if set(data.columns) != set(PINNED_DTYPES) or len(data.columns) != 26:
+    missing = [c for c in PINNED_DTYPES if c not in data.columns]
+    extra = [c for c in data.columns if c not in PINNED_DTYPES]
+    if missing or extra:
+        details: list[str] = []
+        if missing:
+            details.append(f"missing {missing}")
+        if extra:
+            details.append(f"extra {extra}")
+        details_str = "; ".join(details)
         raise ContractError(
             f"{split}: columns must exactly match the 26 pinned columns; "
-            f"{RUN_MAIN_POINTER}"
+            f"{details_str}; {RUN_MAIN_POINTER}"
         )
     for col, expected_dtype in PINNED_DTYPES.items():
         if str(data[col].dtype) != expected_dtype:
@@ -401,10 +409,18 @@ def load_frame(
             raise ContractError(
                 f"load_frame: {role} columns contain duplicates; {RUN_MAIN_POINTER}"
             )
-        if set(frame.columns) != set(PINNED_DTYPES) or len(frame.columns) != 26:
+        missing = [c for c in PINNED_DTYPES if c not in frame.columns]
+        extra = [c for c in frame.columns if c not in PINNED_DTYPES]
+        if missing or extra:
+            details: list[str] = []
+            if missing:
+                details.append(f"missing {missing}")
+            if extra:
+                details.append(f"extra {extra}")
+            details_str = "; ".join(details)
             raise ContractError(
-                f"load_frame: {role} columns must match the 26 pinned columns; "
-                f"{RUN_MAIN_POINTER}"
+                f"load_frame: {role} columns must exactly match the 26 pinned columns; "
+                f"{details_str}; {RUN_MAIN_POINTER}"
             )
         for col, expected_dtype in PINNED_DTYPES.items():
             actual_dtype = str(frame[col].dtype)
