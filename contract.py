@@ -136,6 +136,87 @@ def _load_manifest() -> dict[str, Any]:
         raise ContractError(
             f"manifest field 'columns' must be a list; {RUN_MAIN_POINTER}"
         )
+    for split in SPLIT_NAMES:
+        if split not in manifest["rows"]:
+            raise ContractError(
+                f"manifest rows missing split {split!r}; {RUN_MAIN_POINTER}"
+            )
+        val = manifest["rows"][split]
+        if type(val) is not int:
+            raise ContractError(
+                f"manifest rows[{split!r}] must be int, got {val!r} "
+                f"({type(val).__name__}); {RUN_MAIN_POINTER}"
+            )
+    total = manifest["total"]
+    if type(total) is not int or total != 3008016:
+        raise ContractError(
+            f"manifest total {total!r} ({type(total).__name__}) != 3008016; "
+            f"{RUN_MAIN_POINTER}"
+        )
+    for split in SPLIT_NAMES:
+        if split not in manifest["bounds"]:
+            raise ContractError(
+                f"manifest bounds missing split {split!r}; {RUN_MAIN_POINTER}"
+            )
+        split_bounds = manifest["bounds"][split]
+        if not isinstance(split_bounds, (list, tuple)) or len(split_bounds) != 2:
+            raise ContractError(
+                f"manifest bounds[{split!r}] must be a 2-element sequence; "
+                f"{RUN_MAIN_POINTER}"
+            )
+        try:
+            start_ts = pd.Timestamp(split_bounds[0])
+        except Exception as error:
+            raise ContractError(
+                f"manifest bounds[{split!r}] start timestamp invalid "
+                f"({split_bounds[0]!r}): {error}; {RUN_MAIN_POINTER}"
+            ) from error
+        try:
+            end_ts = pd.Timestamp(split_bounds[1])
+        except Exception as error:
+            raise ContractError(
+                f"manifest bounds[{split!r}] end timestamp invalid "
+                f"({split_bounds[1]!r}): {error}; {RUN_MAIN_POINTER}"
+            ) from error
+        if start_ts >= end_ts:
+            raise ContractError(
+                f"manifest bounds[{split!r}] start {start_ts} not strictly "
+                f"before end {end_ts}; {RUN_MAIN_POINTER}"
+            )
+    if "grid_fill_rows" not in manifest["why"]:
+        raise ContractError(
+            f"manifest field 'why.grid_fill_rows' missing; {RUN_MAIN_POINTER}"
+        )
+    grid_fills = manifest["why"]["grid_fill_rows"]
+    if not isinstance(grid_fills, dict):
+        raise ContractError(
+            f"manifest field 'why.grid_fill_rows' must be an object; {RUN_MAIN_POINTER}"
+        )
+    grid_fill_sum = 0
+    for split in SPLIT_NAMES:
+        if split not in grid_fills:
+            raise ContractError(
+                f"manifest why.grid_fill_rows missing split {split!r}; "
+                f"{RUN_MAIN_POINTER}"
+            )
+        count = grid_fills[split]
+        if type(count) is not int:
+            raise ContractError(
+                f"manifest why.grid_fill_rows[{split!r}] must be int, got "
+                f"{count!r} ({type(count).__name__}); {RUN_MAIN_POINTER}"
+            )
+        grid_fill_sum += count
+    if grid_fill_sum != 7128:
+        raise ContractError(
+            f"manifest why.grid_fill_rows sum is {grid_fill_sum}, expected 7128; "
+            f"{RUN_MAIN_POINTER}"
+        )
+    frame_rows_sum = int(manifest["rows"]["train"]) + int(manifest["rows"]["valid"])
+    if FRAME_ROWS != frame_rows_sum:
+        raise ContractError(
+            f"FRAME_ROWS {FRAME_ROWS} != train ({manifest['rows']['train']}) + "
+            f"valid ({manifest['rows']['valid']}); {RUN_MAIN_POINTER}"
+        )
     return manifest
 
 
@@ -354,18 +435,49 @@ def _check_manifest_metadata() -> None:
             )
     print("PASS manifest: bounds end 2016-03-27 / 2016-09-11 / 2017-08-15")
     closures = {"train": 5346, "valid": 0, "local_test": 1782}
-    grid_fills = manifest.get("grid_fill_rows", closures)
+    grid_fills = manifest["why"]["grid_fill_rows"]
     for split, count in closures.items():
-        if int(grid_fills[split]) != count:
+        measured_fill = int(grid_fills[split])
+        if measured_fill != count:
             raise ContractError(
-                f"manifest {split} grid fills {grid_fills[split]} != pinned {count}"
+                f"manifest {split} grid fills {measured_fill} != pinned {count}"
             )
+    fill_sum = sum(int(grid_fills[split]) for split in closures)
+    if fill_sum != 7128:
+        raise ContractError(f"manifest why.grid_fill_rows sum {fill_sum} != 7128")
     print("PASS manifest: grid_fill_rows 5,346 / 0 / 1,782 (7,128 closure fills)")
     if len(manifest["columns"]) != 26:
         raise ContractError(
             f"manifest has {len(manifest['columns'])} columns, expected 26"
         )
-    print("PASS manifest: 26 columns and pinned dtypes verified")
+    print("PASS manifest: 26 columns")
+    pinned_starts = {
+        "train": "2013-01-01",
+        "valid": "2016-03-28",
+        "local_test": "2016-09-12",
+    }
+    for split, start in pinned_starts.items():
+        measured_start = manifest["bounds"][split][0]
+        if measured_start != start:
+            raise ContractError(
+                f"manifest {split} start date {measured_start} != pinned {start}"
+            )
+    print("PASS manifest: bounds start 2013-01-01 / 2016-03-28 / 2016-09-12")
+    total_measured = sum(int(manifest["rows"][split]) for split in SPLIT_NAMES)
+    if int(manifest["total"]) != 3008016 or total_measured != 3008016:
+        raise ContractError(
+            f"manifest total {manifest['total']} or "
+            f"sum(rows) {total_measured} != 3008016"
+        )
+    frame_sum = int(manifest["rows"]["train"]) + int(manifest["rows"]["valid"])
+    if FRAME_ROWS != 2405700 or frame_sum != 2405700:
+        raise ContractError(
+            f"FRAME_ROWS {FRAME_ROWS} or train+valid {frame_sum} != 2405700"
+        )
+    print(
+        "PASS manifest: total 3,008,016 = sum(rows); "
+        "FRAME_ROWS 2,405,700 = train + valid"
+    )
 
 
 def _check_data_contract() -> None:
