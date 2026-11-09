@@ -151,6 +151,43 @@ def _load_manifest() -> dict[str, Any]:
         raise ContractError(
             f"manifest field 'columns' must be a list; {RUN_MAIN_POINTER}"
         )
+    for idx, col in enumerate(manifest["columns"]):
+        if not isinstance(col, str):
+            raise ContractError(
+                f"manifest 'columns' element at index {idx} must be str, got {col!r}; "
+                f"{RUN_MAIN_POINTER}"
+            )
+    missing = [c for c in PINNED_DTYPES if c not in manifest["columns"]]
+    extra = [c for c in manifest["columns"] if c not in PINNED_DTYPES]
+    if missing or extra:
+        details: list[str] = []
+        if missing:
+            details.append(f"missing {missing}")
+        if extra:
+            details.append(f"extra {extra}")
+        raise ContractError(
+            f"manifest 'columns' must be the 26 pinned columns; {'; '.join(details)}; "
+            f"{RUN_MAIN_POINTER}"
+        )
+    pinned_columns = list(PINNED_DTYPES)
+    if manifest["columns"] != pinned_columns:
+        for i, (got, want) in enumerate(
+            zip(manifest["columns"], pinned_columns, strict=False)
+        ):
+            if got != want:
+                raise ContractError(
+                    f"manifest 'columns' matches the pinned set but is out of "
+                    f"pinned order at position {i}: got {got!r}, expected {want!r}; "
+                    f"{RUN_MAIN_POINTER}"
+                )
+        if len(manifest["columns"]) > len(pinned_columns):
+            i = len(pinned_columns)
+            got = manifest["columns"][i]
+            raise ContractError(
+                f"manifest 'columns' matches the pinned set but is out of "
+                f"pinned order at position {i}: got {got!r}, expected None; "
+                f"{RUN_MAIN_POINTER}"
+            )
     for split in SPLIT_NAMES:
         if split not in manifest["rows"]:
             raise ContractError(
@@ -195,6 +232,17 @@ def _load_manifest() -> dict[str, Any]:
                 f"manifest bounds[{split!r}] start timestamp invalid "
                 f"({split_bounds[0]!r}): {error}; {RUN_MAIN_POINTER}"
             ) from error
+        if pd.isna(start_ts):
+            raise ContractError(
+                f"manifest bounds[{split!r}] start timestamp {split_bounds[0]!r} "
+                f"parses to NaT, not a real date; {RUN_MAIN_POINTER}"
+            )
+        if start_ts.tzinfo is not None:
+            raise ContractError(
+                f"manifest bounds[{split!r}] start timestamp {split_bounds[0]!r} "
+                f"carries a timezone (got tz {start_ts.tzinfo!r}); "
+                f"naive timestamps only; {RUN_MAIN_POINTER}"
+            )
         try:
             end_ts = pd.Timestamp(split_bounds[1])
         except Exception as error:
@@ -202,6 +250,17 @@ def _load_manifest() -> dict[str, Any]:
                 f"manifest bounds[{split!r}] end timestamp invalid "
                 f"({split_bounds[1]!r}): {error}; {RUN_MAIN_POINTER}"
             ) from error
+        if pd.isna(end_ts):
+            raise ContractError(
+                f"manifest bounds[{split!r}] end timestamp {split_bounds[1]!r} "
+                f"parses to NaT, not a real date; {RUN_MAIN_POINTER}"
+            )
+        if end_ts.tzinfo is not None:
+            raise ContractError(
+                f"manifest bounds[{split!r}] end timestamp {split_bounds[1]!r} "
+                f"carries a timezone (got tz {end_ts.tzinfo!r}); "
+                f"naive timestamps only; {RUN_MAIN_POINTER}"
+            )
         if start_ts >= end_ts:
             raise ContractError(
                 f"manifest bounds[{split!r}] start {start_ts} not strictly "
