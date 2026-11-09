@@ -32,7 +32,6 @@ from typing import Any, cast
 
 import numpy as np
 import pandas as pd
-import pyarrow as pa  # pyright: ignore[reportMissingTypeStubs]
 from sklearn.metrics import (  # pyright: ignore[reportMissingTypeStubs]
     mean_absolute_error,
     root_mean_squared_error,
@@ -317,10 +316,15 @@ def load_split(split: str) -> pd.DataFrame:
         raise ContractError(f"{path.name} missing; {RUN_MAIN_POINTER}")
     try:
         data = pd.read_parquet(path)
-    except (ValueError, OSError, pa.ArrowException) as error:
+    except Exception as error:
         raise ContractError(
             f"{path.name} unreadable: {error}; {RUN_MAIN_POINTER}"
         ) from error
+    if not isinstance(data, pd.DataFrame):  # pyright: ignore[reportUnnecessaryIsInstance]
+        raise ContractError(
+            f"{split}: reader returned {type(data).__name__}, expected a DataFrame; "
+            f"{RUN_MAIN_POINTER}"
+        )
     if not data.columns.is_unique:
         raise ContractError(f"{split}: columns contain duplicates; {RUN_MAIN_POINTER}")
     if set(data.columns) != set(PINNED_DTYPES) or len(data.columns) != 26:
