@@ -131,13 +131,6 @@ DELAYS_OPEN_UNTIL: dict[int, pd.Timestamp] = {
     53: pd.Timestamp("2014-05-29"),
 }
 
-CHRISTMAS_DATES = (
-    pd.Timestamp("2013-12-25"),
-    pd.Timestamp("2014-12-25"),
-    pd.Timestamp("2015-12-25"),
-    pd.Timestamp("2016-12-25"),
-)
-
 RUN_MAIN_POINTER = "run 'uv run python main.py' to rebuild splits/"
 
 
@@ -444,7 +437,12 @@ def score(
     if is_active is None:
         active = truth > 0
     else:
-        active = np.asarray(is_active)
+        try:
+            active = np.asarray(is_active)
+        except (ValueError, TypeError) as error:
+            raise ContractError(
+                f"score: is_active could not be converted to a boolean array: {error}"
+            ) from error
         if active.dtype != np.bool_:
             raise ContractError(
                 f"score: is_active must be boolean mask; got dtype {active.dtype}"
@@ -633,6 +631,7 @@ def _check_data_contract() -> None:
             f"{list(preopening_rows(probe))} vs {expected_preopen}"
         )
     for store, open_date in sorted(DELAYS_OPEN_UNTIL.items()):
+        # Store 52 opens 2017-04-20 in frozen local_test, outside train; cannot verify.
         if store == 52:
             continue
         day_sales = float(
@@ -725,27 +724,31 @@ def _check_scorer() -> None:
             return
         raise ContractError(f"score guard regression: {label} did not raise")
 
-    must_refuse(lambda: score(["1.0", "2.0"], np.ones(2)), "string list y_true")
-    must_refuse(lambda: score(np.array([1 + 2j]), np.ones(1)), "complex y_true")
-    must_refuse(
-        lambda: score(np.array(["2026-01-01"], dtype="datetime64[D]"), np.ones(1)),
-        "datetime64 y_true",
-    )
-    must_refuse(lambda: score(np.array([1.0, np.nan]), np.ones(2)), "NaN y_true")
-    must_refuse(lambda: score(np.array([1.0, np.inf]), np.ones(2)), "inf y_true")
-    must_refuse(lambda: score(np.ones(2), np.array([1.0, np.inf])), "inf y_pred")
-    must_refuse(lambda: score(np.array([2.0, -0.5]), np.ones(2)), "negative y_true")
-    must_refuse(lambda: score(np.array([2.0, -1.0]), np.ones(2)), "y_true at -1")
-    must_refuse(lambda: score(np.ones((2, 1)), np.ones((2, 1))), "2-D input")
-    must_refuse(
-        lambda: score(np.ones(2), np.ones(2), is_active=np.array([0.5, 1.0])),
-        "non-boolean is_active",
-    )
+    cases = [
+        ("string list y_true", lambda: score(["1.0", "2.0"], np.ones(2))),
+        ("complex y_true", lambda: score(np.array([1 + 2j]), np.ones(1))),
+        (
+            "datetime64 y_true",
+            lambda: score(np.array(["2026-01-01"], dtype="datetime64[D]"), np.ones(1)),
+        ),
+        ("NaN y_true", lambda: score(np.array([1.0, np.nan]), np.ones(2))),
+        ("inf y_true", lambda: score(np.array([1.0, np.inf]), np.ones(2))),
+        ("inf y_pred", lambda: score(np.ones(2), np.array([1.0, np.inf]))),
+        ("negative y_true", lambda: score(np.array([2.0, -0.5]), np.ones(2))),
+        ("y_true at -1", lambda: score(np.array([2.0, -1.0]), np.ones(2))),
+        ("2-D input", lambda: score(np.ones((2, 1)), np.ones((2, 1)))),
+        (
+            "non-boolean is_active",
+            lambda: score(np.ones(2), np.ones(2), is_active=np.array([0.5, 1.0])),
+        ),
+    ]
+    for label, call in cases:
+        must_refuse(call, label)
     print("PASS score: perfect 3-vector is 0 on all six metric keys")
     print("PASS score: -1 prediction clips to 0; all six hand values match")
     print("PASS score: is_active override computed over its own hand slice (3.0)")
     print("PASS score: all-zero slice is all 0.0, n_active 0, no NaN")
-    print("PASS score: all seven guard cases refuse with a friendly error")
+    print(f"PASS score: all {len(cases)} guard cases refuse with a friendly error")
 
 
 def run_check() -> None:
