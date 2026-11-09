@@ -1,4 +1,22 @@
-"""Dataset split loaders, truth filtering masks, and RMSLE evaluation scorer."""
+"""Dataset split loaders, truth filtering masks, and RMSLE evaluation scorer.
+
+Specifications:
+- Split loaders return full frames without dropping rows. Training consumers
+  apply training_mask (fit_rows) during model training or fold assembly.
+- score() computes RMSLE, MAE, and RMSE for full inputs and active-demand rows
+  (y_true > 0), reported in *_active keys.
+- Holiday closure grid fills (5,346 train / 0 valid / 1,782 local_test, 7,128 total)
+  in why.grid_fill_rows are preserved by training_mask.
+- earthquake_decay feature is validated by dtype (float32).
+- local_test is gated by FREEZE_RUN=1 for final evaluation.
+- Masks are index-aligned boolean Series; align index when reordering frames.
+- Import is side-effect-free: no data files are opened on module load.
+- Evaluation slices are scored without pre-opening masking.
+- Duplicate key and negative-sales checks are deferred to Day 2.
+- RMSLE is the primary evaluation metric, not MAPE.
+  MAPE is undefined for zero demand.
+  MAPE is excluded from contract outputs.
+"""
 
 from __future__ import annotations
 
