@@ -450,15 +450,27 @@ def load_frame(
                     f"expected {expected_dtype}; {RUN_MAIN_POINTER}"
                 )
     data = pd.concat([train, valid], ignore_index=True)
-    if not data.columns.is_unique:
-        raise ContractError(
-            f"load_frame: concatenated columns contain duplicates; {RUN_MAIN_POINTER}"
-        )
-    if set(data.columns) != set(PINNED_DTYPES) or len(data.columns) != 26:
-        raise ContractError(
-            f"load_frame: concatenated columns must match the 26 pinned columns; "
-            f"{RUN_MAIN_POINTER}"
-        )
+    expected = list(PINNED_DTYPES)
+    if list(data.columns) != expected:
+        cols = list(data.columns)
+        for i in range(max(len(cols), len(expected))):
+            got = cols[i] if i < len(cols) else "<end>"
+            want = expected[i] if i < len(expected) else "<end>"
+            if got != want:
+                raise ContractError(
+                    f"load_frame: concatenated column order disagrees with the pinned "
+                    f"order at position {i}: got {got!r}, expected {want!r}; "
+                    f"{RUN_MAIN_POINTER}"
+                )
+    # Re-check dtypes post-concat because pd.concat can widen category -> object
+    # when train and valid carry disjoint category domains.
+    for col, expected_dtype in PINNED_DTYPES.items():
+        actual = str(data[col].dtype)
+        if actual != expected_dtype:
+            raise ContractError(
+                f"load_frame: concatenated column {col!r} got dtype {actual}, "
+                f"expected {expected_dtype}; {RUN_MAIN_POINTER}"
+            )
     data = data.sort_values("date", kind="mergesort").reset_index(drop=True)
     if len(data) != FRAME_ROWS:
         raise ContractError(
