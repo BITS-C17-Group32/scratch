@@ -204,15 +204,25 @@ def _load_manifest() -> dict[str, Any]:
             f"manifest total {total!r} ({type(total).__name__}) != 3008016; "
             f"{RUN_MAIN_POINTER}"
         )
+    counts = [manifest["rows"][split] for split in SPLIT_NAMES]
+    if any(count < 0 for count in counts):
+        raise ContractError(
+            f"manifest rows contain a negative count {counts}; {RUN_MAIN_POINTER}"
+        )
+    rows_sum = sum(counts)
+    if rows_sum != total:
+        raise ContractError(
+            f"manifest rows sum {rows_sum} != total {total}; {RUN_MAIN_POINTER}"
+        )
     for split in SPLIT_NAMES:
         if split not in manifest["bounds"]:
             raise ContractError(
                 f"manifest bounds missing split {split!r}; {RUN_MAIN_POINTER}"
             )
         split_bounds = manifest["bounds"][split]
-        if not isinstance(split_bounds, (list, tuple)) or len(split_bounds) != 2:
+        if not isinstance(split_bounds, list) or len(split_bounds) != 2:
             raise ContractError(
-                f"manifest bounds[{split!r}] must be a 2-element sequence; "
+                f"manifest bounds[{split!r}] must be a 2-element list; "
                 f"{RUN_MAIN_POINTER}"
             )
         for bound_name, bound_val in (
@@ -326,7 +336,10 @@ def load_split(split: str) -> pd.DataFrame:
             f"{RUN_MAIN_POINTER}"
         )
     if not data.columns.is_unique:
-        raise ContractError(f"{split}: columns contain duplicates; {RUN_MAIN_POINTER}")
+        dup_names = _duplicate_column_names(list(data.columns))
+        raise ContractError(
+            f"{split}: columns contain duplicates {dup_names}; {RUN_MAIN_POINTER}"
+        )
     missing = [c for c in PINNED_DTYPES if c not in data.columns]
     extra = [c for c in data.columns if c not in PINNED_DTYPES]
     if missing or extra:
@@ -408,6 +421,8 @@ def load_split(split: str) -> pd.DataFrame:
         )
     if data["sales"].isna().any():
         raise ContractError(f"{split}: sales contains NaN; {RUN_MAIN_POINTER}")
+    if data["date"].isna().any():
+        raise ContractError(f"{split}: date contains NaT value(s); {RUN_MAIN_POINTER}")
     return data
 
 
@@ -426,8 +441,10 @@ def load_frame(
                 f"load_frame: {role} must be a DataFrame; {RUN_MAIN_POINTER}"
             )
         if not frame.columns.is_unique:
+            dup_names = _duplicate_column_names(list(frame.columns))
             raise ContractError(
-                f"load_frame: {role} columns contain duplicates; {RUN_MAIN_POINTER}"
+                f"load_frame: {role} columns contain duplicates {dup_names}; "
+                f"{RUN_MAIN_POINTER}"
             )
         missing = [c for c in PINNED_DTYPES if c not in frame.columns]
         extra = [c for c in frame.columns if c not in PINNED_DTYPES]
@@ -442,6 +459,18 @@ def load_frame(
                 f"load_frame: {role} columns must exactly match the 26 pinned columns; "
                 f"{details_str}; {RUN_MAIN_POINTER}"
             )
+        expected_columns = list(PINNED_DTYPES)
+        if list(frame.columns) != expected_columns:
+            cols = list(frame.columns)
+            for i in range(max(len(cols), len(expected_columns))):
+                got = cols[i] if i < len(cols) else "<end>"
+                want = expected_columns[i] if i < len(expected_columns) else "<end>"
+                if got != want:
+                    raise ContractError(
+                        f"load_frame: {role} column order disagrees with the pinned "
+                        f"order at position {i}: got {got!r}, expected {want!r}; "
+                        f"{RUN_MAIN_POINTER}"
+                    )
         for col, expected_dtype in PINNED_DTYPES.items():
             actual_dtype = str(frame[col].dtype)
             if actual_dtype != expected_dtype:
@@ -484,10 +513,21 @@ def load_frame(
     return data
 
 
+def _duplicate_column_names(names: list[Any]) -> list[Any]:
+    """Return duplicated labels sorted by repr; tolerates unhashable labels."""
+    dup_names: list[Any] = []
+    for name in names:
+        if names.count(name) > 1 and not any(
+            existing == name for existing in dup_names
+        ):
+            dup_names.append(name)
+    dup_names.sort(key=repr)
+    return dup_names
+
+
 def _require_unique_columns(df: pd.DataFrame, fn_name: str) -> None:
     """Refuse duplicated column labels; df[col] would widen to a DataFrame."""
-    names = list(df.columns)
-    dup_names = sorted({name for name in names if names.count(name) > 1})
+    dup_names = _duplicate_column_names(list(df.columns))
     if dup_names:
         raise ContractError(
             f"{fn_name}: columns contain duplicates {dup_names}; "
@@ -715,7 +755,7 @@ def _check_manifest_metadata() -> None:
         measured_end = manifest["bounds"][split][1]
         if measured_end != end:
             raise ContractError(
-                f"manifest {split} end date {measured_end} != pinned {end}; "
+                f"manifest {split} end date {measured_end!r} != pinned {end!r}; "
                 f"{RUN_MAIN_POINTER}"
             )
     print("PASS manifest: bounds end 2016-03-27 / 2016-09-11 / 2017-08-15")
@@ -749,7 +789,7 @@ def _check_manifest_metadata() -> None:
         measured_start = manifest["bounds"][split][0]
         if measured_start != start:
             raise ContractError(
-                f"manifest {split} start date {measured_start} != pinned {start}; "
+                f"manifest {split} start date {measured_start!r} != pinned {start!r}; "
                 f"{RUN_MAIN_POINTER}"
             )
     print("PASS manifest: bounds start 2013-01-01 / 2016-03-28 / 2016-09-12")
@@ -1047,6 +1087,18 @@ def _check_scorer() -> None:
         )
         load_frame(train=permuted, valid=permuted)
 
+    def _test_load_frame_valid_permuted_cols() -> None:
+        cols = list(PINNED_DTYPES)
+        i_fam, i_id = cols.index("family"), cols.index("id")
+        cols[i_fam], cols[i_id] = cols[i_id], cols[i_fam]
+        straight = pd.DataFrame(
+            {col: pd.Series([], dtype=dt) for col, dt in PINNED_DTYPES.items()}
+        )
+        permuted = pd.DataFrame(
+            {col: pd.Series([], dtype=PINNED_DTYPES[col]) for col in cols}
+        )
+        load_frame(train=straight, valid=permuted)
+
     def _test_load_frame_category_mismatch() -> None:
         cat_a = pd.DataFrame(
             {
@@ -1182,6 +1234,10 @@ def _check_scorer() -> None:
         ),
         ("load_frame permuted columns", _test_load_frame_permuted_cols),
         (
+            "load_frame valid permuted columns",
+            _test_load_frame_valid_permuted_cols,
+        ),
+        (
             "load_frame category domain mismatch",
             _test_load_frame_category_mismatch,
         ),
@@ -1192,11 +1248,39 @@ def _check_scorer() -> None:
             ),
         ),
         (
-            "load_manifest timezone bound",
+            "load_manifest malformed timestamp bound",
             lambda: _test_tampered_manifest(
                 lambda m: m["bounds"].__setitem__(
                     "train", ["2013-01-01+00:00", "2016-03-27"]
                 )
+            ),
+        ),
+        (
+            "load_manifest timezone start bound",
+            lambda: _test_tampered_manifest(
+                lambda m: m["bounds"].__setitem__(
+                    "train", ["2013-01-01T00:00:00+00:00", "2016-03-27"]
+                )
+            ),
+        ),
+        (
+            "load_manifest timezone end bound",
+            lambda: _test_tampered_manifest(
+                lambda m: m["bounds"].__setitem__(
+                    "valid", ["2016-03-28", "2016-09-11T00:00:00+00:00"]
+                )
+            ),
+        ),
+        (
+            "load_manifest NaT end bound",
+            lambda: _test_tampered_manifest(
+                lambda m: m["bounds"].__setitem__("valid", ["2016-03-28", "nan"])
+            ),
+        ),
+        (
+            "mask mixed-type duplicate labels",
+            lambda: closure_rows(
+                pd.DataFrame([[1, 2, 3, 4]], columns=["id", "id", 1, 1])
             ),
         ),
         (
