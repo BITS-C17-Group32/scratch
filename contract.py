@@ -238,8 +238,13 @@ def load_split(split: str) -> pd.DataFrame:
         raise ContractError(
             f"{path.name} unreadable: {error}; {RUN_MAIN_POINTER}"
         ) from error
+    missing_cols = [col for col in PINNED_DTYPES if col not in data.columns]
+    if missing_cols:
+        raise ContractError(
+            f"{split}: missing pinned columns {missing_cols}; {RUN_MAIN_POINTER}"
+        )
     for col, expected_dtype in PINNED_DTYPES.items():
-        if col in data.columns and str(data[col].dtype) != expected_dtype:
+        if str(data[col].dtype) != expected_dtype:
             raise ContractError(
                 f"{split}: column {col!r} has dtype {data[col].dtype}, "
                 f"expected {expected_dtype}; {RUN_MAIN_POINTER}"
@@ -259,9 +264,24 @@ def load_split(split: str) -> pd.DataFrame:
             f"{split}: row count {len(data)} != manifest {expected_rows}; "
             f"{RUN_MAIN_POINTER}"
         )
-    start_str, end_str = manifest["bounds"][split]
-    start_ts = pd.Timestamp(start_str)
-    end_ts = pd.Timestamp(end_str)
+    try:
+        start_str, end_str = manifest["bounds"][split]
+    except Exception as error:
+        raise ContractError(
+            f"{split}: invalid bounds sequence: {error}; {RUN_MAIN_POINTER}"
+        ) from error
+    try:
+        start_ts = pd.Timestamp(start_str)
+    except Exception as error:
+        raise ContractError(
+            f"{split}: start bound {start_str!r} invalid: {error}; {RUN_MAIN_POINTER}"
+        ) from error
+    try:
+        end_ts = pd.Timestamp(end_str)
+    except Exception as error:
+        raise ContractError(
+            f"{split}: end bound {end_str!r} invalid: {error}; {RUN_MAIN_POINTER}"
+        ) from error
     actual_start = data["date"].min()
     actual_end = data["date"].max()
     if actual_start != start_ts or actual_end != end_ts:
@@ -283,15 +303,19 @@ def load_frame(
         train = load_split("train")
     if valid is None:
         valid = load_split("valid")
-    mismatched = {
-        col: (str(train[col].dtype), str(valid[col].dtype))
-        for col in train.columns
-        if train[col].dtype != valid[col].dtype
-    }
-    if mismatched:
-        raise ContractError(
-            f"load_frame: train/valid dtype drift: {mismatched}; {RUN_MAIN_POINTER}"
-        )
+    for role, frame in (("train", train), ("valid", valid)):
+        for col, expected_dtype in PINNED_DTYPES.items():
+            if col not in frame.columns:
+                raise ContractError(
+                    f"load_frame: {role} missing column {col!r}, "
+                    f"expected {expected_dtype}; {RUN_MAIN_POINTER}"
+                )
+            actual_dtype = str(frame[col].dtype)
+            if actual_dtype != expected_dtype:
+                raise ContractError(
+                    f"load_frame: {role} column {col!r} got dtype {actual_dtype}, "
+                    f"expected {expected_dtype}; {RUN_MAIN_POINTER}"
+                )
     data = pd.concat([train, valid], ignore_index=True)
     data = data.sort_values("date", kind="mergesort").reset_index(drop=True)
     if len(data) != FRAME_ROWS:
