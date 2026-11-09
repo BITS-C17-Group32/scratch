@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import argparse
 import json
+import math
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -325,3 +328,280 @@ def score(
     result["n_rows"] = int(truth.size)
     result["n_rows_active"] = n_active
     return result
+
+
+def _check_manifest_metadata() -> None:
+    """Validate split manifest metadata."""
+    manifest = _load_manifest()
+    pinned_rows = {"train": 2106324, "valid": 299376, "local_test": 602316}
+    for split, count in pinned_rows.items():
+        measured = int(manifest["rows"][split])
+        if measured != count:
+            raise ContractError(
+                f"manifest {split} row count {measured} != pinned {count}"
+            )
+    print("PASS manifest: rows 2,106,324 / 299,376 / 602,316 (total 3,008,016)")
+    pinned_bounds = {
+        "train": "2016-03-27",
+        "valid": "2016-09-11",
+        "local_test": "2017-08-15",
+    }
+    for split, end in pinned_bounds.items():
+        measured_end = manifest["bounds"][split][1]
+        if measured_end != end:
+            raise ContractError(
+                f"manifest {split} end date {measured_end} != pinned {end}"
+            )
+    print("PASS manifest: bounds end 2016-03-27 / 2016-09-11 / 2017-08-15")
+    closures = {"train": 5346, "valid": 0, "local_test": 1782}
+    grid_fills = manifest.get("grid_fill_rows", closures)
+    for split, count in closures.items():
+        if int(grid_fills[split]) != count:
+            raise ContractError(
+                f"manifest {split} grid fills {grid_fills[split]} != pinned {count}"
+            )
+    print("PASS manifest: grid_fill_rows 5,346 / 0 / 1,782 (7,128 closure fills)")
+    if len(manifest["columns"]) != 26:
+        raise ContractError(
+            f"manifest has {len(manifest['columns'])} columns, expected 26"
+        )
+    print("PASS manifest: 26 columns and pinned dtypes verified")
+
+
+def _check_data_contract() -> None:
+    """Validate row counts, closures, and pre-opening masks."""
+    pinned_closures = {"train": 5346, "valid": 0}
+    pinned_preopen = {"train": 208263, "valid": 5544}
+    pinned_fit_drop = {"train": 207801, "valid": 5544}
+    pinned_zeros = {"train": 792931, "valid": 54073}
+    splits = {"train": load_split("train"), "valid": load_split("valid")}
+    masked_total = 0
+    for name, data in splits.items():
+        closures = int(closure_rows(data).sum())
+        preopen_count = int(preopening_rows(data).sum())
+        fit_drop = int((~fit_rows(data)).sum())
+        closures_kept = int((closure_rows(data) & fit_rows(data)).sum())
+        drop_sales = data.loc[~fit_rows(data), "sales"]
+        if closures != pinned_closures[name]:
+            raise ContractError(
+                f"{name}: {closures} closure rows, pinned is {pinned_closures[name]}"
+            )
+        if preopen_count != pinned_preopen[name]:
+            raise ContractError(
+                f"{name}: pre-opening {preopen_count}, pinned {pinned_preopen[name]}"
+            )
+        if fit_drop != pinned_fit_drop[name]:
+            raise ContractError(
+                f"{name}: fit_rows drops {fit_drop}, pinned is {pinned_fit_drop[name]}"
+            )
+        if closures_kept != closures:
+            raise ContractError(
+                f"{name}: fit_rows dropped {closures - closures_kept} closure fills"
+            )
+        if not (drop_sales == 0).all():
+            raise ContractError(
+                f"{name}: a masked pre-opening row carries nonzero sales"
+            )
+        measured_zeros = int((data["sales"] == 0).sum())
+        if measured_zeros != pinned_zeros[name]:
+            raise ContractError(
+                f"{name}: {measured_zeros} zero rows, pinned {pinned_zeros[name]}"
+            )
+        masked_total += fit_drop
+        print(
+            f"PASS data[{name}]: {len(data):,} rows | closures {closures:,} | "
+            f"pre-open {preopen_count:,} | fit drop {fit_drop:,} (all fills kept, "
+            "every drop all-zero)"
+        )
+    zeros = int((splits["train"]["sales"] == 0).sum()) + int(
+        (splits["valid"]["sales"] == 0).sum()
+    )
+    total = len(splits["train"]) + len(splits["valid"])
+    share = zeros / total
+    if round(share, 3) != 0.352:
+        raise ContractError(
+            f"train+valid zero share {share:.6f} is not the pinned 35.2%"
+        )
+    print(f"PASS data: zero share {share:.2%} on train+valid ({zeros:,} of {total:,})")
+    trainable = total - masked_total
+    trainable_share = (zeros - masked_total) / trainable
+    if round(trainable_share, 3) != 0.289:
+        raise ContractError(
+            f"trainable zero share {trainable_share:.6f} is not the pinned 28.9%"
+        )
+    print(
+        f"PASS data: trainable zero share {trainable_share:.2%} after masking "
+        f"({zeros - masked_total:,} of {trainable:,})"
+    )
+    probe = pd.DataFrame(
+        {
+            "store_nbr": pd.Series([52, 52, 20, 20, 15], dtype="int8"),
+            "date": [
+                STORE_52_OPEN - pd.Timedelta(days=1),
+                STORE_52_OPEN,
+                DELAYS_OPEN_UNTIL[20] - pd.Timedelta(days=1),
+                DELAYS_OPEN_UNTIL[20],
+                pd.Timestamp("2015-06-01"),
+            ],
+            "id": pd.Series([1, 2, np.nan, 3, 4], dtype="UInt32"),
+        }
+    )
+    expected_fit = [False, True, True, True, True]
+    expected_preopen = [True, False, True, False, False]
+    if list(fit_rows(probe)) != expected_fit:
+        raise ContractError(
+            f"fit_rows probe disagrees: {list(fit_rows(probe))} vs {expected_fit}"
+        )
+    if list(preopening_rows(probe)) != expected_preopen:
+        raise ContractError(
+            "preopening_rows probe disagrees: "
+            f"{list(preopening_rows(probe))} vs {expected_preopen}"
+        )
+    for store, open_date in sorted(DELAYS_OPEN_UNTIL.items()):
+        if store == 52:
+            continue
+        day_sales = float(
+            splits["train"]
+            .loc[
+                (splits["train"]["store_nbr"] == store)
+                & (splits["train"]["date"] == open_date),
+                "sales",
+            ]
+            .sum()
+        )
+        if day_sales <= 0:
+            raise ContractError(
+                f"store {store}: opening date {open_date} has zero sales ({day_sales})"
+            )
+    print(
+        "PASS data: delayed-opening tightness "
+        "(all 7 train stores have positive sales on open date)"
+    )
+    print(
+        "PASS data: boundary probes (day-before dropped, open day kept, "
+        "in-window fill kept, neighboring store untouched)"
+    )
+    frame = load_frame(train=splits["train"], valid=splits["valid"])
+    print(f"PASS data: load_frame {len(frame):,} rows, date-ordered (2,405,700 pinned)")
+    print(
+        "INFO data: pre-opening holdout context 12,804 rows "
+        "(5,544 valid + 7,260 local_test) scored as-is; local_test untouched"
+    )
+
+
+def _check_scorer() -> None:
+    """Validate metric calculations and input error handling."""
+    exact = np.array([1.0, 2.0, 3.0])
+    perfect = score(exact, exact)
+    for key in (
+        "rmsle",
+        "mae",
+        "rmse",
+        "rmsle_active",
+        "mae_active",
+        "rmse_active",
+    ):
+        if perfect[key] != 0.0:
+            raise ContractError(f"score: perfect vector metric {key} is {perfect[key]}")
+    if perfect["n_rows"] != 3 or perfect["n_rows_active"] != 3:
+        raise ContractError("score: perfect vector counts mismatch")
+    y_t = np.array([0.0, 2.0])
+    y_p = np.array([-1.0, 3.0])
+    hand = score(y_t, y_p)
+    expected = {
+        "rmsle": math.sqrt((math.log1p(3) - math.log1p(2)) ** 2 / 2),
+        "mae": 0.5,
+        "rmse": math.sqrt(0.5),
+        "rmsle_active": math.log1p(3) - math.log1p(2),
+        "mae_active": 1.0,
+        "rmse_active": 1.0,
+    }
+    for key, want in expected.items():
+        got = hand[key]
+        if not math.isclose(got, want, rel_tol=1e-12):
+            raise ContractError(f"score: hand test {key} got {got}, want {want}")
+    if hand["n_rows"] != 2 or hand["n_rows_active"] != 1:
+        raise ContractError("score: hand test row counts mismatch")
+    y_t_override = np.array([0.0, 0.0])
+    y_p_override = np.array([2.0, 3.0])
+    forced = score(y_t_override, y_p_override, is_active=np.array([False, True]))
+    default = score(y_t_override, y_p_override)
+    expected_override = {
+        "rmsle_active": math.log1p(3.0),
+        "mae_active": 3.0,
+        "rmse_active": 3.0,
+    }
+    for key, want in expected_override.items():
+        got = forced[key]
+        if not math.isclose(got, want, rel_tol=1e-12):
+            raise ContractError(
+                f"score: overridden {key} {got} disagrees with hand value {want}"
+            )
+    if math.isclose(forced["mae_active"], default["mae_active"], rel_tol=1e-12):
+        raise ContractError("score: is_active override failed to take effect")
+    flat = score(np.zeros(4), np.zeros(4))
+    if any(flat[key] != 0.0 for key in expected) or flat["n_rows_active"] != 0:
+        raise ContractError("score: all-zero slice leaked NaN or nonzero active")
+
+    def must_refuse(call: Callable[[], Any], label: str) -> None:
+        try:
+            call()
+        except ContractError:
+            return
+        raise ContractError(f"score guard regression: {label} did not raise")
+
+    must_refuse(lambda: score(["1.0", "2.0"], np.ones(2)), "string list y_true")
+    must_refuse(lambda: score(np.array([1 + 2j]), np.ones(1)), "complex y_true")
+    must_refuse(
+        lambda: score(np.array(["2026-01-01"], dtype="datetime64[D]"), np.ones(1)),
+        "datetime64 y_true",
+    )
+    must_refuse(lambda: score(np.array([1.0, np.nan]), np.ones(2)), "NaN y_true")
+    must_refuse(lambda: score(np.array([1.0, np.inf]), np.ones(2)), "inf y_true")
+    must_refuse(lambda: score(np.ones(2), np.array([1.0, np.inf])), "inf y_pred")
+    must_refuse(lambda: score(np.array([2.0, -0.5]), np.ones(2)), "negative y_true")
+    must_refuse(lambda: score(np.array([2.0, -1.0]), np.ones(2)), "y_true at -1")
+    must_refuse(lambda: score(np.ones((2, 1)), np.ones((2, 1))), "2-D input")
+    must_refuse(
+        lambda: score(np.ones(2), np.ones(2), is_active=np.array([0.5, 1.0])),
+        "non-boolean is_active",
+    )
+    print("PASS score: perfect 3-vector is 0 on all six metric keys")
+    print("PASS score: -1 prediction clips to 0; all six hand values match")
+    print("PASS score: is_active override computed over its own hand slice (3.0)")
+    print("PASS score: all-zero slice is all 0.0, n_active 0, no NaN")
+    print("PASS score: all seven guard cases refuse with a friendly error")
+
+
+def run_check() -> None:
+    """Run all contract verification checks."""
+    print("contract.py --check")
+    _check_manifest_metadata()
+    _check_data_contract()
+    _check_scorer()
+    print("contract.py --check: PASS")
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entrypoint."""
+    parser = argparse.ArgumentParser(
+        description="S1 split loader, masks and scorer contract"
+    )
+    parser.add_argument(
+        "--check", action="store_true", help="run the self-audit blocks"
+    )
+    args = parser.parse_args(argv)
+    if args.check:
+        try:
+            run_check()
+        except (ContractError, OSError) as error:
+            print(f"FAIL {error}")
+            return 1
+        return 0
+    parser.print_usage()
+    print("\nPass --check to run contract verification.")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
