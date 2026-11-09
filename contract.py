@@ -7,8 +7,9 @@ Specifications:
   (y_true > 0), reported in *_active keys.
 - Holiday closure grid fills (5,346 train / 0 valid / 1,782 local_test, 7,128 total)
   in why.grid_fill_rows are preserved by training_mask.
-- earthquake_decay feature (float32): 2016-04-16 quake decay (53,460 positive
-  rows) falls inside valid; fold windows from 2016-07-26 contain no quake rows.
+- earthquake_decay feature (float32): 2016-04-16 quake decay (53,460 positive rows;
+  44,429 with sales>0) falls inside valid; fold windows from 2016-07-26 contain
+  no quake rows.
 - local_test is gated by FREEZE_RUN=1 for final evaluation.
 - Masks are index-aligned boolean Series; align index when reordering frames.
 - Import is side-effect-free: no data files are opened on module load.
