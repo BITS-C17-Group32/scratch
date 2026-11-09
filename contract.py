@@ -674,6 +674,21 @@ def score(
         if not math.isfinite(val):
             raise ContractError(f"score: computed metric {key} is non-finite ({val})")
 
+    # Squared deviations of subnormal values underflow float64 to 0.0, so RMSE can
+    # come back 0.0 while MAE is tiny but nonzero (e.g. y_true=1e-200). The
+    # tolerance keeps the quadratic-mean >= arithmetic-mean invariant meaningful
+    # without rejecting the float artifact.
+    tol = max(1e-12, 1e-12 * mae)
+    if rmse < mae - tol:
+        raise ContractError(f"score: inconsistent metrics rmse {rmse} < mae {mae}")
+    if result["rmse_active"] < result["mae_active"] - max(
+        1e-12, 1e-12 * result["mae_active"]
+    ):
+        raise ContractError(
+            f"score: inconsistent active metrics rmse_active {result['rmse_active']} "
+            f"< mae_active {result['mae_active']}"
+        )
+
     result["n_rows"] = int(truth.size)
     result["n_rows_active"] = n_active
     return result
