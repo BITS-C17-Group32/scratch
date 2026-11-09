@@ -7,15 +7,15 @@ Specifications:
   (y_true > 0), reported in *_active keys.
 - Holiday closure grid fills (5,346 train / 0 valid / 1,782 local_test, 7,128 total)
   in why.grid_fill_rows are preserved by training_mask.
-- earthquake_decay feature is validated by dtype (float32).
+- earthquake_decay feature (float32): 2016-04-16 quake decay (53,460 positive
+  rows) falls inside valid; fold windows from 2016-07-26 contain no quake rows.
 - local_test is gated by FREEZE_RUN=1 for final evaluation.
 - Masks are index-aligned boolean Series; align index when reordering frames.
 - Import is side-effect-free: no data files are opened on module load.
 - Evaluation slices are scored without pre-opening masking.
 - Duplicate key and negative-sales checks are deferred to Day 2.
-- RMSLE is the primary evaluation metric, not MAPE.
-  MAPE is undefined for zero demand.
-  MAPE is excluded from contract outputs.
+- RMSLE is the primary evaluation metric; MAPE is undefined at 35.2% zero demand
+  and is excluded from contract outputs.
 """
 
 from __future__ import annotations
@@ -24,9 +24,10 @@ import argparse
 import json
 import math
 import os
+import warnings
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -133,6 +134,8 @@ def _load_manifest() -> dict[str, Any]:
         raise ContractError(
             f"splits/split_manifest.json is not a JSON object; {RUN_MAIN_POINTER}"
         )
+    # MANIFEST_KEYS is checked for presence only (not exact match) to allow
+    # forward-compatible auxiliary fields in split_manifest.json.
     missing = [key for key in MANIFEST_KEYS if key not in manifest]
     if missing:
         raise ContractError(
@@ -175,6 +178,15 @@ def _load_manifest() -> dict[str, Any]:
                 f"manifest bounds[{split!r}] must be a 2-element sequence; "
                 f"{RUN_MAIN_POINTER}"
             )
+        for bound_name, bound_val in (
+            ("start", split_bounds[0]),
+            ("end", split_bounds[1]),
+        ):
+            if not isinstance(bound_val, str):
+                raise ContractError(
+                    f"manifest bounds[{split!r}] {bound_name} timestamp must be str, "
+                    f"got {bound_val!r}; {RUN_MAIN_POINTER}"
+                )
         try:
             start_ts = pd.Timestamp(split_bounds[0])
         except Exception as error:
@@ -222,7 +234,7 @@ def _load_manifest() -> dict[str, Any]:
             f"manifest why.grid_fill_rows sum is {grid_fill_sum}, expected 7128; "
             f"{RUN_MAIN_POINTER}"
         )
-    frame_rows_sum = int(manifest["rows"]["train"]) + int(manifest["rows"]["valid"])
+    frame_rows_sum = manifest["rows"]["train"] + manifest["rows"]["valid"]
     if FRAME_ROWS != frame_rows_sum:
         raise ContractError(
             f"FRAME_ROWS {FRAME_ROWS} != train ({manifest['rows']['train']}) + "
@@ -249,10 +261,12 @@ def load_split(split: str) -> pd.DataFrame:
         raise ContractError(
             f"{path.name} unreadable: {error}; {RUN_MAIN_POINTER}"
         ) from error
-    missing_cols = [col for col in PINNED_DTYPES if col not in data.columns]
-    if missing_cols:
+    if not data.columns.is_unique:
+        raise ContractError(f"{split}: columns contain duplicates; {RUN_MAIN_POINTER}")
+    if set(data.columns) != set(PINNED_DTYPES) or len(data.columns) != 26:
         raise ContractError(
-            f"{split}: missing pinned columns {missing_cols}; {RUN_MAIN_POINTER}"
+            f"{split}: columns must exactly match the 26 pinned columns; "
+            f"{RUN_MAIN_POINTER}"
         )
     for col, expected_dtype in PINNED_DTYPES.items():
         if str(data[col].dtype) != expected_dtype:
@@ -265,7 +279,7 @@ def load_split(split: str) -> pd.DataFrame:
             f"{split}: columns disagree with manifest; {RUN_MAIN_POINTER}"
         )
     try:
-        expected_rows = int(manifest["rows"][split])
+        expected_rows = manifest["rows"][split]
     except (KeyError, TypeError, ValueError) as error:
         raise ContractError(
             f"manifest rows[{split!r}] invalid; {RUN_MAIN_POINTER}"
@@ -315,12 +329,20 @@ def load_frame(
     if valid is None:
         valid = load_split("valid")
     for role, frame in (("train", train), ("valid", valid)):
+        if not isinstance(frame, pd.DataFrame):  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise ContractError(
+                f"load_frame: {role} must be a DataFrame; {RUN_MAIN_POINTER}"
+            )
+        if not frame.columns.is_unique:
+            raise ContractError(
+                f"load_frame: {role} columns contain duplicates; {RUN_MAIN_POINTER}"
+            )
+        if set(frame.columns) != set(PINNED_DTYPES) or len(frame.columns) != 26:
+            raise ContractError(
+                f"load_frame: {role} columns must match the 26 pinned columns; "
+                f"{RUN_MAIN_POINTER}"
+            )
         for col, expected_dtype in PINNED_DTYPES.items():
-            if col not in frame.columns:
-                raise ContractError(
-                    f"load_frame: {role} missing column {col!r}, "
-                    f"expected {expected_dtype}; {RUN_MAIN_POINTER}"
-                )
             actual_dtype = str(frame[col].dtype)
             if actual_dtype != expected_dtype:
                 raise ContractError(
@@ -328,6 +350,15 @@ def load_frame(
                     f"expected {expected_dtype}; {RUN_MAIN_POINTER}"
                 )
     data = pd.concat([train, valid], ignore_index=True)
+    if not data.columns.is_unique:
+        raise ContractError(
+            f"load_frame: concatenated columns contain duplicates; {RUN_MAIN_POINTER}"
+        )
+    if set(data.columns) != set(PINNED_DTYPES) or len(data.columns) != 26:
+        raise ContractError(
+            f"load_frame: concatenated columns must match the 26 pinned columns; "
+            f"{RUN_MAIN_POINTER}"
+        )
     data = data.sort_values("date", kind="mergesort").reset_index(drop=True)
     if len(data) != FRAME_ROWS:
         raise ContractError(
@@ -343,6 +374,10 @@ def load_frame(
 
 def closure_rows(df: pd.DataFrame) -> pd.Series:
     """Return boolean mask for holiday closure fill rows (id is NaN)."""
+    if not isinstance(df, pd.DataFrame):  # pyright: ignore[reportUnnecessaryIsInstance]
+        raise ContractError(
+            f"closure_rows: input must be a DataFrame, got {type(df).__name__}"
+        )
     if "id" not in df.columns:
         raise ContractError("closure_rows: input dataframe missing 'id' column")
     return df["id"].isna()
@@ -350,19 +385,41 @@ def closure_rows(df: pd.DataFrame) -> pd.Series:
 
 def preopening_rows(df: pd.DataFrame) -> pd.Series:
     """Return boolean mask for dates before a store officially opened."""
+    if not isinstance(df, pd.DataFrame):  # pyright: ignore[reportUnnecessaryIsInstance]
+        raise ContractError(
+            f"preopening_rows: input must be a DataFrame, got {type(df).__name__}"
+        )
     for col in ("store_nbr", "date"):
         if col not in df.columns:
             raise ContractError(f"preopening_rows: missing {col!r} column")
+    store_col = df["store_nbr"]
+    if not pd.api.types.is_integer_dtype(store_col):
+        raise ContractError(
+            f"preopening_rows: 'store_nbr' must be integer dtype, got {store_col.dtype}"
+        )
+    date_col = df["date"]
+    if (
+        not pd.api.types.is_datetime64_any_dtype(date_col)
+        or getattr(date_col.dtype, "tz", None) is not None
+    ):
+        raise ContractError(
+            "preopening_rows: 'date' must be datetime dtype without timezone, "
+            f"got {date_col.dtype}"
+        )
     mask = pd.Series(False, index=df.index)
     for store, open_date in DELAYS_OPEN_UNTIL.items():
-        store_match = df["store_nbr"] == store
-        before_open = df["date"] < open_date
+        store_match = store_col == store
+        before_open = date_col < open_date
         mask |= store_match & before_open
     return mask
 
 
 def fit_rows(df: pd.DataFrame) -> pd.Series:
     """Return boolean mask of rows to include in model training."""
+    if not isinstance(df, pd.DataFrame):  # pyright: ignore[reportUnnecessaryIsInstance]
+        raise ContractError(
+            f"fit_rows: input must be a DataFrame, got {type(df).__name__}"
+        )
     is_preopen = preopening_rows(df)
     is_closure = closure_rows(df)
     return (~is_preopen) | is_closure
@@ -381,6 +438,11 @@ def score(
     Predictions are clipped to non-negative values before computing metrics.
     When n_rows_active == 0, active metrics return 0.0.
     """
+    if isinstance(y_true, np.ma.MaskedArray) or isinstance(y_pred, np.ma.MaskedArray):
+        raise ContractError("score: masked arrays are not supported")
+    if is_active is not None and isinstance(is_active, np.ma.MaskedArray):
+        raise ContractError("score: is_active cannot be a masked array")
+
     for name, raw in (("y_true", y_true), ("y_pred", y_pred)):
         try:
             arr = np.asarray(raw)
@@ -388,7 +450,9 @@ def score(
             raise ContractError(
                 f"score: {name} could not be converted to array: {error}"
             ) from error
-        if arr.dtype.kind not in "fiub":
+        if arr.dtype == np.bool_ or arr.dtype.kind == "b":
+            raise ContractError(f"score: {name} cannot be boolean")
+        if arr.dtype.kind not in ("f", "i", "u"):
             raise ContractError(
                 f"score: {name} must be numeric array; got dtype {arr.dtype}"
             )
@@ -430,22 +494,54 @@ def score(
             raise ContractError(
                 f"score: is_active shape {active.shape} != {truth.shape}"
             )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        try:
+            rmsle = float(root_mean_squared_log_error(truth, pred))
+            mae = float(mean_absolute_error(truth, pred))
+            rmse = float(root_mean_squared_error(truth, pred))
+        except Exception as error:
+            raise ContractError(f"score: metric calculation failed: {error}") from error
     result: dict[str, float | int] = {
-        "rmsle": float(root_mean_squared_log_error(truth, pred)),
-        "mae": float(mean_absolute_error(truth, pred)),
-        "rmse": float(root_mean_squared_error(truth, pred)),
+        "rmsle": rmsle,
+        "mae": mae,
+        "rmse": rmse,
     }
     n_active = int(active.sum())
     if n_active:
         sub_true = truth[active]
         sub_pred = pred[active]
-        result["rmsle_active"] = float(root_mean_squared_log_error(sub_true, sub_pred))
-        result["mae_active"] = float(mean_absolute_error(sub_true, sub_pred))
-        result["rmse_active"] = float(root_mean_squared_error(sub_true, sub_pred))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            try:
+                result["rmsle_active"] = float(
+                    root_mean_squared_log_error(sub_true, sub_pred)
+                )
+                result["mae_active"] = float(mean_absolute_error(sub_true, sub_pred))
+                result["rmse_active"] = float(
+                    root_mean_squared_error(sub_true, sub_pred)
+                )
+            except Exception as error:
+                raise ContractError(
+                    f"score: active metric calculation failed: {error}"
+                ) from error
     else:
         result["rmsle_active"] = 0.0
         result["mae_active"] = 0.0
         result["rmse_active"] = 0.0
+
+    for key in (
+        "rmsle",
+        "mae",
+        "rmse",
+        "rmsle_active",
+        "mae_active",
+        "rmse_active",
+    ):
+        val = result[key]
+        if not math.isfinite(val):
+            raise ContractError(f"score: computed metric {key} is non-finite ({val})")
+
     result["n_rows"] = int(truth.size)
     result["n_rows_active"] = n_active
     return result
@@ -456,10 +552,11 @@ def _check_manifest_metadata() -> None:
     manifest = _load_manifest()
     pinned_rows = {"train": 2106324, "valid": 299376, "local_test": 602316}
     for split, count in pinned_rows.items():
-        measured = int(manifest["rows"][split])
+        measured = manifest["rows"][split]
         if measured != count:
             raise ContractError(
-                f"manifest {split} row count {measured} != pinned {count}"
+                f"manifest {split} row count {measured} != pinned {count}; "
+                f"{RUN_MAIN_POINTER}"
             )
     print("PASS manifest: rows 2,106,324 / 299,376 / 602,316 (total 3,008,016)")
     pinned_bounds = {
@@ -471,24 +568,29 @@ def _check_manifest_metadata() -> None:
         measured_end = manifest["bounds"][split][1]
         if measured_end != end:
             raise ContractError(
-                f"manifest {split} end date {measured_end} != pinned {end}"
+                f"manifest {split} end date {measured_end} != pinned {end}; "
+                f"{RUN_MAIN_POINTER}"
             )
     print("PASS manifest: bounds end 2016-03-27 / 2016-09-11 / 2017-08-15")
     closures = {"train": 5346, "valid": 0, "local_test": 1782}
     grid_fills = manifest["why"]["grid_fill_rows"]
     for split, count in closures.items():
-        measured_fill = int(grid_fills[split])
+        measured_fill = grid_fills[split]
         if measured_fill != count:
             raise ContractError(
-                f"manifest {split} grid fills {measured_fill} != pinned {count}"
+                f"manifest {split} grid fills {measured_fill} != pinned {count}; "
+                f"{RUN_MAIN_POINTER}"
             )
-    fill_sum = sum(int(grid_fills[split]) for split in closures)
+    fill_sum = sum(grid_fills[split] for split in closures)
     if fill_sum != 7128:
-        raise ContractError(f"manifest why.grid_fill_rows sum {fill_sum} != 7128")
+        raise ContractError(
+            f"manifest why.grid_fill_rows sum {fill_sum} != 7128; {RUN_MAIN_POINTER}"
+        )
     print("PASS manifest: grid_fill_rows 5,346 / 0 / 1,782 (7,128 closure fills)")
     if len(manifest["columns"]) != 26:
         raise ContractError(
-            f"manifest has {len(manifest['columns'])} columns, expected 26"
+            f"manifest has {len(manifest['columns'])} columns, expected 26; "
+            f"{RUN_MAIN_POINTER}"
         )
     print("PASS manifest: 26 columns")
     pinned_starts = {
@@ -500,19 +602,21 @@ def _check_manifest_metadata() -> None:
         measured_start = manifest["bounds"][split][0]
         if measured_start != start:
             raise ContractError(
-                f"manifest {split} start date {measured_start} != pinned {start}"
+                f"manifest {split} start date {measured_start} != pinned {start}; "
+                f"{RUN_MAIN_POINTER}"
             )
     print("PASS manifest: bounds start 2013-01-01 / 2016-03-28 / 2016-09-12")
-    total_measured = sum(int(manifest["rows"][split]) for split in SPLIT_NAMES)
-    if int(manifest["total"]) != 3008016 or total_measured != 3008016:
+    total_measured = sum(manifest["rows"][split] for split in SPLIT_NAMES)
+    if manifest["total"] != 3008016 or total_measured != 3008016:
         raise ContractError(
             f"manifest total {manifest['total']} or "
-            f"sum(rows) {total_measured} != 3008016"
+            f"sum(rows) {total_measured} != 3008016; {RUN_MAIN_POINTER}"
         )
-    frame_sum = int(manifest["rows"]["train"]) + int(manifest["rows"]["valid"])
+    frame_sum = manifest["rows"]["train"] + manifest["rows"]["valid"]
     if FRAME_ROWS != 2405700 or frame_sum != 2405700:
         raise ContractError(
-            f"FRAME_ROWS {FRAME_ROWS} or train+valid {frame_sum} != 2405700"
+            f"FRAME_ROWS {FRAME_ROWS} or train+valid {frame_sum} != 2405700; "
+            f"{RUN_MAIN_POINTER}"
         )
     print(
         "PASS manifest: total 3,008,016 = sum(rows); "
@@ -536,28 +640,34 @@ def _check_data_contract() -> None:
         drop_sales = data.loc[~fit_rows(data), "sales"]
         if closures != pinned_closures[name]:
             raise ContractError(
-                f"{name}: {closures} closure rows, pinned is {pinned_closures[name]}"
+                f"{name}: {closures} closure rows, pinned is {pinned_closures[name]}; "
+                f"{RUN_MAIN_POINTER}"
             )
         if preopen_count != pinned_preopen[name]:
             raise ContractError(
-                f"{name}: pre-opening {preopen_count}, pinned {pinned_preopen[name]}"
+                f"{name}: pre-opening {preopen_count}, pinned {pinned_preopen[name]}; "
+                f"{RUN_MAIN_POINTER}"
             )
         if fit_drop != pinned_fit_drop[name]:
             raise ContractError(
-                f"{name}: fit_rows drops {fit_drop}, pinned is {pinned_fit_drop[name]}"
+                f"{name}: fit_rows drops {fit_drop}, "
+                f"pinned is {pinned_fit_drop[name]}; {RUN_MAIN_POINTER}"
             )
         if closures_kept != closures:
             raise ContractError(
-                f"{name}: fit_rows dropped {closures - closures_kept} closure fills"
+                f"{name}: fit_rows dropped {closures - closures_kept} closure fills; "
+                f"{RUN_MAIN_POINTER}"
             )
         if not (drop_sales == 0).all():
             raise ContractError(
-                f"{name}: a masked pre-opening row carries nonzero sales"
+                f"{name}: a masked pre-opening row carries nonzero sales; "
+                f"{RUN_MAIN_POINTER}"
             )
         measured_zeros = int((data["sales"] == 0).sum())
         if measured_zeros != pinned_zeros[name]:
             raise ContractError(
-                f"{name}: {measured_zeros} zero rows, pinned {pinned_zeros[name]}"
+                f"{name}: {measured_zeros} zero rows, pinned {pinned_zeros[name]}; "
+                f"{RUN_MAIN_POINTER}"
             )
         masked_total += fit_drop
         print(
@@ -572,14 +682,16 @@ def _check_data_contract() -> None:
     share = zeros / total
     if round(share, 3) != 0.352:
         raise ContractError(
-            f"train+valid zero share {share:.6f} is not the pinned 35.2%"
+            f"train+valid zero share {share:.6f} is not the pinned 35.2%; "
+            f"{RUN_MAIN_POINTER}"
         )
     print(f"PASS data: zero share {share:.2%} on train+valid ({zeros:,} of {total:,})")
     trainable = total - masked_total
     trainable_share = (zeros - masked_total) / trainable
     if round(trainable_share, 3) != 0.289:
         raise ContractError(
-            f"trainable zero share {trainable_share:.6f} is not the pinned 28.9%"
+            f"trainable zero share {trainable_share:.6f} is not the pinned 28.9%; "
+            f"{RUN_MAIN_POINTER}"
         )
     print(
         f"PASS data: trainable zero share {trainable_share:.2%} after masking "
@@ -602,15 +714,18 @@ def _check_data_contract() -> None:
     expected_preopen = [True, False, True, False, False]
     if list(fit_rows(probe)) != expected_fit:
         raise ContractError(
-            f"fit_rows probe disagrees: {list(fit_rows(probe))} vs {expected_fit}"
+            f"fit_rows probe disagrees: {list(fit_rows(probe))} vs {expected_fit}; "
+            f"{RUN_MAIN_POINTER}"
         )
     if list(preopening_rows(probe)) != expected_preopen:
         raise ContractError(
             "preopening_rows probe disagrees: "
-            f"{list(preopening_rows(probe))} vs {expected_preopen}"
+            f"{list(preopening_rows(probe))} vs {expected_preopen}; "
+            f"{RUN_MAIN_POINTER}"
         )
     for store, open_date in sorted(DELAYS_OPEN_UNTIL.items()):
-        # Store 52 opens in local_test; not present in train.
+        # Store 52 opening date (2017-04-20) falls in local_test;
+        # train only contains pre-opening zero rows.
         if store == 52:
             continue
         day_sales = float(
@@ -624,7 +739,8 @@ def _check_data_contract() -> None:
         )
         if day_sales <= 0:
             raise ContractError(
-                f"store {store}: opening date {open_date} has zero sales ({day_sales})"
+                f"store {store}: opening date {open_date} has zero sales "
+                f"({day_sales}); {RUN_MAIN_POINTER}"
             )
     print(
         "PASS data: delayed-opening tightness "
@@ -701,9 +817,40 @@ def _check_scorer() -> None:
             call()
         except ContractError:
             return
-        raise ContractError(f"score guard regression: {label} did not raise")
+        raise ContractError(f"guard regression: {label} did not raise")
 
-    cases = [
+    def _test_load_split_extra_col() -> None:
+        from unittest.mock import patch
+
+        bad_df = pd.DataFrame(
+            {col: pd.Series([], dtype=dt) for col, dt in PINNED_DTYPES.items()}
+        )
+        bad_df["extra_col"] = 1
+        with patch("pandas.read_parquet", return_value=bad_df):
+            load_split("train")
+
+    def _test_load_split_dup_col() -> None:
+        from unittest.mock import patch
+
+        bad_df = pd.DataFrame([[1, 2]], columns=["date", "date"])
+        with patch("pandas.read_parquet", return_value=bad_df):
+            load_split("train")
+
+    def _test_load_frame_extra_col() -> None:
+        sample = pd.DataFrame(
+            {col: pd.Series([], dtype=dt) for col, dt in PINNED_DTYPES.items()}
+        )
+        extra = sample.copy()
+        extra["extra_col"] = 1
+        load_frame(train=extra, valid=sample)
+
+    def _test_load_frame_dup_col() -> None:
+        dup = pd.DataFrame([[1, 2]], columns=["date", "date"])
+        load_frame(train=dup, valid=dup)
+
+    dummy_date = pd.Timestamp("2016-01-01")
+
+    cases: list[tuple[str, Callable[[], Any]]] = [
         ("string list y_true", lambda: score(["1.0", "2.0"], np.ones(2))),
         ("complex y_true", lambda: score(np.array([1 + 2j]), np.ones(1))),
         (
@@ -720,6 +867,66 @@ def _check_scorer() -> None:
             "non-boolean is_active",
             lambda: score(np.ones(2), np.ones(2), is_active=np.array([0.5, 1.0])),
         ),
+        (
+            "masked array y_true",
+            lambda: score(np.ma.array([1.0, 2.0]), np.ones(2)),
+        ),
+        (
+            "masked array y_pred",
+            lambda: score(np.ones(2), np.ma.array([1.0, 2.0])),
+        ),
+        (
+            "masked array is_active",
+            lambda: score(np.ones(2), np.ones(2), is_active=np.ma.array([True, False])),
+        ),
+        (
+            "boolean y_true",
+            lambda: score(np.array([True, False]), np.ones(2)),
+        ),
+        (
+            "boolean y_pred",
+            lambda: score(np.ones(2), np.array([True, False])),
+        ),
+        (
+            "overflow metric in score",
+            lambda: score([1e160], [0.0]),
+        ),
+        ("closure_rows non-DataFrame", lambda: closure_rows(cast(Any, "not a df"))),
+        ("preopening_rows non-DataFrame", lambda: preopening_rows(cast(Any, 123))),
+        ("fit_rows non-DataFrame", lambda: fit_rows(cast(Any, {"a": 1}))),
+        (
+            "preopening_rows non-integer store_nbr",
+            lambda: preopening_rows(
+                pd.DataFrame({"store_nbr": ["1"], "date": [dummy_date]})
+            ),
+        ),
+        (
+            "preopening_rows float store_nbr",
+            lambda: preopening_rows(
+                pd.DataFrame({"store_nbr": [1.5], "date": [dummy_date]})
+            ),
+        ),
+        (
+            "preopening_rows non-datetime date",
+            lambda: preopening_rows(
+                pd.DataFrame({"store_nbr": [1], "date": ["2016-01-01"]})
+            ),
+        ),
+        (
+            "preopening_rows timezone date",
+            lambda: preopening_rows(
+                pd.DataFrame(
+                    {
+                        "store_nbr": [1],
+                        "date": [pd.Timestamp("2016-01-01", tz="UTC")],
+                    }
+                )
+            ),
+        ),
+        ("load_split extra column", _test_load_split_extra_col),
+        ("load_split duplicate column", _test_load_split_dup_col),
+        ("load_frame extra column", _test_load_frame_extra_col),
+        ("load_frame duplicate column", _test_load_frame_dup_col),
     ]
     for label, call in cases:
         must_refuse(call, label)
