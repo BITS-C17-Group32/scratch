@@ -30,6 +30,10 @@ Specifications:
 - Freeze refusal gates run before anything else: FREEZE_RUN=1, no prior
   freeze_run = true record, full registry present, per-artifact schema.
   No gate opens a split; local_test loads only on the Day-5 body.
+- artifacts/freeze_results.json carries the pinned Day-5 field set
+  (frozen_at, git_sha, headline_model, data_snapshot, contract_counts,
+  fold_phase, freeze_phase, notes). It is written once, atomically, by
+  the freeze run, and its model count equals the registry's.
 - Duplicate (store, family, date) keys, duplicate real ids, and negative
   sales are asserted zero on train and valid inside --check.
 - Evaluation slices are scored without pre-opening masking.
@@ -56,7 +60,7 @@ import sys
 import tempfile
 import time
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Generator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NoReturn, cast
@@ -234,6 +238,54 @@ KIND_BY_ARTIFACT = {
     "classical_results.json": "classical",
     "deep_results.json": "deep",
 }
+
+# -- Day-5 pins: the freeze output contract. artifacts/freeze_results.json
+# carries exactly these top-level fields, in this order (sheet §10), so the
+# dashboard and the report read one fixed key map.
+FREEZE_RESULTS_KEYS = (
+    "frozen_at",
+    "git_sha",
+    "headline_model",
+    "data_snapshot",
+    "contract_counts",
+    "fold_phase",
+    "freeze_phase",
+    "notes",
+)
+FREEZE_RESULTS_FILENAME = "freeze_results.json"
+# The Christmas-2016 slice: the local_test rows dated 2016-12-25, the one
+# full-calendar closure day inside the holdout window (54 stores x 33
+# families). The count is asserted against the frame, never assumed.
+CHRISTMAS_2016_DATE = pd.Timestamp("2016-12-25")
+CHRISTMAS_2016_ROWS = 1782
+# The deep models' lookback: predict_frame opens with valid's 60-day tail.
+LOOKBACK_DAYS = 60
+# The slices every freeze-phase model record carries, and the fold-phase
+# pair (the freeze phase adds the Christmas-2016 slice).
+FREEZE_SLICE_NAMES = ("full_grid", "active_slice", "christmas_2016")
+FOLD_SLICE_NAMES = ("full_grid", "active_slice")
+# The contract_counts sub-blocks (sheet §10).
+CONTRACT_COUNT_KEYS = (
+    "closure_rows",
+    "masked_training_drop",
+    "zero_share_raw",
+    "zero_share_trainable",
+    "preopening_holdout_rows",
+    "christmas_2016_rows",
+)
+# The week's locked counts. Every one of them is re-derived from the
+# frames at freeze time and compared against the pin, so a data drift
+# refuses the freeze instead of landing in the final JSON.
+PINNED_CLOSURE_ROWS = {"train": 5346, "valid": 0, "local_test": 1782}
+PINNED_CLOSURE_UNIVERSE = 7128
+PINNED_MASKED_DROP = {"train": 207801, "valid": 5544, "total": 213345}
+PINNED_IN_WINDOW_FILLS_KEPT = 462
+PINNED_ZERO_SHARE_RAW = (847004, 2405700)
+PINNED_ZERO_SHARE_TRAINABLE = (633659, 2192355)
+PINNED_PREOPENING_HOLDOUT = {"valid": 5544, "local_test": 7260, "total": 12804}
+# The rows one calendar day carries in the balanced grid: 54 stores x 33
+# families. Used for the valid-tail composition, never for a metric.
+SERIES_PER_DAY = 1782
 
 # -- Day-2 pins: artifacts/run_manifest.json record schema. One record
 # per contract invocation, oldest first; freeze_run is true on exactly
@@ -1188,7 +1240,13 @@ def read_run_manifest(path: Path) -> list[dict[str, Any]]:
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    """Write bytes atomically via a same-dir temp file and replace."""
+    """Write bytes atomically via a same-dir temp file and replace.
+
+    The rename is the only step that publishes the new content, so a
+    failure anywhere before it leaves the previous file untouched and no
+    temp file behind. A failed rename is reported as a friendly refusal
+    naming the file, never as a raw OSError.
+    """
     fd, tmp_name = tempfile.mkstemp(
         prefix=path.name + ".", suffix=".tmp", dir=str(path.parent)
     )
@@ -1197,7 +1255,10 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
     try:
         tmp.write_bytes(data)
         os.chmod(tmp, 0o644)
-        os.replace(tmp, path)
+        try:
+            os.replace(tmp, path)
+        except OSError as error:
+            raise ContractError(f"{path.name} write failed: {error}") from error
     finally:
         try:
             if tmp.exists():
@@ -2016,6 +2077,1020 @@ def _freeze_preflight(
     return registered, blurbs
 
 
+def _require_int(value: Any, label: str) -> int:
+    """A non-negative int, or a loud refusal."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ContractError(f"{label} must be a non-negative int, got {value!r}")
+    return value
+
+
+def _assert_pinned_frame(frame: pd.DataFrame, label: str) -> None:
+    """Refuse a frame that drifted from the 26 pinned columns and dtypes."""
+    if not isinstance(frame, pd.DataFrame):  # pyright: ignore[reportUnnecessaryIsInstance]
+        raise ContractError(f"{label}: must be a DataFrame, got {type(frame).__name__}")
+    if not frame.columns.is_unique:
+        raise ContractError(f"{label}: columns contain duplicates")
+    missing = [c for c in PINNED_DTYPES if c not in frame.columns]
+    extra = [c for c in frame.columns if c not in PINNED_DTYPES]
+    if missing or extra:
+        raise ContractError(
+            f"{label}: columns must exactly match the 26 pinned columns; "
+            f"missing {missing}; extra {extra}"
+        )
+    for col, expected_dtype in PINNED_DTYPES.items():
+        actual = str(frame[col].dtype)
+        if actual != expected_dtype:
+            raise ContractError(
+                f"{label}: column {col!r} got dtype {actual}, expected {expected_dtype}"
+            )
+
+
+def _empty_score_block() -> dict[str, float | int]:
+    """The pinned score schema for an empty slice."""
+    return {
+        "rmsle": 0.0,
+        "mae": 0.0,
+        "rmse": 0.0,
+        "rmsle_active": 0.0,
+        "mae_active": 0.0,
+        "rmse_active": 0.0,
+        "n_rows": 0,
+        "n_rows_active": 0,
+    }
+
+
+def _slice_block(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float | int]:
+    """One slice of the pinned score schema, in the pinned key order.
+
+    score() is the only metric implementation; this helper only picks the
+    slice and keeps the pinned key order. An empty slice scores as zeros
+    instead of refusing (the Christmas-2016 slice is all-zero demand).
+    """
+    if y_true.size == 0:
+        return _empty_score_block()
+    block = score(y_true, y_pred)
+    return {key: block[key] for key in SCORE_KEYS}
+
+
+def _christmas_mask(
+    local_test: pd.DataFrame, expected_rows: int = CHRISTMAS_2016_ROWS
+) -> np.ndarray:
+    """The Christmas-2016 slice mask, derived from the frame's date column.
+
+    The slice is the local_test rows dated 2016-12-25 (54 stores x 33
+    families = 1,782 rows). The row count is asserted, never assumed: a
+    frame whose slice does not hold exactly the pinned count is refused.
+    """
+    if "date" not in local_test.columns:
+        raise ContractError("freeze: the local_test frame has no 'date' column")
+    dates = local_test["date"]
+    if not pd.api.types.is_datetime64_any_dtype(dates):
+        raise ContractError(
+            "freeze: the local_test 'date' column must be a datetime, got "
+            f"{dates.dtype}"
+        )
+    mask = (dates == CHRISTMAS_2016_DATE).to_numpy()
+    found = int(mask.sum())
+    if found != expected_rows:
+        raise ContractError(
+            f"freeze: the Christmas-2016 slice holds {found} local_test rows "
+            f"dated {CHRISTMAS_2016_DATE.date()}, expected {expected_rows} "
+            "(54 stores x 33 families); the slice is derived from the frame's "
+            "date column, never hardcoded"
+        )
+    return mask
+
+
+def _align_local_test_predictions(
+    model_name: str, raw: Any, predict_frame_rows: int, local_test_rows: int
+) -> np.ndarray:
+    """Align a fit_predict_frozen return to the local_test rows.
+
+    The sanctioned entrypoints are pinned to one of two shapes: aligned to
+    the predict_frame row order (S3) or to the local_test rows only (S4).
+    Both are accepted; anything else is refused with both counts named.
+    """
+    try:
+        predictions = np.asarray(raw, dtype=np.float64)
+    except (TypeError, ValueError) as error:
+        raise ContractError(
+            f"freeze: model {model_name!r} returned a non-numeric prediction "
+            f"array: {error}"
+        ) from error
+    if predictions.ndim != 1:
+        raise ContractError(
+            f"freeze: model {model_name!r} returned a {predictions.ndim}-D "
+            "prediction array; predictions must be 1-D"
+        )
+    if predictions.size == local_test_rows:
+        aligned = predictions
+    elif predictions.size == predict_frame_rows:
+        aligned = predictions[predict_frame_rows - local_test_rows :]
+    else:
+        raise ContractError(
+            f"freeze: model {model_name!r} returned {predictions.size} "
+            f"predictions; expected {local_test_rows} (aligned to the "
+            f"local_test rows) or {predict_frame_rows} (aligned to the "
+            "predict_frame row order)"
+        )
+    if not np.isfinite(aligned).all():
+        raise ContractError(
+            f"freeze: model {model_name!r} returned non-finite predictions"
+        )
+    return aligned
+
+
+def _registered_payloads(directory: Path) -> dict[str, dict[str, Any]]:
+    """The registered artifacts' parsed payloads, read for the fold phase.
+
+    The pre-flight gate already validated these bytes (schema, bounds,
+    banned keys); this read exists only so the fold-phase numbers come
+    from the same artifacts the gate cleared, never from memory.
+    """
+    payloads: dict[str, dict[str, Any]] = {}
+    for name in ARTIFACT_REGISTRY:
+        path = directory / name
+        if not path.is_file():
+            raise ContractError(
+                f"freeze: the registered artifact {name} is missing from {directory}"
+            )
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise ContractError(
+                f"freeze: artifacts/{name} does not parse: {error}"
+            ) from error
+        if not isinstance(payload, dict):
+            raise ContractError(f"freeze: artifacts/{name} is not a JSON object")
+        spec = ARTIFACT_REGISTRY[name]
+        tiers = payload.get(spec["tiers_key"])
+        if not isinstance(tiers, list) or not tiers:
+            raise ContractError(
+                f"freeze: artifacts/{name} carries no {spec['tiers_key']} list"
+            )
+        names = [entry.get(spec["tier_name_key"]) for entry in tiers]
+        if names != list(spec["model_names"]):
+            raise ContractError(
+                f"freeze: artifacts/{name} tier names {names} != pinned "
+                f"{list(spec['model_names'])}"
+            )
+        payloads[name] = payload
+    return payloads
+
+
+def _freeze_model_specs(payloads: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """The ordered freeze model list: every registered tier, with its config.
+
+    The classical tiers carry the hyperparameters their own artifact
+    records (that artifact is the winning-config record); the deep tiers
+    carry None, because their sheet pins the config argument as optional
+    and the checkpoint holds the architecture.
+    """
+    specs: list[dict[str, Any]] = []
+    for artifact_name, payload in payloads.items():
+        spec = ARTIFACT_REGISTRY[artifact_name]
+        for entry in payload[spec["tiers_key"]]:
+            config: Any = None
+            if artifact_name == "classical_results.json":
+                config = entry.get("hyperparameters")
+                if not isinstance(config, dict):
+                    raise ContractError(
+                        f"freeze: artifacts/{artifact_name} tier "
+                        f"{entry.get(spec['tier_name_key'])!r} carries no "
+                        "hyperparameters object"
+                    )
+            specs.append(
+                {
+                    "name": str(entry[spec["tier_name_key"]]),
+                    "track": spec["track"],
+                    "artifact": artifact_name,
+                    "module": KIND_BY_ARTIFACT[artifact_name],
+                    "config": config,
+                }
+            )
+    return specs
+
+
+def _data_snapshot(manifest: dict[str, Any]) -> dict[str, Any]:
+    """The per-split rows and bound dates, copied from the fresh manifest."""
+    snapshot: dict[str, Any] = {}
+    for split in SPLIT_NAMES:
+        rows = manifest["rows"][split]
+        bounds = manifest["bounds"][split]
+        snapshot[split] = {
+            "rows": int(rows),
+            "bounds": [str(bounds[0]), str(bounds[1])],
+        }
+    return snapshot
+
+
+def _contract_counts(
+    train: pd.DataFrame,
+    valid: pd.DataFrame,
+    local_test: pd.DataFrame,
+    frame: pd.DataFrame,
+    fit_frame: pd.DataFrame,
+) -> dict[str, Any]:
+    """The contract_counts block: the week's locked counts, re-derived.
+
+    Every number is computed from the frames and compared against its
+    pinned value, so a data drift refuses the freeze instead of landing
+    in the final JSON.
+    """
+    closure = {
+        "train": int(closure_rows(train).sum()),
+        "valid": int(closure_rows(valid).sum()),
+        "local_test": int(closure_rows(local_test).sum()),
+    }
+    if closure != PINNED_CLOSURE_ROWS:
+        raise ContractError(
+            f"freeze: closure rows {closure} != pinned {PINNED_CLOSURE_ROWS}"
+        )
+    drop_train = int((~fit_rows(train)).sum())
+    drop_valid = int((~fit_rows(valid)).sum())
+    in_window = int((preopening_rows(train) & closure_rows(train)).sum())
+    if {
+        "train": drop_train,
+        "valid": drop_valid,
+        "total": drop_train + drop_valid,
+    } != PINNED_MASKED_DROP:
+        raise ContractError(
+            f"freeze: the masked training drop {{'train': {drop_train}, "
+            f"'valid': {drop_valid}, 'total': {drop_train + drop_valid}}} != "
+            f"pinned {PINNED_MASKED_DROP}"
+        )
+    if in_window != PINNED_IN_WINDOW_FILLS_KEPT:
+        raise ContractError(
+            f"freeze: {in_window} closure fills sit inside a pre-opening "
+            f"window, pinned {PINNED_IN_WINDOW_FILLS_KEPT}"
+        )
+    raw_zeros = int((frame["sales"] == 0).sum())
+    if (raw_zeros, len(frame)) != PINNED_ZERO_SHARE_RAW:
+        raise ContractError(
+            f"freeze: the raw zero share is {raw_zeros} of {len(frame)}, "
+            f"pinned {PINNED_ZERO_SHARE_RAW[0]} of {PINNED_ZERO_SHARE_RAW[1]}"
+        )
+    trainable_zeros = int((fit_frame["sales"] == 0).sum())
+    if (trainable_zeros, len(fit_frame)) != PINNED_ZERO_SHARE_TRAINABLE:
+        raise ContractError(
+            f"freeze: the trainable zero share is {trainable_zeros} of "
+            f"{len(fit_frame)}, pinned {PINNED_ZERO_SHARE_TRAINABLE[0]} of "
+            f"{PINNED_ZERO_SHARE_TRAINABLE[1]}"
+        )
+    holdout = {
+        "valid": int(preopening_rows(valid).sum()),
+        "local_test": int(preopening_rows(local_test).sum()),
+    }
+    holdout["total"] = holdout["valid"] + holdout["local_test"]
+    if holdout != PINNED_PREOPENING_HOLDOUT:
+        raise ContractError(
+            f"freeze: the pre-opening holdout rows {holdout} != pinned "
+            f"{PINNED_PREOPENING_HOLDOUT}"
+        )
+    return {
+        "closure_rows": {
+            "train": closure["train"],
+            "valid": closure["valid"],
+            "local_test": closure["local_test"],
+            "universe": PINNED_CLOSURE_UNIVERSE,
+        },
+        "masked_training_drop": {
+            "train": drop_train,
+            "valid": drop_valid,
+            "total": drop_train + drop_valid,
+            "in_window_fills_kept": in_window,
+        },
+        "zero_share_raw": {
+            "rows": raw_zeros,
+            "of_rows": len(frame),
+            "share": round(raw_zeros / len(frame), 6),
+        },
+        "zero_share_trainable": {
+            "rows": trainable_zeros,
+            "of_rows": len(fit_frame),
+            "share": round(trainable_zeros / len(fit_frame), 6),
+        },
+        "preopening_holdout_rows": {
+            "valid": holdout["valid"],
+            "local_test": holdout["local_test"],
+            "total": holdout["total"],
+        },
+        "christmas_2016_rows": CHRISTMAS_2016_ROWS,
+    }
+
+
+def _fold_phase_from_artifacts(payloads: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """The shared fold table plus every registered model's per-fold metrics.
+
+    The fold-phase numbers are the ones the tracks already recorded in
+    their registered artifacts; the freeze re-reads them, never re-derives
+    them (metric recomputation is the freeze phase's job only).
+    """
+    table = folds_table()
+    fold_rows = [
+        {
+            "fold": int(row["fold"]),
+            "origin": str(row["origin"]),
+            "window_start": str(row["window_start"]),
+            "window_end": str(row["window_end"]),
+            "n_rows": int(row["n_rows"]),
+        }
+        for _, row in table.iterrows()
+    ]
+    models: list[dict[str, Any]] = []
+    for artifact_name, payload in payloads.items():
+        spec = ARTIFACT_REGISTRY[artifact_name]
+        for entry in payload[spec["tiers_key"]]:
+            model_name = str(entry[spec["tier_name_key"]])
+            records: list[dict[str, Any]] = []
+            for index, fold_row in enumerate(entry["fold_metrics"]):
+                block = dict(fold_row)
+                ordinal = block.pop("fold", index + 1)
+                if ordinal != index + 1:
+                    raise ContractError(
+                        f"freeze: artifacts/{artifact_name} model {model_name!r} "
+                        f"fold_metrics[{index}] carries fold {ordinal}, "
+                        f"expected {index + 1}"
+                    )
+                missing = [key for key in SCORE_KEYS if key not in block]
+                if missing:
+                    raise ContractError(
+                        f"freeze: artifacts/{artifact_name} model {model_name!r} "
+                        f"fold_metrics[{index}] is missing {missing}"
+                    )
+                full_grid = _assert_score_block(
+                    f"freeze: artifacts/{artifact_name} model {model_name!r} "
+                    f"fold {index + 1}",
+                    {key: block[key] for key in SCORE_KEYS},
+                )
+                active_slice = {
+                    "rmsle": full_grid["rmsle_active"],
+                    "mae": full_grid["mae_active"],
+                    "rmse": full_grid["rmse_active"],
+                    "rmsle_active": full_grid["rmsle_active"],
+                    "mae_active": full_grid["mae_active"],
+                    "rmse_active": full_grid["rmse_active"],
+                    "n_rows": full_grid["n_rows_active"],
+                    "n_rows_active": full_grid["n_rows_active"],
+                }
+                records.append(
+                    {
+                        "fold": index + 1,
+                        "origin": fold_rows[index]["origin"],
+                        "window_start": fold_rows[index]["window_start"],
+                        "window_end": fold_rows[index]["window_end"],
+                        "n_rows": int(full_grid["n_rows"]),
+                        "slices": {
+                            "full_grid": dict(full_grid),
+                            "active_slice": active_slice,
+                        },
+                    }
+                )
+            models.append(
+                {
+                    "name": model_name,
+                    "track": spec["track"],
+                    "artifact": artifact_name,
+                    "folds": records,
+                }
+            )
+    return {"folds": fold_rows, "models": models}
+
+
+def _freeze_phase_records(
+    models: list[dict[str, Any]],
+    local_test: pd.DataFrame,
+    predict_frame: pd.DataFrame,
+    predict: Callable[[dict[str, Any]], Any],
+) -> list[dict[str, Any]]:
+    """Step 3-4: every registered model's freeze-phase slices.
+
+    The Christmas-2016 slice comes from the local_test frame's date
+    column, and every metric comes from score(); nothing is re-derived
+    here.
+    """
+    christmas = _christmas_mask(local_test)
+    y_true = local_test["sales"].to_numpy(dtype=np.float64)
+    active = y_true > 0
+    predict_frame_rows = len(predict_frame)
+    local_test_rows = len(local_test)
+    window_start = local_test["date"].min().date().isoformat()
+    window_end = local_test["date"].max().date().isoformat()
+    records: list[dict[str, Any]] = []
+    for spec in models:
+        model_name = str(spec["name"])
+        raw = predict(spec)
+        predictions = _align_local_test_predictions(
+            model_name, raw, predict_frame_rows, local_test_rows
+        )
+        records.append(
+            {
+                "name": model_name,
+                "track": str(spec["track"]),
+                "artifact": str(spec["artifact"]),
+                "window_start": window_start,
+                "window_end": window_end,
+                "n_rows": int(local_test_rows),
+                "slices": {
+                    "full_grid": _slice_block(y_true, predictions),
+                    "active_slice": _slice_block(y_true[active], predictions[active]),
+                    "christmas_2016": _slice_block(
+                        y_true[christmas], predictions[christmas]
+                    ),
+                },
+            }
+        )
+    return records
+
+
+def _pick_headline_model(records: list[dict[str, Any]]) -> str:
+    """The registered model with the lowest freeze-time full-grid RMSLE."""
+    if not records:
+        raise ContractError("freeze: no registered model carries a freeze-phase score")
+    best = min(
+        records,
+        key=lambda record: float(record["slices"]["full_grid"]["rmsle"]),
+    )
+    return str(best["name"])
+
+
+def _validate_data_snapshot(snapshot: Any) -> None:
+    """The data_snapshot block: three splits, rows and bound dates."""
+    if not isinstance(snapshot, dict) or sorted(snapshot) != sorted(SPLIT_NAMES):
+        raise ContractError(
+            "freeze_results.json: data_snapshot must cover exactly train, "
+            "valid and local_test, copied from the fresh split manifest"
+        )
+    for split, block in snapshot.items():
+        label = f"freeze_results.json: data_snapshot {split}"
+        if not isinstance(block, dict) or sorted(block) != ["bounds", "rows"]:
+            raise ContractError(f"{label} must carry exactly rows and bounds")
+        _require_int(block["rows"], f"{label} rows")
+        bounds = block["bounds"]
+        if (
+            not isinstance(bounds, list)
+            or len(bounds) != 2
+            or not all(isinstance(edge, str) and edge for edge in bounds)
+        ):
+            raise ContractError(f"{label} bounds must be two date strings")
+
+
+def _validate_contract_counts(counts: Any) -> None:
+    """The contract_counts block: the pinned sub-blocks, each with counts."""
+    if not isinstance(counts, dict) or sorted(counts) != sorted(CONTRACT_COUNT_KEYS):
+        raise ContractError(
+            "freeze_results.json: contract_counts must carry exactly "
+            f"{sorted(CONTRACT_COUNT_KEYS)}"
+        )
+    closure = counts["closure_rows"]
+    if not isinstance(closure, dict) or sorted(closure) != [
+        "local_test",
+        "train",
+        "universe",
+        "valid",
+    ]:
+        raise ContractError(
+            "freeze_results.json: contract_counts closure_rows must carry "
+            "train, valid, local_test and universe"
+        )
+    for key, value in closure.items():
+        _require_int(value, f"freeze_results.json: contract_counts closure_rows {key}")
+    drop = counts["masked_training_drop"]
+    if not isinstance(drop, dict) or sorted(drop) != [
+        "in_window_fills_kept",
+        "total",
+        "train",
+        "valid",
+    ]:
+        raise ContractError(
+            "freeze_results.json: contract_counts masked_training_drop must "
+            "carry train, valid, total and in_window_fills_kept"
+        )
+    for key, value in drop.items():
+        _require_int(
+            value, f"freeze_results.json: contract_counts masked_training_drop {key}"
+        )
+    for key in ("zero_share_raw", "zero_share_trainable"):
+        block = counts[key]
+        if not isinstance(block, dict) or sorted(block) != ["of_rows", "rows", "share"]:
+            raise ContractError(
+                f"freeze_results.json: contract_counts {key} must carry rows, "
+                "of_rows and share"
+            )
+        _require_int(block["rows"], f"freeze_results.json: contract_counts {key} rows")
+        _require_int(
+            block["of_rows"], f"freeze_results.json: contract_counts {key} of_rows"
+        )
+        share = block["share"]
+        if isinstance(share, bool) or not isinstance(share, (int, float)):
+            raise ContractError(
+                f"freeze_results.json: contract_counts {key} share must be a number"
+            )
+    holdout = counts["preopening_holdout_rows"]
+    if not isinstance(holdout, dict) or sorted(holdout) != [
+        "local_test",
+        "total",
+        "valid",
+    ]:
+        raise ContractError(
+            "freeze_results.json: contract_counts preopening_holdout_rows must "
+            "carry valid, local_test and total"
+        )
+    for key, value in holdout.items():
+        _require_int(
+            value, f"freeze_results.json: contract_counts preopening_holdout_rows {key}"
+        )
+    _require_int(
+        counts["christmas_2016_rows"],
+        "freeze_results.json: contract_counts christmas_2016_rows",
+    )
+
+
+def _validate_fold_record(record: Any, label: str) -> None:
+    """One fold-phase record: the window plus the two pinned slices."""
+    expected = ["fold", "n_rows", "origin", "slices", "window_end", "window_start"]
+    if not isinstance(record, dict) or sorted(record) != expected:
+        raise ContractError(f"{label} must carry exactly {expected}")
+    _require_int(record["fold"], f"{label} fold")
+    _require_int(record["n_rows"], f"{label} n_rows")
+    for key in ("origin", "window_start", "window_end"):
+        if not isinstance(record[key], str) or not record[key]:
+            raise ContractError(f"{label} {key} must be a non-empty string")
+    slices = record["slices"]
+    if not isinstance(slices, dict) or sorted(slices) != sorted(FOLD_SLICE_NAMES):
+        raise ContractError(
+            f"{label} slices must carry exactly {sorted(FOLD_SLICE_NAMES)}"
+        )
+    for slice_name, slice_block in slices.items():
+        _assert_score_block(f"{label} slice {slice_name}", slice_block)
+
+
+def _validate_fold_phase(block: Any) -> list[dict[str, Any]]:
+    """The fold_phase block: the pinned windows and every model's rows."""
+    if not isinstance(block, dict) or sorted(block) != ["folds", "models"]:
+        raise ContractError(
+            "freeze_results.json: fold_phase must carry exactly folds and models"
+        )
+    folds = block["folds"]
+    if not isinstance(folds, list) or len(folds) != len(FOLD_TABLE_PINS):
+        raise ContractError(
+            f"freeze_results.json: fold_phase must carry the {len(FOLD_TABLE_PINS)} "
+            "pinned windows"
+        )
+    for index, (fold, origin, start, end) in enumerate(FOLD_TABLE_PINS):
+        record = folds[index]
+        label = f"freeze_results.json: fold_phase folds[{index}]"
+        if not isinstance(record, dict) or sorted(record) != [
+            "fold",
+            "n_rows",
+            "origin",
+            "window_end",
+            "window_start",
+        ]:
+            raise ContractError(f"{label} must carry the pinned window fields")
+        if [
+            record["fold"],
+            record["origin"],
+            record["window_start"],
+            record["window_end"],
+        ] != [fold, origin, start, end]:
+            raise ContractError(
+                f"{label} {record} != the pinned window {fold} {origin} {start} {end}"
+            )
+        _require_int(record["n_rows"], f"{label} n_rows")
+    models = block["models"]
+    if not isinstance(models, list) or not models:
+        raise ContractError(
+            "freeze_results.json: fold_phase must carry at least one model"
+        )
+    for index, model in enumerate(models):
+        label = f"freeze_results.json: fold_phase models[{index}]"
+        if not isinstance(model, dict) or sorted(model) != [
+            "artifact",
+            "folds",
+            "name",
+            "track",
+        ]:
+            raise ContractError(
+                f"{label} must carry exactly artifact, name, track and folds"
+            )
+        if not isinstance(model["name"], str) or not model["name"]:
+            raise ContractError(f"{label} name must be a non-empty string")
+        model_folds = model["folds"]
+        if not isinstance(model_folds, list) or len(model_folds) != len(
+            FOLD_TABLE_PINS
+        ):
+            raise ContractError(f"{label} must carry one record per pinned fold")
+        for fold_index, fold_record in enumerate(model_folds):
+            _validate_fold_record(fold_record, f"{label} folds[{fold_index}]")
+    return models
+
+
+def _validate_freeze_phase(block: Any) -> list[dict[str, Any]]:
+    """The freeze_phase block: one record per registered model."""
+    if not isinstance(block, dict) or sorted(block) != [
+        "models",
+        "n_rows",
+        "window_end",
+        "window_start",
+    ]:
+        raise ContractError(
+            "freeze_results.json: freeze_phase must carry exactly window_start, "
+            "window_end, n_rows and models"
+        )
+    _require_int(block["n_rows"], "freeze_results.json: freeze_phase n_rows")
+    for key in ("window_start", "window_end"):
+        if not isinstance(block[key], str) or not block[key]:
+            raise ContractError(
+                f"freeze_results.json: freeze_phase {key} must be a non-empty string"
+            )
+    models = block["models"]
+    if not isinstance(models, list) or not models:
+        raise ContractError(
+            "freeze_results.json: freeze_phase must carry at least one model"
+        )
+    for index, model in enumerate(models):
+        label = f"freeze_results.json: freeze_phase models[{index}]"
+        expected = [
+            "artifact",
+            "n_rows",
+            "name",
+            "slices",
+            "track",
+            "window_end",
+            "window_start",
+        ]
+        if not isinstance(model, dict) or sorted(model) != expected:
+            raise ContractError(f"{label} must carry exactly {expected}")
+        if not isinstance(model["name"], str) or not model["name"]:
+            raise ContractError(f"{label} name must be a non-empty string")
+        _require_int(model["n_rows"], f"{label} n_rows")
+        slices = model["slices"]
+        if not isinstance(slices, dict) or sorted(slices) != sorted(FREEZE_SLICE_NAMES):
+            raise ContractError(
+                f"{label} slices must carry exactly {sorted(FREEZE_SLICE_NAMES)}"
+            )
+        for slice_name, slice_block in slices.items():
+            _assert_score_block(f"{label} slice {slice_name}", slice_block)
+    return models
+
+
+def _validate_freeze_results(
+    payload: Any, *, expected_models: int | None = None
+) -> None:
+    """The pinned freeze_results.json schema; any drift is a loud refusal."""
+    if not isinstance(payload, dict):
+        raise ContractError(
+            f"freeze_results.json must be a JSON object, got {type(payload).__name__}"
+        )
+    measured = list(payload)
+    if measured != list(FREEZE_RESULTS_KEYS):
+        missing = [key for key in FREEZE_RESULTS_KEYS if key not in payload]
+        extra = [key for key in payload if key not in FREEZE_RESULTS_KEYS]
+        raise ContractError(
+            f"freeze_results.json: fields {measured} != the pinned "
+            f"{list(FREEZE_RESULTS_KEYS)}; missing {missing}; extra {extra}"
+        )
+    frozen_at = payload["frozen_at"]
+    if not isinstance(frozen_at, str):
+        raise ContractError("freeze_results.json: frozen_at must be an ISO 8601 string")
+    try:
+        stamp = datetime.fromisoformat(frozen_at.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ContractError(
+            f"freeze_results.json: frozen_at {frozen_at!r} does not parse: {error}"
+        ) from error
+    if stamp.tzinfo is None:
+        raise ContractError(
+            "freeze_results.json: frozen_at must carry a timezone "
+            "(ISO 8601 Z or offset)"
+        )
+    sha = payload["git_sha"]
+    if (
+        not isinstance(sha, str)
+        or len(sha) != 40
+        or set(sha.lower()) - set("0123456789abcdef")
+    ):
+        raise ContractError(
+            f"freeze_results.json: git_sha must be a 40-hex sha, got {sha!r}"
+        )
+    headline = payload["headline_model"]
+    if not isinstance(headline, str) or not headline.strip():
+        raise ContractError(
+            "freeze_results.json: headline_model must be a non-empty string"
+        )
+    notes = payload["notes"]
+    if not isinstance(notes, list) or not all(isinstance(note, str) for note in notes):
+        raise ContractError("freeze_results.json: notes must be a list of strings")
+    _validate_data_snapshot(payload["data_snapshot"])
+    _validate_contract_counts(payload["contract_counts"])
+    fold_models = _validate_fold_phase(payload["fold_phase"])
+    freeze_models = _validate_freeze_phase(payload["freeze_phase"])
+    names = [str(model["name"]) for model in freeze_models]
+    if headline not in names:
+        raise ContractError(
+            f"freeze_results.json: headline_model {headline!r} is not one of the "
+            f"freeze-phase models {names}"
+        )
+    if expected_models is not None and len(freeze_models) != expected_models:
+        raise ContractError(
+            f"freeze_results.json: {len(freeze_models)} model records != the "
+            f"registered count {expected_models}"
+        )
+    if len(fold_models) != len(freeze_models):
+        raise ContractError(
+            f"freeze_results.json: the fold phase carries {len(fold_models)} "
+            f"models but the freeze phase carries {len(freeze_models)}"
+        )
+
+
+def _write_freeze_results(path: Path, payload: dict[str, Any]) -> None:
+    """Write freeze_results.json atomically, then re-open and re-parse it.
+
+    Same-dir temp file and a rename (a crash mid-write never leaves a
+    half-written file behind), then the file is reopened, its size
+    asserted and its content compared with the payload.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        data = (json.dumps(payload, indent=2, allow_nan=False) + "\n").encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise ContractError(
+            f"freeze_results.json does not serialise to JSON: {error}"
+        ) from error
+    _atomic_write_bytes(path, data)
+    try:
+        stored_bytes = path.read_bytes()
+    except OSError as error:
+        raise ContractError(
+            f"freeze_results.json could not be re-read after the write: {error}"
+        ) from error
+    if not stored_bytes:
+        raise ContractError("freeze_results.json is zero bytes after the write")
+    try:
+        stored = json.loads(stored_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as error:
+        raise ContractError(
+            f"freeze_results.json does not parse after the write: {error}"
+        ) from error
+    if stored != payload:
+        raise ContractError(
+            "freeze_results.json does not round-trip through JSON unchanged"
+        )
+
+
+def _freeze_notes() -> list[str]:
+    """The notes block: the locked decisions, carried into the final JSON."""
+    return [
+        "the earthquake-decay caveat applies strictly to the full-valid row "
+        "set; the three fold windows starting 2016-07-26 carry no quake rows",
+        "closure rows: the 7,128 id=NaN full-calendar fills (5,346 train / 0 "
+        "valid / 1,782 local_test) stay as true-zero labels everywhere; the "
+        "training mask keeps the 462 fills that sit inside a pre-opening window",
+        "masking: the training mask is date < DELAYS_OPEN_UNTIL[store_nbr] & "
+        "id.notna() over the 8 pinned per-store windows; 213,345 raw rows drop "
+        "(207,801 train + 5,544 valid); the 12,804 pre-opening holdout rows "
+        "(5,544 valid + 7,260 local_test) are scored as-is",
+        "the percentage-error metric is excluded from every reported number: "
+        "it is undefined at 35.2% zero demand in train+valid",
+        "dual evaluation: every model carries the full-grid and the active-slice "
+        "numbers side by side, and the Christmas-2016 slice (1,782 local_test "
+        "rows) is reported separately",
+        f"predict_frame: valid's {LOOKBACK_DAYS}-day tail "
+        f"({(VALID_END - pd.Timedelta(days=LOOKBACK_DAYS - 1)).date()}.."
+        f"{VALID_END.date()}) followed by local_test "
+        f"({SPLIT_FRAME_STARTS['local_test']}..{SPLIT_FRAME_ENDS['local_test']}), "
+        "unmasked, so the predictors carry their lookback before the scored window",
+        "the holiday lead flags (is_*_tomorrow / is_*_in_2days) are "
+        "calendar-built and future-known by design; nothing else in the "
+        "pipeline reaches from the future",
+        "local_test was read exactly once, through the guarded load_split "
+        "inside the freeze path, and was never tuned on",
+    ]
+
+
+def _load_sanctioned_entrypoints() -> dict[str, dict[str, Any]]:
+    """The sanctioned per-track fit_predict_frozen entrypoints.
+
+    One module per registered artifact (S3's classical, S4's deep). A
+    missing module or a missing symbol is a loud refusal, never a skip.
+    """
+    entrypoints: dict[str, dict[str, Any]] = {}
+    for artifact_name, module_name in KIND_BY_ARTIFACT.items():
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as error:
+            raise ContractError(
+                f"sanctioned entrypoint {module_name} for {artifact_name} "
+                f"failed to import: {error}"
+            ) from error
+        symbol = getattr(module, "fit_predict_frozen", None)
+        if not callable(symbol):
+            raise ContractError(
+                f"sanctioned entrypoint {module_name} for {artifact_name} "
+                "missing symbol fit_predict_frozen"
+            )
+        entrypoints[artifact_name] = {"module": module_name, "call": symbol}
+    return entrypoints
+
+
+def _align_categorical_domains(
+    reference: pd.DataFrame, target: pd.DataFrame, label: str
+) -> pd.DataFrame:
+    """Cast the target's categorical columns onto the reference's domain.
+
+    The predict frame concatenates two frames, and pandas widens a
+    categorical to object the moment the two domains differ, which would
+    break the pinned dtype contract downstream. The holdout is cast onto
+    the training frame's domain instead, and a holdout category the
+    training frame never saw is a loud refusal, never a silent NaN.
+    """
+    aligned = target.copy()
+    for column, reference_dtype in reference.dtypes.items():
+        if not isinstance(reference_dtype, pd.CategoricalDtype):
+            continue
+        values = aligned[column]
+        unseen = sorted(
+            str(value)
+            for value in values.dropna().unique()
+            if value not in reference_dtype.categories
+        )
+        if unseen:
+            raise ContractError(
+                f"{label}: column {column!r} holds categor(ies) {unseen} that "
+                "the training frame never saw; the holdout cannot be cast "
+                "onto the training domain"
+            )
+        aligned[column] = values.astype(reference_dtype)
+    return aligned
+
+
+def _freeze_predict_frame(
+    valid: pd.DataFrame, local_test: pd.DataFrame
+) -> pd.DataFrame:
+    """The predict frame: valid's 60-day tail followed by local_test.
+
+    The tail gives the predictors their lookback before the scored
+    window; local_test follows, unmasked, because the holdout is scored
+    as it stands.
+    """
+    tail_start = VALID_END - pd.Timedelta(days=LOOKBACK_DAYS - 1)
+    tail = valid.loc[valid["date"] >= tail_start]
+    tail_days = int(tail["date"].nunique())
+    if tail_days != LOOKBACK_DAYS:
+        raise ContractError(
+            f"freeze: the valid tail holds {tail_days} days, expected "
+            f"{LOOKBACK_DAYS} (from {tail_start.date()} to {VALID_END.date()})"
+        )
+    expected_rows = LOOKBACK_DAYS * SERIES_PER_DAY
+    if len(tail) != expected_rows:
+        raise ContractError(
+            f"freeze: the valid tail holds {len(tail)} rows, expected "
+            f"{expected_rows} ({LOOKBACK_DAYS} days x {SERIES_PER_DAY} series)"
+        )
+    predict_frame = pd.concat([tail, local_test], ignore_index=True)
+    _assert_pinned_frame(predict_frame, "freeze predict_frame")
+    return predict_frame
+
+
+def _run_canonical_sequence(
+    directory: Path,
+    *,
+    models: list[dict[str, Any]],
+    fit_frame: pd.DataFrame,
+    predict_frame: pd.DataFrame,
+    local_test: pd.DataFrame,
+    predict: Callable[[dict[str, Any]], Any],
+    fold_phase: dict[str, Any],
+    contract_counts: dict[str, Any],
+    data_snapshot: dict[str, Any],
+    notes: list[str],
+    frozen_at: str,
+    git_sha: str,
+) -> dict[str, Any]:
+    """Steps 3-5: score every model, assemble the payload, write it.
+
+    Nothing is written until every registered model scored: a failing
+    phase leaves the artifacts directory without a freeze_results.json.
+    """
+    records = _freeze_phase_records(models, local_test, predict_frame, predict)
+    freeze_phase = {
+        "window_start": records[0]["window_start"],
+        "window_end": records[0]["window_end"],
+        "n_rows": records[0]["n_rows"],
+        "models": records,
+    }
+    headline = _pick_headline_model(records)
+    payload = {
+        "frozen_at": frozen_at,
+        "git_sha": git_sha,
+        "headline_model": headline,
+        "data_snapshot": data_snapshot,
+        "contract_counts": contract_counts,
+        "fold_phase": fold_phase,
+        "freeze_phase": freeze_phase,
+        "notes": list(notes),
+    }
+    _validate_freeze_results(payload, expected_models=len(models))
+    _write_freeze_results(directory / FREEZE_RESULTS_FILENAME, payload)
+    return payload
+
+
+def _freeze_day5(
+    directory: Path, entrypoints: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    """The canonical Day-5 sequence, steps 1 to 5 of sheet §5.
+
+    Step 1: the registered artifacts are re-read (the pre-flight gate
+    owns the schema check). Step 2: FREEZE_RUN=1 is set and
+    splits/local_test.parquet is loaded exactly once through the guarded
+    load_split. Step 3: every registered model is called through its
+    sanctioned fit_predict_frozen with fit_frame = concat(train, valid)
+    masked by fit_rows and predict_frame = valid's 60-day tail followed
+    by local_test. Step 4: the pinned score schema runs on the full grid,
+    the active slice and the Christmas-2016 slice. Step 5:
+    artifacts/freeze_results.json is written atomically.
+    """
+    payloads = _registered_payloads(directory)
+    models = _freeze_model_specs(payloads)
+    registered_count = sum(
+        len(spec["model_names"]) for spec in ARTIFACT_REGISTRY.values()
+    )
+    if len(models) != registered_count:
+        raise ContractError(
+            f"freeze: {len(models)} registered models != the registry's "
+            f"{registered_count}; the freeze consumes all tiers or none"
+        )
+
+    # Step 2: the guarded local_test load, exactly once. The CLI does not
+    # set the flag, so this path sets it before the load.
+    os.environ["FREEZE_RUN"] = "1"
+    local_test = load_split("local_test")
+    train = load_split("train")
+    valid = load_split("valid")
+    _assert_pinned_frame(local_test, "freeze local_test")
+
+    # Step 3: fit_frame = concat(train, valid) masked by fit_rows;
+    # predict_frame = valid's 60-day tail followed by local_test.
+    frame = load_frame(train, valid)
+    fit_frame = frame.loc[fit_rows(frame)]
+    _assert_pinned_frame(fit_frame, "freeze fit_frame")
+    counts = _contract_counts(train, valid, local_test, frame, fit_frame)
+    # The counts are derived; the full frame and the train split are not
+    # needed again, and the model runs want the memory back.
+    del frame, train
+    local_test = _align_categorical_domains(fit_frame, local_test, "freeze local_test")
+    predict_frame = _freeze_predict_frame(valid, local_test)
+    del valid
+
+    def _predict(spec: dict[str, Any]) -> Any:
+        entry = entrypoints[str(spec["artifact"])]
+        call = entry["call"]
+        try:
+            return call(spec["name"], fit_frame, predict_frame, spec["config"])
+        except ContractError:
+            raise
+        except Exception as error:
+            raise ContractError(
+                f"freeze: model {spec['name']!r} failed inside its sanctioned "
+                f"fit_predict_frozen: {error!r}"
+            ) from error
+
+    manifest = _load_manifest()
+    snapshot = _data_snapshot(manifest)
+    if snapshot["local_test"]["bounds"] != [
+        SPLIT_FRAME_STARTS["local_test"],
+        SPLIT_FRAME_ENDS["local_test"],
+    ]:
+        raise ContractError(
+            "freeze: the split manifest's local_test bounds "
+            f"{snapshot['local_test']['bounds']} != the pinned "
+            f"{[SPLIT_FRAME_STARTS['local_test'], SPLIT_FRAME_ENDS['local_test']]}"
+        )
+    fold_phase = _fold_phase_from_artifacts(payloads)
+    sha, sha_notes = _git_sha()
+    if not sha:
+        raise ContractError(
+            "freeze: git sha unavailable; the freeze numbers must describe a "
+            f"committed tree ({'; '.join(sha_notes)})"
+        )
+    frozen_at = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return _run_canonical_sequence(
+        directory,
+        models=models,
+        fit_frame=fit_frame,
+        predict_frame=predict_frame,
+        local_test=local_test,
+        predict=_predict,
+        fold_phase=fold_phase,
+        contract_counts=counts,
+        data_snapshot=snapshot,
+        notes=_freeze_notes(),
+        frozen_at=frozen_at,
+        git_sha=sha,
+    )
+
+
 def freeze(artifacts_dir: Path | None = None) -> int:
     """The canonical freeze entrypoint; one testified pass, never a rehearsal.
 
@@ -2024,7 +3099,8 @@ def freeze(artifacts_dir: Path | None = None) -> int:
     per-track entrypoints importable on the merged tree. The gates
     themselves open no split and never touch local_test. On Day 5
     morning the canonical sequence runs here: re-verified artifacts,
-    fit_frame = load_frame() masked by fit_rows, predict_frame =
+    FREEZE_RUN=1 set and the guarded load_split("local_test") called
+    once, fit_frame = load_frame() masked by fit_rows, predict_frame =
     valid's 60-day tail followed by local_test, per-tier
     fit_predict_frozen, the pinned score schema on full-grid,
     active-slice and the Christmas-2016 slice (1,782 rows),
@@ -2067,20 +3143,7 @@ def freeze(artifacts_dir: Path | None = None) -> int:
 
         phase = "sanctioned entrypoints"
         try:
-            for artifact_name, module_name in KIND_BY_ARTIFACT.items():
-                try:
-                    module = importlib.import_module(module_name)
-                except Exception as error:
-                    raise ContractError(
-                        f"sanctioned entrypoint {module_name} for {artifact_name} "
-                        f"failed to import: {error}"
-                    ) from error
-                symbol = getattr(module, "fit_predict_frozen", None)
-                if not callable(symbol):
-                    raise ContractError(
-                        f"sanctioned entrypoint {module_name} for {artifact_name} "
-                        "missing symbol fit_predict_frozen"
-                    )
+            entrypoints = _load_sanctioned_entrypoints()
         except ContractError as error:
             reasons = [f"not merged yet - {error}"]
             print(f"FAIL freeze, {phase}: {'; '.join(reasons)}")
@@ -2088,13 +3151,52 @@ def freeze(artifacts_dir: Path | None = None) -> int:
             return 1
 
         phase = "canonical sequence"
-        reasons = [
-            "the Day-5 execution body lands at the Day-4 rehearsal review; "
-            "gates are green, no local_test was opened, nothing scored"
-        ]
-        print(f"FAIL freeze, {phase}: {'; '.join(reasons)}")
-        _record_attempt(phase, reasons)
-        return 1
+        try:
+            payload = _freeze_day5(directory, entrypoints)
+        except ContractError as error:
+            print(f"FAIL freeze, {phase}: {error}")
+            _record_attempt(phase, [str(error)])
+            return 1
+
+        elapsed = round(time.perf_counter() - started, 3)
+        try:
+            write_run_manifest(
+                "contract.py --freeze",
+                exit_status=0,
+                elapsed_seconds=elapsed,
+                arguments={"freeze": "1"},
+                freeze_run=True,
+                notes=[
+                    *_dirty_notes(),
+                    f"freeze_results.json written; headline model "
+                    f"{payload['headline_model']}",
+                ],
+                artifacts_dir=directory,
+            )
+        except Exception as error:
+            print(
+                f"FAIL freeze, manifest record: {error}; freeze_results.json is "
+                "already written and the manifest must be repaired by hand"
+            )
+            _record_attempt("manifest record", [repr(error)])
+            return 1
+        records = read_run_manifest(directory / "run_manifest.json")
+        last = records[-1] if records else {}
+        if (
+            last.get("freeze_run") is not True
+            or last.get("git_sha") != payload["git_sha"]
+        ):
+            print(
+                "FAIL freeze, manifest record: the appended record does not "
+                "carry freeze_run = true with the freeze's git sha"
+            )
+            return 1
+        print(
+            f"PASS freeze: {len(payload['freeze_phase']['models'])} models "
+            f"scored on the frozen holdout; headline {payload['headline_model']}; "
+            "freeze_results.json written atomically and verified"
+        )
+        return 0
     except SystemExit:
         raise
     except Exception as error:
@@ -3342,6 +4444,1732 @@ def _check_freeze_gates() -> None:
     print("PASS freeze: gates open no split and never read local_test")
 
 
+def _synthetic_frame(
+    dates: list[Any], sales: list[float], ids: list[Any] | None = None
+) -> pd.DataFrame:
+    """A contract-shaped frame (26 pinned columns, pinned dtypes) for fixtures.
+
+    The Day-5 check block drives the freeze body without opening a split
+    file; this builds frames the same shape the real ones have, so the
+    validators and the scorer see the real dtypes.
+    """
+    rows = len(dates)
+    data: dict[str, Any] = {
+        "date": pd.Series(pd.to_datetime(dates), dtype="datetime64[us]"),
+        "store_nbr": pd.Series([1] * rows, dtype="int8"),
+        "family": pd.Series(pd.Categorical(["A"] * rows)),
+        "id": pd.Series(
+            ids if ids is not None else list(range(1, rows + 1)), dtype="UInt32"
+        ),
+        "sales": pd.Series(sales, dtype="float32"),
+        "onpromotion": pd.Series([0] * rows, dtype="uint16"),
+        "city": pd.Series(pd.Categorical(["x"] * rows)),
+        "state": pd.Series(pd.Categorical(["x"] * rows)),
+        "store_type": pd.Series(pd.Categorical(["x"] * rows)),
+        "cluster": pd.Series([1] * rows, dtype="int8"),
+    }
+    for flag in (
+        "is_event",
+        "is_national_holiday",
+        "is_regional_holiday",
+        "is_local_holiday",
+        "is_holiday",
+        "is_national_holiday_tomorrow",
+        "is_national_holiday_in_2days",
+        "is_regional_holiday_tomorrow",
+        "is_regional_holiday_in_2days",
+        "is_local_holiday_tomorrow",
+        "is_local_holiday_in_2days",
+        "is_holiday_tomorrow",
+        "is_holiday_in_2days",
+        "is_event_tomorrow",
+        "is_event_in_2days",
+    ):
+        data[flag] = pd.Series([0] * rows, dtype="int8")
+    data["earthquake_decay"] = pd.Series([0.0] * rows, dtype="float32")
+    frame = pd.DataFrame(data)
+    _assert_pinned_frame(frame, "synthetic fixture")
+    return frame
+
+
+def _synthetic_freeze_fixtures() -> dict[str, Any]:
+    """The Day-5 check block's fixtures: frames, models and a fake predictor.
+
+    The local_test stand-in carries the pinned 1,782-row Christmas-2016
+    slice plus a small active tail, so the slice assertion, the dual
+    evaluation and the headline choice all run on realistic shapes
+    without opening splits/local_test.parquet.
+    """
+    christmas = [CHRISTMAS_2016_DATE] * CHRISTMAS_2016_ROWS
+    ordinary = [pd.Timestamp("2016-09-12")] * 120
+    sales = [0.0] * CHRISTMAS_2016_ROWS + [3.0] * 120
+    ids: list[Any] = [None] * CHRISTMAS_2016_ROWS + list(range(1, 121))
+    local_test = _synthetic_frame(christmas + ordinary, sales, ids)
+    tail_dates = [
+        VALID_END - pd.Timedelta(days=offset)
+        for offset in range(LOOKBACK_DAYS - 1, -1, -1)
+    ]
+    tail = _synthetic_frame(tail_dates, [1.0] * LOOKBACK_DAYS)
+    predict_frame = pd.concat([tail, local_test], ignore_index=True)
+    fit_frame = _synthetic_frame([pd.Timestamp("2016-03-27")] * 10, [2.0] * 10)
+    models = [
+        {
+            "name": "naive",
+            "track": "S3",
+            "artifact": "classical_results.json",
+            "module": "classical",
+            "config": {},
+        },
+        {
+            "name": "deep-lstm",
+            "track": "S4",
+            "artifact": "deep_results.json",
+            "module": "deep",
+            "config": None,
+        },
+    ]
+    return {
+        "local_test": local_test,
+        "predict_frame": predict_frame,
+        "fit_frame": fit_frame,
+        "models": models,
+        "rows": len(local_test),
+    }
+
+
+def _synthetic_fold_phase(models: list[dict[str, Any]]) -> dict[str, Any]:
+    """A fold-phase block shaped like the one the registered artifacts feed."""
+    table = folds_table()
+    fold_rows = [
+        {
+            "fold": int(row["fold"]),
+            "origin": str(row["origin"]),
+            "window_start": str(row["window_start"]),
+            "window_end": str(row["window_end"]),
+            "n_rows": int(row["n_rows"]),
+        }
+        for _, row in table.iterrows()
+    ]
+    fold_models = []
+    for spec in models:
+        records = []
+        for index, fold_row in enumerate(fold_rows):
+            full_grid = {
+                "rmsle": 0.2 + 0.01 * index,
+                "mae": 1.0 + 0.01 * index,
+                "rmse": 2.0 + 0.01 * index,
+                "rmsle_active": 0.3 + 0.01 * index,
+                "mae_active": 1.5 + 0.01 * index,
+                "rmse_active": 2.5 + 0.01 * index,
+                "n_rows": FOLD_ROWS,
+                "n_rows_active": 20000,
+            }
+            active_slice = {
+                "rmsle": full_grid["rmsle_active"],
+                "mae": full_grid["mae_active"],
+                "rmse": full_grid["rmse_active"],
+                "rmsle_active": full_grid["rmsle_active"],
+                "mae_active": full_grid["mae_active"],
+                "rmse_active": full_grid["rmse_active"],
+                "n_rows": full_grid["n_rows_active"],
+                "n_rows_active": full_grid["n_rows_active"],
+            }
+            records.append(
+                {
+                    "fold": index + 1,
+                    "origin": fold_row["origin"],
+                    "window_start": fold_row["window_start"],
+                    "window_end": fold_row["window_end"],
+                    "n_rows": FOLD_ROWS,
+                    "slices": {"full_grid": full_grid, "active_slice": active_slice},
+                }
+            )
+        fold_models.append(
+            {
+                "name": spec["name"],
+                "track": spec["track"],
+                "artifact": spec["artifact"],
+                "folds": records,
+            }
+        )
+    return {"folds": fold_rows, "models": fold_models}
+
+
+def _synthetic_contract_counts() -> dict[str, Any]:
+    """A contract_counts block shaped like the one the frames feed."""
+    return {
+        "closure_rows": {
+            "train": 5346,
+            "valid": 0,
+            "local_test": 1782,
+            "universe": 7128,
+        },
+        "masked_training_drop": {
+            "train": 207801,
+            "valid": 5544,
+            "total": 213345,
+            "in_window_fills_kept": 462,
+        },
+        "zero_share_raw": {
+            "rows": 847004,
+            "of_rows": 2405700,
+            "share": 0.352082,
+        },
+        "zero_share_trainable": {
+            "rows": 633659,
+            "of_rows": 2192355,
+            "share": 0.289031,
+        },
+        "preopening_holdout_rows": {
+            "valid": 5544,
+            "local_test": 7260,
+            "total": 12804,
+        },
+        "christmas_2016_rows": 1782,
+    }
+
+
+def _synthetic_data_snapshot() -> dict[str, Any]:
+    """A data_snapshot block shaped like the one the manifest feeds."""
+    return {
+        split: {
+            "rows": rows,
+            "bounds": [SPLIT_FRAME_STARTS[split], SPLIT_FRAME_ENDS[split]],
+        }
+        for split, rows in (
+            ("train", 2106324),
+            ("valid", 299376),
+            ("local_test", 602316),
+        )
+    }
+
+
+def _check_freeze_body() -> None:
+    """Day-5 block: the canonical freeze body, on synthetic fixtures only.
+
+    No split file is opened here and local_test is never read: the block
+    drives the freeze body with contract-shaped fixtures in throwaway
+    temp dirs and proves the atomic write, the refusals, the Christmas
+    slice assertion, the one-freeze invariant, the headline choice and
+    the no-write-on-failure rule.
+    """
+    fixtures = _synthetic_freeze_fixtures()
+    models = fixtures["models"]
+    local_test = fixtures["local_test"]
+    predict_frame = fixtures["predict_frame"]
+    rows = fixtures["rows"]
+    fold_phase = _synthetic_fold_phase(models)
+    counts = _synthetic_contract_counts()
+    snapshot = _synthetic_data_snapshot()
+
+    def _fake_predict(spec: dict[str, Any]) -> Any:
+        value = 1.0 if spec["name"] == "deep-lstm" else 2.0
+        return np.full(rows, value, dtype=np.float64)
+
+    with tempfile.TemporaryDirectory() as tmp_name:
+        directory = Path(tmp_name)
+        payload = _run_canonical_sequence(
+            directory,
+            models=models,
+            fit_frame=fixtures["fit_frame"],
+            predict_frame=predict_frame,
+            local_test=local_test,
+            predict=_fake_predict,
+            fold_phase=fold_phase,
+            contract_counts=counts,
+            data_snapshot=snapshot,
+            notes=_freeze_notes(),
+            frozen_at="2026-11-11T00:00:00Z",
+            git_sha="a" * 40,
+        )
+        written = directory / FREEZE_RESULTS_FILENAME
+        if not written.is_file():
+            raise ContractError(
+                "the canonical sequence did not write artifacts/freeze_results.json"
+            )
+        stored = json.loads(written.read_text(encoding="utf-8"))
+        if stored != payload:
+            raise ContractError(
+                "the written freeze_results.json does not re-parse to the payload"
+            )
+        if list(stored) != list(FREEZE_RESULTS_KEYS):
+            raise ContractError(
+                f"freeze_results.json carries {list(stored)}, not the pinned "
+                f"{list(FREEZE_RESULTS_KEYS)}"
+            )
+        leftovers = sorted(
+            p.name for p in directory.iterdir() if p.name != FREEZE_RESULTS_FILENAME
+        )
+        if leftovers:
+            raise ContractError(
+                f"the atomic write left temporary files behind: {leftovers}"
+            )
+        freeze_models = stored["freeze_phase"]["models"]
+        if len(freeze_models) != len(models):
+            raise ContractError(
+                f"freeze_results.json carries {len(freeze_models)} model records "
+                f"!= the {len(models)} scored models"
+            )
+        christmas_slice = freeze_models[0]["slices"]["christmas_2016"]
+        if christmas_slice["n_rows"] != CHRISTMAS_2016_ROWS:
+            raise ContractError(
+                "the Christmas-2016 slice did not hold the pinned "
+                f"{CHRISTMAS_2016_ROWS} rows"
+            )
+        if freeze_models[0]["slices"]["full_grid"]["n_rows"] != rows:
+            raise ContractError(
+                "the full-grid slice did not cover the whole scored frame"
+            )
+    print(
+        "PASS freeze body: freeze_results.json carries the pinned field set, is "
+        "written atomically (no temp residue) and re-parses to the payload"
+    )
+
+    # The refusals: a short, missing or malformed field set.
+    malformed: list[tuple[str, Any, str]] = [
+        (
+            "a missing field",
+            {k: v for k, v in payload.items() if k != "notes"},
+            "missing",
+        ),
+        (
+            "a short field set",
+            {k: v for k, v in payload.items() if k != "git_sha"},
+            "missing",
+        ),
+        ("an extra field", {**payload, "extra": 1}, "extra"),
+        (
+            "a naive frozen_at",
+            {**payload, "frozen_at": "2026-11-11T00:00:00"},
+            "timezone",
+        ),
+        ("a short git_sha", {**payload, "git_sha": "abc"}, "40-hex"),
+        (
+            "an empty headline",
+            {**payload, "headline_model": " "},
+            "headline_model",
+        ),
+        ("a foreign headline", {**payload, "headline_model": "nope"}, "not one of"),
+        ("notes that are not strings", {**payload, "notes": [1]}, "list of strings"),
+        (
+            "a short contract_counts",
+            {**payload, "contract_counts": {}},
+            "contract_counts",
+        ),
+        (
+            "a missing snapshot split",
+            {**payload, "data_snapshot": {}},
+            "data_snapshot",
+        ),
+        (
+            "a missing freeze slice",
+            {
+                **payload,
+                "freeze_phase": {
+                    "models": [],
+                    "n_rows": 0,
+                    "window_end": "",
+                    "window_start": "",
+                },
+            },
+            "freeze_phase",
+        ),
+    ]
+    for label, broken, needle in malformed:
+        try:
+            _validate_freeze_results(broken, expected_models=len(models))
+        except ContractError as error:
+            if needle not in str(error):
+                raise ContractError(
+                    f"the freeze_results.json validator refused {label} with the "
+                    f"wrong lead: {error}"
+                ) from error
+        else:
+            raise ContractError(f"the freeze_results.json validator accepted {label}")
+    print(
+        "PASS freeze body: a missing, short, extra or malformed field set is "
+        "refused with a friendly error"
+    )
+
+    # The Christmas-2016 slice assertion fires when the slice is wrong.
+    short_slice = _synthetic_frame(
+        [CHRISTMAS_2016_DATE] * (CHRISTMAS_2016_ROWS - 1)
+        + [pd.Timestamp("2016-09-12")],
+        [0.0] * CHRISTMAS_2016_ROWS,
+    )
+    try:
+        _christmas_mask(short_slice)
+    except ContractError as error:
+        if "Christmas-2016 slice" not in str(error):
+            raise ContractError(
+                f"the Christmas-2016 assertion refused with the wrong lead: {error}"
+            ) from error
+    else:
+        raise ContractError("the Christmas-2016 assertion accepted a short slice")
+    print(
+        "PASS freeze body: the Christmas-2016 slice row count is asserted against "
+        "the frame's date column and fires when the slice is wrong"
+    )
+
+    # Exactly one freeze_run = true record; a second freeze refuses.
+    with tempfile.TemporaryDirectory() as tmp_name:
+        manifest_dir = Path(tmp_name)
+        write_run_manifest(
+            "contract.py --freeze",
+            freeze_run=True,
+            arguments={"freeze": "1"},
+            artifacts_dir=manifest_dir,
+        )
+        records = read_run_manifest(manifest_dir / "run_manifest.json")
+        frozen = [record for record in records if record["freeze_run"] is True]
+        if len(frozen) != 1:
+            raise ContractError(
+                f"the manifest carries {len(frozen)} freeze_run = true records, "
+                "expected exactly one"
+            )
+        try:
+            write_run_manifest(
+                "contract.py --freeze",
+                freeze_run=True,
+                arguments={"freeze": "1"},
+                artifacts_dir=manifest_dir,
+            )
+        except ContractError as error:
+            if "already carries" not in str(error):
+                raise ContractError(
+                    f"the second freeze refused with the wrong lead: {error}"
+                ) from error
+        else:
+            raise ContractError("the second freeze was accepted")
+        write_run_manifest("contract.py --check", artifacts_dir=manifest_dir)
+        records = read_run_manifest(manifest_dir / "run_manifest.json")
+        frozen = [record for record in records if record["freeze_run"] is True]
+        if len(frozen) != 1:
+            raise ContractError(
+                "a later non-freeze record changed the freeze_run = true count"
+            )
+        doubled = [
+            {**records[0], "created": "2026-11-10T00:00:00Z"},
+            {**records[0], "created": "2026-11-11T00:00:00Z"},
+        ]
+        (manifest_dir / "run_manifest.json").write_text(
+            json.dumps(doubled), encoding="utf-8"
+        )
+        try:
+            read_run_manifest(manifest_dir / "run_manifest.json")
+        except ContractError as error:
+            if "freeze_run = true" not in str(error):
+                raise ContractError(
+                    f"the doubled manifest refused with the wrong lead: {error}"
+                ) from error
+        else:
+            raise ContractError("a manifest with two freeze records was accepted")
+    print(
+        "PASS freeze body: exactly one freeze_run = true record survives, a "
+        "second freeze refuses and a doubled manifest is refused"
+    )
+
+    # The headline is the registered model with the lowest RMSLE.
+    headline_records = [
+        {
+            "name": "naive",
+            "slices": {"full_grid": {"rmsle": 0.31}},
+        },
+        {
+            "name": "ridge",
+            "slices": {"full_grid": {"rmsle": 0.12}},
+        },
+        {
+            "name": "hgb",
+            "slices": {"full_grid": {"rmsle": 0.20}},
+        },
+    ]
+    if _pick_headline_model(headline_records) != "ridge":
+        raise ContractError(
+            "the headline was not the model with the lowest full-grid RMSLE"
+        )
+    if stored["headline_model"] != "deep-lstm":
+        raise ContractError(
+            f"the freeze headline {stored['headline_model']!r} is not the model "
+            "with the lowest full-grid RMSLE"
+        )
+    print(
+        "PASS freeze body: headline_model is the registered model with the "
+        "lowest full-grid RMSLE"
+    )
+
+    # A failing phase never leaves a freeze_results.json behind.
+    with tempfile.TemporaryDirectory() as tmp_name:
+        directory = Path(tmp_name)
+
+        def _failing_predict(spec: dict[str, Any]) -> Any:
+            if spec["name"] == "deep-lstm":
+                raise ContractError(
+                    "the fixture's sanctioned entrypoint refused the call"
+                )
+            return np.full(rows, 1.0, dtype=np.float64)
+
+        try:
+            _run_canonical_sequence(
+                directory,
+                models=models,
+                fit_frame=fixtures["fit_frame"],
+                predict_frame=predict_frame,
+                local_test=local_test,
+                predict=_failing_predict,
+                fold_phase=fold_phase,
+                contract_counts=counts,
+                data_snapshot=snapshot,
+                notes=_freeze_notes(),
+                frozen_at="2026-11-11T00:00:00Z",
+                git_sha="a" * 40,
+            )
+        except ContractError:
+            pass
+        else:
+            raise ContractError("a failing model phase was accepted")
+        if (directory / FREEZE_RESULTS_FILENAME).exists():
+            raise ContractError(
+                "freeze_results.json was written even though a phase failed"
+            )
+    print("PASS freeze body: freeze_results.json is never written when a phase fails")
+    print("PASS freeze body: the block opens no split and never reads local_test")
+
+
+# -- Day-5 self-audit battery: the freeze machinery against synthetic --
+# fixtures. splits/local_test.parquet is never opened here: every frame
+# these blocks score is built in memory, every artifact the freeze path
+# consumes is a throwaway fixture in a TemporaryDirectory, and the two
+# fit_predict_frozen alignment conventions (predict_frame row order vs
+# local_test rows only) are stub modules. While the Day-5 body has not
+# landed (the canonical-sequence phase still carries the placeholder),
+# the body-dependent blocks print an INFO line and return, so --check
+# stays green on a tree without the body; the moment the body lands,
+# they run for real and fail loudly on any contract drift.
+#
+# One direct-call seam is pinned on the freeze body by this battery:
+#     _validate_freeze_results(payload: dict) -> None
+#        raises ContractError on a freeze_results.json payload that
+#        violates the sheet Section-10 field set, types, finiteness,
+#        non-negative metrics, the registry-sized model list, or the
+#        headline_model-led registry rule. Friendly errors only.
+# Every other block drives the public freeze() entrypoint end to end.
+_CHRISTMAS_2016 = pd.Timestamp("2016-12-25")
+# Pinned by the sheets: 54 stores x 33 families = 1,782 rows on
+# 2016-12-25 in local_test (the count is pinned there, never measured
+# by opening the file).
+_CHRISTMAS_ROWS = 54 * 33
+_VALID_TAIL_DAYS = 60
+_FREEZE_RESULTS_TOP_LEVEL = (
+    "frozen_at",
+    "git_sha",
+    "headline_model",
+    "data_snapshot",
+    "contract_counts",
+    "fold_phase",
+    "freeze_phase",
+    "notes",
+)
+
+
+def _registered_model_names() -> list[str]:
+    """The 8 registered model names, in registry pin order."""
+    ordered: list[str] = []
+    for artifact_name in sorted(ARTIFACT_REGISTRY):
+        ordered.extend(ARTIFACT_REGISTRY[artifact_name]["model_names"])
+    return ordered
+
+
+def _walk_nodes(node: Any, path: str = "") -> Generator[tuple[str, Any], None, None]:
+    """Yield (dotted path, node) for every node in the tree, leaves too."""
+    yield path, node
+    if isinstance(node, dict):
+        for key, value in node.items():
+            child = f"{path}.{key}" if path else str(key)
+            yield from _walk_nodes(value, child)
+    elif isinstance(node, list):
+        for index, item in enumerate(node):
+            yield from _walk_nodes(item, f"{path}[{index}]")
+
+
+def _classify_slice(path: str) -> str | None:
+    """Full-grid / active-slice / Christmas tag from a dotted path."""
+    lowered = path.lower()
+    if "christmas" in lowered:
+        return "christmas"
+    if "full" in lowered:
+        return "full_grid"
+    if "active" in lowered:
+        return "active_slice"
+    return None
+
+
+def _assert_score_block_shape(path: str, block: dict[str, Any]) -> dict[str, Any]:
+    """Pinned score schema keys: 6 finite non-negative metrics + 2 counts."""
+    for key in SCORE_KEYS[:6]:
+        value = block[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ContractError(
+                f"{path}: {key} must be a finite non-negative number, got {value!r}"
+            )
+        number = float(value)
+        if not math.isfinite(number) or number < 0.0:
+            raise ContractError(
+                f"{path}: {key} must be a finite non-negative number, got {value!r}"
+            )
+    for key in ("n_rows", "n_rows_active"):
+        count = block[key]
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ContractError(f"{path}: {key} must be a non-negative int")
+    if block["n_rows_active"] > block["n_rows"]:
+        raise ContractError(
+            f"{path}: n_rows_active {block['n_rows_active']} > n_rows {block['n_rows']}"
+        )
+    return block
+
+
+def _fold_records(block: Any) -> list[dict[str, Any]]:
+    """The per-model-per-fold records of a fold_phase block, flattened.
+
+    The freeze body writes fold_phase as an object holding the pinned
+    windows and, per model, its own list of fold records; a flat list of
+    fold records is the other shape the sheets allow. Both are read here.
+    """
+    records: list[dict[str, Any]] = []
+    if isinstance(block, dict):
+        models = block.get("models")
+        if isinstance(models, list):
+            for model in models:
+                if not isinstance(model, dict):
+                    continue
+                model_folds = model.get("folds")
+                if isinstance(model_folds, list):
+                    for fold_record in model_folds:
+                        if not isinstance(fold_record, dict):
+                            continue
+                        # The owning model's identity lives on the parent
+                        # record in this shape; carry it down so the record
+                        # still names exactly one registered model.
+                        record = dict(fold_record)
+                        for key in ("name", "model", "model_name", "tier"):
+                            if key not in record and key in model:
+                                record[key] = model[key]
+                        records.append(record)
+    elif isinstance(block, list):
+        records.extend(f for f in block if isinstance(f, dict))
+    return records
+
+
+def _drop_last_freeze_model(payload: dict[str, Any]) -> Any:
+    """Drop the last freeze-phase model record, in either container shape."""
+    block = payload.get("freeze_phase")
+    if isinstance(block, dict) and isinstance(block.get("models"), list):
+        models = list(block["models"])
+        if models:
+            models = models[:-1]
+        return {**block, "models": models}
+    if isinstance(block, list) and block:
+        return block[:-1]
+    return block
+
+
+def _phase_records(block: Any) -> list[dict[str, Any]]:
+    """The per-model records of a phase block, whichever container holds them.
+
+    The freeze body writes freeze_phase as an object carrying window_start,
+    window_end, n_rows and models; a bare list of model records is the other
+    shape the sheets allow. Both are read here, so the checker asserts on the
+    records rather than on the container.
+    """
+    if isinstance(block, dict):
+        models = block.get("models")
+        if isinstance(models, list):
+            return [model for model in models if isinstance(model, dict)]
+    if isinstance(block, list):
+        return [model for model in block if isinstance(model, dict)]
+    return []
+
+
+def _slice_blocks(
+    record: Any, kinds: tuple[str, ...], label: str
+) -> dict[str, dict[str, Any]]:
+    """Exactly one SCORE_KEYS block per slice kind inside record."""
+    found: dict[str, list[tuple[str, dict[str, Any]]]] = {kind: [] for kind in kinds}
+    for path, node in _walk_nodes(record, label):
+        if not isinstance(node, dict):
+            continue
+        if set(node) != set(SCORE_KEYS):
+            continue
+        kind = _classify_slice(path)
+        if kind in found:
+            found[kind].append((path, node))
+    blocks: dict[str, dict[str, Any]] = {}
+    for kind, entries in found.items():
+        if len(entries) != 1:
+            raise ContractError(
+                f"{label}: expected exactly one {kind} block with the pinned "
+                f"score schema keys, found {len(entries)}"
+            )
+        path, block = entries[0]
+        blocks[kind] = _assert_score_block_shape(path, block)
+    return blocks
+
+
+def _record_model(record: Any, model_names: set[str], label: str) -> str:
+    """The single registered model named inside a freeze record."""
+    if isinstance(record, dict):
+        for key in ("model", "model_name", "name", "tier"):
+            value = record.get(key)
+            if isinstance(value, str) and value in model_names:
+                return value
+    hits = {
+        node
+        for _path, node in _walk_nodes(record)
+        if isinstance(node, str) and node in model_names
+    }
+    if len(hits) != 1:
+        raise ContractError(
+            f"{label}: expected the record to name exactly one registered "
+            f"model, found {sorted(hits)}"
+        )
+    return hits.pop()
+
+
+def _synthetic_split_frame(
+    dates: pd.DatetimeIndex,
+    drop_on_christmas: tuple[int, str] | None = None,
+) -> pd.DataFrame:
+    """Synthetic split frame: 54 stores x 33 families per date.
+
+    Christmas-2016 rows carry id = <NA> (the closure-fill pattern). When
+    drop_on_christmas is set, that (store, family) pair is removed on
+    2016-12-25 only, leaving 1,781 Christmas rows for the refusal test.
+    """
+    per_day = 54 * 33
+    n = len(dates) * per_day
+    stores = np.tile(np.repeat(np.arange(1, 55, dtype=np.int8), 33), len(dates))
+    families = [f"family_{i:02d}" for i in range(33)]
+    family = np.tile(families * 54, len(dates))
+    date = np.repeat(dates.to_numpy().astype("datetime64[us]"), per_day)
+    idx = np.arange(n, dtype=np.int64)
+    sales = np.where(idx % 7 == 0, 0.0, (idx % 7) + 0.5).astype("float32")
+    is_christmas = date == np.datetime64(_CHRISTMAS_2016)
+    id_values = pd.Series(idx + 1, dtype="UInt32")
+    id_values = id_values.mask(pd.Series(is_christmas))
+    frame = pd.DataFrame(
+        {
+            "date": pd.Series(date),
+            "store_nbr": pd.Series(stores),
+            "family": pd.Categorical(family),
+            "id": id_values,
+            "sales": pd.Series(sales),
+            "onpromotion": np.zeros(n, dtype="uint16"),
+            "city": pd.Categorical(np.repeat("city_a", n)),
+            "state": pd.Categorical(np.repeat("state_a", n)),
+            "store_type": pd.Categorical(np.repeat("type_a", n)),
+            "cluster": np.full(n, 5, dtype="int8"),
+        }
+    )
+    for col in PINNED_DTYPES:
+        if col.startswith("is_"):
+            frame[col] = np.zeros(n, dtype="int8")
+    frame["earthquake_decay"] = np.zeros(n, dtype="float32")
+    frame = frame[list(PINNED_DTYPES)]
+    if drop_on_christmas is not None:
+        drop_store, drop_family = drop_on_christmas
+        drop = (
+            (frame["store_nbr"] == drop_store)
+            & (frame["family"] == drop_family)
+            & (frame["date"] == _CHRISTMAS_2016)
+        )
+        frame = frame.loc[~drop].reset_index(drop=True)
+    return frame
+
+
+def _synthetic_splits(*, christmas_intact: bool = True) -> dict[str, pd.DataFrame]:
+    """Synthetic train/valid/local_test; the real parquets never load."""
+    valid_dates = pd.date_range("2016-07-14", "2016-09-11", freq="D")
+    train_dates = pd.date_range("2016-03-26", "2016-03-27", freq="D")
+    local_test_dates = pd.date_range(
+        SPLIT_FRAME_STARTS["local_test"], SPLIT_FRAME_ENDS["local_test"], freq="D"
+    )
+    local_test = _synthetic_split_frame(
+        local_test_dates, None if christmas_intact else (1, "family_00")
+    )
+    return {
+        "train": _synthetic_split_frame(train_dates),
+        "valid": _synthetic_split_frame(valid_dates),
+        "local_test": local_test,
+    }
+
+
+def _stub_module(kind: str, convention: str, model_names: Sequence[str]) -> Any:
+    """Module stub exposing fit_predict_frozen for the freeze path.
+
+    convention "frame-order" returns predictions aligned to predict_frame
+    row order (S3's wording); "local-test-only" returns the local_test
+    suffix only (S4's wording). Metrics are identical either way.
+    """
+    import types
+
+    module = types.ModuleType(kind)
+    local_test_start = pd.Timestamp(SPLIT_FRAME_STARTS["local_test"])
+
+    def fit_predict_frozen(
+        model: str,
+        fit_frame: pd.DataFrame,
+        predict_frame: pd.DataFrame,
+        config: dict[str, Any],
+    ) -> np.ndarray:
+        if model not in model_names:
+            raise ContractError(f"synthetic stub refused unknown model {model!r}")
+        sales = predict_frame["sales"].to_numpy(dtype="float64")
+        is_local_test = (predict_frame["date"] >= local_test_start).to_numpy()
+        multiplier = 1.0 + (model_names.index(model) + 1) * 1e-3
+        pred = sales * multiplier
+        if convention == "frame-order":
+            return pred
+        if convention == "local-test-only":
+            return pred[is_local_test]
+        raise ContractError(f"synthetic stub: unknown convention {convention!r}")
+
+    module.fit_predict_frozen = fit_predict_frozen  # type: ignore[attr-defined]
+    return module
+
+
+def _registry_fixture_fold_metric(fold: int) -> dict[str, Any]:
+    return {
+        "fold": fold,
+        "rmsle": 0.1 * fold,
+        "mae": 0.1 * fold,
+        "rmse": 0.1 * fold,
+        "rmsle_active": 0.2 * fold,
+        "mae_active": 0.2 * fold,
+        "rmse_active": 0.2 * fold,
+        "n_rows": FOLD_ROWS,
+        "n_rows_active": 20000,
+    }
+
+
+def _registry_fixture_classical() -> dict[str, Any]:
+    fold_m = _registry_fixture_fold_metric(1)
+    fold_m2 = _registry_fixture_fold_metric(2)
+    fold_m3 = _registry_fixture_fold_metric(3)
+    pooled_m = {
+        "rmsle": 0.15,
+        "mae": 0.15,
+        "rmse": 0.15,
+        "rmsle_active": 0.25,
+        "mae_active": 0.25,
+        "rmse_active": 0.25,
+        "n_rows": POOLED_FOLD_ROWS,
+        "n_rows_active": 60000,
+    }
+
+    def cmod(name: str, kind: str) -> dict[str, Any]:
+        return {
+            "name": name,
+            "kind": kind,
+            "target": "sales",
+            "hyperparameters": {},
+            "fold_metrics": [fold_m, fold_m2, fold_m3],
+            "pooled": pooled_m,
+            "seeds": {},
+            "tuning": "none",
+            "christmas_2016": {"status": "freeze-time"},
+        }
+
+    return {
+        "schema_version": 1,
+        "git_sha": "a" * 40,
+        "python_version": "3.13.0",
+        "sklearn_version": "1.5.1",
+        "split_bounds": {
+            "train": "2013-01-01..2016-03-27",
+            "valid": "2016-03-28..2016-09-11",
+        },
+        "training_mask": "fit_rows",
+        "target": "sales",
+        "prediction_clip": "0",
+        "feature_columns": [f"f{i:02d}" for i in range(1, 24)],
+        "folds": [
+            {
+                "fold": fold,
+                "origin": origin,
+                "window_start": start,
+                "window_end": end,
+                "n_rows": FOLD_ROWS,
+            }
+            for fold, origin, start, end in FOLD_TABLE_PINS
+        ],
+        "models": [
+            cmod("naive", "baseline"),
+            cmod("seasonal_naive", "baseline"),
+            cmod("moving_average", "baseline"),
+            cmod("ridge", "classical_ml"),
+            cmod("hgb", "classical_ml"),
+        ],
+        "notes": [],
+    }
+
+
+def _registry_fixture_deep() -> dict[str, Any]:
+    dfold = {
+        "rmsle": 0.3,
+        "mae": 0.3,
+        "rmse": 0.3,
+        "rmsle_active": 0.4,
+        "mae_active": 0.4,
+        "rmse_active": 0.4,
+        "n_rows": FOLD_ROWS,
+        "n_rows_active": 20000,
+    }
+    dgrid = {
+        "rmsle": 0.5,
+        "mae": 0.4,
+        "rmse": 0.6,
+    }
+    dvalid = {
+        "n_rows": 299376,
+        "per_horizon_rmsle": [0.5] * 16,
+        "full_grid": dgrid,
+        "active_slice": dgrid,
+        "n_active": 123456,
+        "inference_seconds": 1.5,
+    }
+
+    def dtier(tier: str, arch: str) -> dict[str, Any]:
+        return {
+            "tier": tier,
+            "architecture": arch,
+            "checkpoint": "",
+            "checkpoint_bytes": 1024,
+            "checkpoint_sha256": "e" * 64,
+            "params": 1000,
+            "status": "ready",
+            "train": {},
+            "valid": dvalid,
+            "fold_metrics": [dfold, dfold, dfold],
+        }
+
+    return {
+        "schema_version": "1.0",
+        "status": "complete",
+        "track": "S4",
+        "generated_at": "2026-11-10T00:00:00Z",
+        "git_sha": "c" * 40,
+        "data_fingerprint": {},
+        "shared_config": {},
+        "config_sha256": "d" * 64,
+        "tiers": [
+            dtier("deep-rnn", "rnn"),
+            dtier("deep-lstm", "lstm"),
+            dtier("deep-gru", "gru"),
+        ],
+        "ablation_2015plus": {},
+        "comparison": {"status": "ok"},
+        "runtime_tradeoff": {},
+        "notes": [],
+    }
+
+
+def _write_registry_fixture(directory: Path) -> None:
+    """Seed a temp dir with schema-clean registry artifacts."""
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "classical_results.json").write_text(
+        json.dumps(_registry_fixture_classical()), encoding="utf-8"
+    )
+    (directory / "deep_results.json").write_text(
+        json.dumps(_registry_fixture_deep()), encoding="utf-8"
+    )
+
+
+def _freeze_body_ready() -> bool:
+    """True once the Day-5 body replaces the canonical-sequence placeholder."""
+    import inspect
+
+    try:
+        source = inspect.getsource(freeze)
+    except (OSError, TypeError):
+        return False
+    return "the Day-5 execution body lands" not in source
+
+
+def _synthetic_freeze_run(
+    tmp_dir: Path,
+    *,
+    convention: str,
+    christmas_intact: bool = True,
+) -> tuple[int, str, dict[str, Any] | None, dict[str, int]]:
+    """Drive freeze() end to end on synthetic fixtures; return diagnostics.
+
+    Patches the split loaders and stubs the sanctioned per-track modules,
+    so nothing real is read or written; artifacts land in tmp_dir. Returns
+    (rc, stdout, payload-or-None, fixture stats).
+    """
+    import contextlib
+    import io
+    from unittest import mock
+
+    splits = _synthetic_splits(christmas_intact=christmas_intact)
+    _write_registry_fixture(tmp_dir)
+
+    def fake_load_split(split: str) -> pd.DataFrame:
+        if split not in splits:
+            raise ContractError(f"synthetic stub refused split {split!r}")
+        return splits[split]
+
+    def fake_load_frame(
+        train: pd.DataFrame | None = None,
+        valid: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
+        if train is None:
+            train = splits["train"]
+        if valid is None:
+            valid = splits["valid"]
+        frame = pd.concat([train, valid], ignore_index=True)
+        return frame.sort_values("date", kind="mergesort").reset_index(drop=True)
+
+    modules = {
+        "classical": _stub_module("classical", convention, CLASSICAL_MODEL_NAMES),
+        "deep": _stub_module("deep", convention, DEEP_TIER_NAMES),
+    }
+
+    def fake_contract_counts(*args, **kwargs):
+        """The count pins describe the real 3M-row universe, not a
+        synthetic fixture; the production derivation stays untouched and is
+        exercised against the real frames by the freeze body itself."""
+        return _synthetic_contract_counts()
+
+    saved_flag = os.environ.get("FREEZE_RUN")
+    os.environ["FREEZE_RUN"] = "1"
+    buffer = io.StringIO()
+    try:
+        with (
+            mock.patch.object(sys.modules[__name__], "load_split", fake_load_split),
+            mock.patch.object(sys.modules[__name__], "load_frame", fake_load_frame),
+            mock.patch.object(
+                sys.modules[__name__], "_contract_counts", fake_contract_counts
+            ),
+            mock.patch.dict(sys.modules, modules),
+            contextlib.redirect_stdout(buffer),
+        ):
+            rc = freeze(artifacts_dir=tmp_dir)
+    finally:
+        if saved_flag is None:
+            os.environ.pop("FREEZE_RUN", None)
+        else:
+            os.environ["FREEZE_RUN"] = saved_flag
+    stdout = buffer.getvalue()
+    local_test = splits["local_test"]
+    stats = {
+        "local_test_rows": len(local_test),
+        "local_test_active": int((local_test["sales"] > 0).sum()),
+        "christmas_rows": int((local_test["date"] == _CHRISTMAS_2016).sum()),
+    }
+    results_path = tmp_dir / "freeze_results.json"
+    payload: dict[str, Any] | None = None
+    if results_path.exists():
+        try:
+            payload = json.loads(results_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            payload = None
+    return rc, stdout, payload, stats
+
+
+def _has_bound_date(strings: set[str], bound: str, start: str, end: str) -> bool:
+    """The bound appears bare, or inside a combined frame-range string."""
+    if any(s == bound for s in strings):
+        return True
+    combined = f"{start}..{end}"
+    return any(combined in s for s in strings)
+
+
+def _check_freeze_results_payload(
+    payload: Any,
+    *,
+    model_names: list[str],
+    local_test_rows: int,
+    local_test_active: int,
+    christmas_rows: int,
+) -> dict[str, dict[str, Any]]:
+    """Shared payload battery: sheet Section-10 field set and the slices."""
+    if not isinstance(payload, dict):
+        raise ContractError("freeze_results.json is not a JSON object")
+    if set(payload) != set(_FREEZE_RESULTS_TOP_LEVEL):
+        measured = sorted(str(key) for key in payload)
+        raise ContractError(
+            f"freeze_results.json top-level fields {measured} != the pinned "
+            f"set {sorted(_FREEZE_RESULTS_TOP_LEVEL)}"
+        )
+    frozen_at = payload["frozen_at"]
+    if not isinstance(frozen_at, str):
+        raise ContractError("frozen_at must be an ISO 8601 string")
+    try:
+        parsed_frozen = datetime.fromisoformat(frozen_at.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ContractError(
+            f"frozen_at {frozen_at!r} does not parse: {error}"
+        ) from error
+    if parsed_frozen.tzinfo is None:
+        raise ContractError("frozen_at must carry a timezone (ISO 8601 Z or offset)")
+    sha = payload["git_sha"]
+    if not isinstance(sha, str):
+        raise ContractError("git_sha must be a 40-hex sha (or empty)")
+    if sha != "" and (len(sha) != 40 or set(sha.lower()) - set("0123456789abcdef")):
+        raise ContractError("git_sha must be a 40-hex sha (or empty)")
+    headline = payload["headline_model"]
+    if not isinstance(headline, str) or headline not in set(model_names):
+        raise ContractError(
+            f"headline_model must be one of the registered models, got {headline!r}"
+        )
+    notes = payload["notes"]
+    if not isinstance(notes, list) or not all(isinstance(n, str) for n in notes):
+        raise ContractError("notes must be a list of strings")
+    ds = payload["data_snapshot"]
+    if not isinstance(ds, dict):
+        raise ContractError("data_snapshot must be an object")
+    for split, pinned_start, pinned_end in (
+        ("train", SPLIT_FRAME_STARTS["train"], SPLIT_FRAME_ENDS["train"]),
+        ("valid", SPLIT_FRAME_STARTS["valid"], SPLIT_FRAME_ENDS["valid"]),
+        (
+            "local_test",
+            SPLIT_FRAME_STARTS["local_test"],
+            SPLIT_FRAME_ENDS["local_test"],
+        ),
+    ):
+        blocks = [
+            node
+            for path, node in _walk_nodes(ds)
+            if isinstance(node, dict)
+            and (path.split(".")[-1] == split or node.get("split") == split)
+        ]
+        pinned_rows = {"train": 2106324, "valid": 299376, "local_test": 602316}[split]
+        found_rows = False
+        found_bounds: set[str] = set()
+        for block in blocks:
+            ints = [
+                node
+                for _path, node in _walk_nodes(block)
+                if isinstance(node, int) and not isinstance(node, bool)
+            ]
+            if pinned_rows in ints:
+                found_rows = True
+            strings = {
+                node for _path, node in _walk_nodes(block) if isinstance(node, str)
+            }
+            found_bounds |= strings
+        if not found_rows:
+            raise ContractError(
+                f"data_snapshot has no {split!r} block with the pinned row "
+                f"count {pinned_rows:,}"
+            )
+        for bound in (pinned_start, pinned_end):
+            if not _has_bound_date(found_bounds, bound, pinned_start, pinned_end):
+                raise ContractError(
+                    f"data_snapshot {split!r} block is missing the bound date {bound}"
+                )
+    counts = payload["contract_counts"]
+    if not isinstance(counts, dict):
+        raise ContractError("contract_counts must be an object")
+    count_ints = [
+        node
+        for _path, node in _walk_nodes(counts)
+        if isinstance(node, int) and not isinstance(node, bool)
+    ]
+    for required in (5346, 7128, 5544, 7260, 12804, 213345, 207801, _CHRISTMAS_ROWS):
+        if required not in count_ints:
+            raise ContractError(
+                f"contract_counts is missing the pinned count {required:,}"
+            )
+    freeze_phase = _phase_records(payload["freeze_phase"])
+    fold_phase = payload["fold_phase"]
+    if not freeze_phase:
+        raise ContractError("freeze_phase must carry model records")
+    if not _fold_records(fold_phase):
+        raise ContractError("fold_phase must carry fold records")
+    name_set = set(model_names)
+    names: list[str] = []
+    slices_by_model: dict[str, dict[str, dict[str, Any]]] = {}
+    for index, record in enumerate(freeze_phase):
+        label = f"freeze_phase[{index}]"
+        if not isinstance(record, dict):
+            raise ContractError(f"{label} is not a JSON object")
+        name = _record_model(record, name_set, label)
+        names.append(name)
+        slices = _slice_blocks(
+            record, ("full_grid", "active_slice", "christmas"), label
+        )
+        if slices["full_grid"]["n_rows"] != local_test_rows:
+            raise ContractError(
+                f"{label}: full-grid n_rows {slices['full_grid']['n_rows']} != "
+                f"the predict_frame local_test row count {local_test_rows}"
+            )
+        if slices["full_grid"]["n_rows_active"] != local_test_active:
+            raise ContractError(
+                f"{label}: full-grid n_rows_active "
+                f"{slices['full_grid']['n_rows_active']} != {local_test_active}"
+            )
+        if slices["christmas"]["n_rows"] != christmas_rows:
+            raise ContractError(
+                f"{label}: christmas-2016 n_rows {slices['christmas']['n_rows']} "
+                f"!= {christmas_rows}"
+            )
+        slices_by_model[name] = slices
+    if len(set(names)) != len(names):
+        raise ContractError(f"freeze_phase repeats a model: {names}")
+    if sorted(names) != sorted(model_names):
+        raise ContractError(
+            f"freeze_phase models {sorted(names)} != the registered count "
+            f"{len(model_names)} models {sorted(model_names)}"
+        )
+    expected_fold_records = len(model_names) * len(FOLD_TABLE_PINS)
+    fold_records = _fold_records(fold_phase)
+    if len(fold_records) != expected_fold_records:
+        raise ContractError(
+            f"fold_phase holds {len(fold_records)} records, expected "
+            f"{expected_fold_records} (model x fold)"
+        )
+    for index, record in enumerate(fold_records):
+        label = f"fold_phase[{index}]"
+        if not isinstance(record, dict):
+            raise ContractError(f"{label} is not a JSON object")
+        _record_model(record, name_set, label)
+        fold = record.get("fold", record.get("fold_ordinal"))
+        if isinstance(fold, bool) or not isinstance(fold, int) or fold not in (1, 2, 3):
+            raise ContractError(
+                f"{label}: fold must be the int 1, 2 or 3 (key 'fold' or "
+                "'fold_ordinal')"
+            )
+        pinned = FOLD_TABLE_PINS[fold - 1]
+        for key, want in (
+            ("origin", pinned[1]),
+            ("window_start", pinned[2]),
+            ("window_end", pinned[3]),
+        ):
+            if record.get(key) != want:
+                raise ContractError(
+                    f"{label}: {key} {record.get(key)!r} != the pinned {want!r}"
+                )
+        n_rows = record.get("n_rows")
+        if isinstance(n_rows, bool) or not isinstance(n_rows, int):
+            raise ContractError(f"{label}: n_rows must be an int")
+        if n_rows != FOLD_ROWS:
+            raise ContractError(f"{label}: n_rows {n_rows} != the pinned {FOLD_ROWS}")
+        slices = _slice_blocks(record, ("full_grid", "active_slice"), label)
+        # The full-grid slice covers the whole fold window; the active
+        # slice covers only the active-demand rows inside it, so its
+        # n_rows is the active count, not the window size.
+        if slices["full_grid"]["n_rows"] != FOLD_ROWS:
+            raise ContractError(
+                f"{label}: full_grid n_rows {slices['full_grid']['n_rows']} "
+                f"!= {FOLD_ROWS}"
+            )
+        active_rows = slices["active_slice"]["n_rows"]
+        if (
+            active_rows > FOLD_ROWS
+            or active_rows != slices["active_slice"]["n_rows_active"]
+        ):
+            raise ContractError(
+                f"{label}: active_slice n_rows {active_rows} is not the "
+                "active-demand count inside the fold window"
+            )
+    best_name = min(
+        slices_by_model, key=lambda name: slices_by_model[name]["full_grid"]["rmsle"]
+    )
+    if payload["headline_model"] != best_name:
+        raise ContractError(
+            f"headline_model {payload['headline_model']!r} != the lowest-RMSLE "
+            f"freeze_phase model {best_name!r}"
+        )
+    return slices_by_model
+
+
+def _check_freeze_run_invariants() -> None:
+    """Exactly one freeze_run=true record ever; refusals stay friendly."""
+    import contextlib
+    import io
+
+    with tempfile.TemporaryDirectory() as tmp_name:
+        tmp_dir = Path(tmp_name)
+        write_run_manifest(
+            "contract.py --freeze",
+            freeze_run=True,
+            elapsed_seconds=0.0,
+            arguments={"freeze": "1"},
+            notes=["fixture: the one testified freeze"],
+            artifacts_dir=tmp_dir,
+        )
+        try:
+            write_run_manifest(
+                "contract.py --freeze",
+                freeze_run=True,
+                elapsed_seconds=0.0,
+                artifacts_dir=tmp_dir,
+            )
+        except ContractError as error:
+            if "already carries" not in str(error):
+                raise ContractError(
+                    f"the second freeze stamp refused with the wrong lead: {error}"
+                ) from error
+        else:
+            raise ContractError("a second freeze_run=true stamp was accepted")
+        saved_flag = os.environ.get("FREEZE_RUN")
+        os.environ["FREEZE_RUN"] = "1"
+        buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buffer):
+                refused_rc = freeze(artifacts_dir=tmp_dir)
+        finally:
+            if saved_flag is None:
+                os.environ.pop("FREEZE_RUN", None)
+            else:
+                os.environ["FREEZE_RUN"] = saved_flag
+        out = buffer.getvalue()
+        if refused_rc != 1:
+            raise ContractError(
+                f"freeze after a stamped run returned {refused_rc}, not 1"
+            )
+        if "already carries" not in out:
+            raise ContractError(
+                f"freeze after a stamped run printed the wrong lead: {out!r}"
+            )
+        if "Traceback" in out:
+            raise ContractError("freeze after a stamped run leaked a traceback")
+        records = list(read_run_manifest(tmp_dir / "run_manifest.json"))
+        stamped = [record for record in records if record["freeze_run"] is True]
+        if len(stamped) != 1:
+            raise ContractError(
+                f"the temp manifest holds {len(stamped)} freeze_run=true records, "
+                "exactly one is allowed"
+            )
+        last = records[-1]
+        if last["freeze_run"] is not False or last["exit"] != 1:
+            raise ContractError(
+                f"the refused freeze attempt was recorded as {last!r}, "
+                "expected freeze_run=false exit=1"
+            )
+        if last["status"] != "FAIL" or not last["notes"]:
+            raise ContractError(
+                "the refused freeze attempt left no FAIL record with notes"
+            )
+        if not any("failed phase" in note for note in last["notes"]):
+            raise ContractError(
+                "the refused freeze attempt did not record its failed phase"
+            )
+    with tempfile.TemporaryDirectory() as tmp_name:
+        tmp_dir = Path(tmp_name)
+        saved_flag = os.environ.get("FREEZE_RUN")
+        os.environ["FREEZE_RUN"] = "1"
+        buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buffer):
+                failed_rc = freeze(artifacts_dir=tmp_dir)
+        finally:
+            if saved_flag is None:
+                os.environ.pop("FREEZE_RUN", None)
+            else:
+                os.environ["FREEZE_RUN"] = saved_flag
+        out = buffer.getvalue()
+        if failed_rc != 1:
+            raise ContractError(f"freeze on an empty registry returned {failed_rc}")
+        if "Traceback" in out:
+            raise ContractError("a failed freeze attempt leaked a traceback")
+        records = list(read_run_manifest(tmp_dir / "run_manifest.json"))
+        last = records[-1]
+        if last["freeze_run"] is not False or last["status"] != "FAIL":
+            raise ContractError("the failed freeze attempt must stay freeze_run=false")
+        if last["exit"] != 1 or not any(
+            "failed phase" in note for note in last["notes"]
+        ):
+            raise ContractError(
+                "the failed freeze attempt was not recorded with exit=1 "
+                "and its failed phase named"
+            )
+        write_run_manifest(
+            "contract.py --freeze",
+            freeze_run=True,
+            elapsed_seconds=0.0,
+            artifacts_dir=tmp_dir,
+        )
+        records = list(read_run_manifest(tmp_dir / "run_manifest.json"))
+        stamped = [record for record in records if record["freeze_run"] is True]
+        if len(stamped) != 1:
+            raise ContractError(
+                "a failed attempt consumed the freeze gate; the re-run could "
+                "not stamp freeze_run=true"
+            )
+        forged = [dict(record) for record in records]
+        for record in forged:
+            record["freeze_run"] = True
+        forged_path = tmp_dir / "forged.json"
+        forged_path.write_text(json.dumps(forged, indent=2) + "\n", encoding="utf-8")
+        try:
+            read_run_manifest(forged_path)
+        except ContractError as error:
+            if "exactly one freeze run" not in str(error):
+                raise ContractError(
+                    f"a two-freeze manifest refused with the wrong lead: {error}"
+                ) from error
+        else:
+            raise ContractError(
+                "read_run_manifest accepted two freeze_run=true records"
+            )
+    print(
+        "PASS freeze-invariants: one stamped freeze_run=true record ever; a "
+        "second attempt refuses; a failed attempt records freeze_run=false "
+        "and the re-run can still stamp"
+    )
+
+
+def _check_freeze_results_writer() -> None:
+    """Freeze-results writer: pinned field set, atomic write, headline."""
+    if not _freeze_body_ready():
+        print(
+            "INFO freeze-results: freeze body not landed in this tree; "
+            "synthetic-fixture battery pending the Day-5 body"
+        )
+        return
+    with tempfile.TemporaryDirectory() as tmp_name:
+        tmp_dir = Path(tmp_name)
+        rc, out, payload, stats = _synthetic_freeze_run(
+            tmp_dir, convention="frame-order"
+        )
+        if rc != 0:
+            tail = out.strip().splitlines()[-3:]
+            raise ContractError(
+                f"synthetic freeze exited {rc}; last lines: {' | '.join(tail)}"
+            )
+        if "Traceback" in out:
+            raise ContractError("synthetic freeze leaked a traceback")
+        results_path = tmp_dir / "freeze_results.json"
+        if not results_path.is_file():
+            raise ContractError("freeze did not write artifacts/freeze_results.json")
+        leftovers = list(tmp_dir.rglob("*.tmp"))
+        if leftovers:
+            raise ContractError(f"the atomic write left temp files behind: {leftovers}")
+        allowed = {
+            "freeze_results.json",
+            "classical_results.json",
+            "deep_results.json",
+            "run_manifest.json",
+            "run_manifest.json.lock",
+        }
+        residue = sorted(p.name for p in tmp_dir.iterdir() if p.name not in allowed)
+        if residue:
+            raise ContractError(
+                f"unexpected files next to freeze_results.json: {residue}"
+            )
+        try:
+            reread = json.loads(results_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise ContractError(
+                f"freeze_results.json does not re-parse after the write: {error}"
+            ) from error
+        if reread != payload:
+            raise ContractError("the written freeze_results.json drifted on re-parse")
+        size = results_path.stat().st_size
+        if size > 5 * 1024 * 1024:
+            raise ContractError(
+                f"freeze_results.json is {size / 1e6:.2f} MB, over the 5 MB pin"
+            )
+        model_names = _registered_model_names()
+        _check_freeze_results_payload(
+            reread,
+            model_names=model_names,
+            local_test_rows=stats["local_test_rows"],
+            local_test_active=stats["local_test_active"],
+            christmas_rows=stats["christmas_rows"],
+        )
+        record_count = len(_phase_records(reread["freeze_phase"]))
+        if record_count != len(model_names):
+            raise ContractError(
+                f"the freeze wrote {record_count} model records, expected "
+                f"the registered count {len(model_names)}"
+            )
+    print(
+        "PASS freeze-results: freeze_results.json written atomically (temp "
+        "file then rename; no *.tmp residue; re-parses); sheet Section-10 "
+        "field set with the pinned types; headline_model is the lowest-RMSLE "
+        "registered model; model count equals the registered count"
+    )
+
+
+def _check_freeze_results_validation() -> None:
+    """Field validation battery; refuses with friendly ContractErrors."""
+    if not _freeze_body_ready():
+        print(
+            "INFO freeze-results: freeze body not landed in this tree; "
+            "field-validation battery pending the Day-5 body"
+        )
+        return
+    validator = globals().get("_validate_freeze_results")
+    if not callable(validator):
+        print(
+            "INFO freeze-results: _validate_freeze_results seam not exposed "
+            "by the freeze body; field-validation battery skipped"
+        )
+        return
+    with tempfile.TemporaryDirectory() as tmp_name:
+        tmp_dir = Path(tmp_name)
+        rc, out, payload, _stats = _synthetic_freeze_run(
+            tmp_dir, convention="frame-order"
+        )
+        if rc != 0 or payload is None:
+            tail = out.strip().splitlines()[-3:]
+            raise ContractError(
+                f"synthetic freeze exited {rc}; payload not harvested: "
+                f"{' | '.join(tail)}"
+            )
+
+    def _lookup_block(bad: dict[str, Any], kind: str) -> dict[str, Any]:
+        for path, node in _walk_nodes(bad):
+            if (
+                isinstance(node, dict)
+                and set(node) == set(SCORE_KEYS)
+                and _classify_slice(path) == kind
+            ):
+                return node
+        raise ContractError(f"no {kind} score block in the payload")
+
+    refused = 0
+
+    def _expect_refusal(label: str, mutate: Callable[[dict[str, Any]], None]) -> None:
+        nonlocal refused
+        bad = copy.deepcopy(payload)
+        mutate(bad)
+        try:
+            validator(bad)
+        except ContractError as error:
+            if not str(error).strip():
+                raise ContractError(
+                    f"field validation {label}: empty refusal message"
+                ) from error
+            if "Traceback" in str(error):
+                raise ContractError(
+                    f"field validation {label}: refusal leaked a traceback"
+                ) from error
+            refused += 1
+            return
+        except Exception as error:
+            raise ContractError(
+                f"field validation {label}: {type(error).__name__} escaped "
+                f"instead of a friendly ContractError: {error!r}"
+            ) from error
+        raise ContractError(f"field validation {label}: accepted a broken payload")
+
+    for key in _FREEZE_RESULTS_TOP_LEVEL:
+        _expect_refusal(f"missing top-level key {key!r}", lambda bad, k=key: bad.pop(k))
+    try:
+        _lookup_block(payload, "full_grid")
+        _lookup_block(payload, "active_slice")
+    except ContractError as error:
+        raise ContractError(
+            "the synthetic freeze payload carries no full-grid / active-slice "
+            f"score block to mutate; the field-validation battery cannot run: {error}"
+        ) from error
+
+    def _set_full(key: str, value: Any) -> Callable[[dict[str, Any]], None]:
+        def mutate(bad: dict[str, Any]) -> None:
+            target = _lookup_block(bad, "full_grid")
+            target[key] = value
+
+        return mutate
+
+    def _set_active(key: str, value: Any) -> Callable[[dict[str, Any]], None]:
+        def mutate(bad: dict[str, Any]) -> None:
+            target = _lookup_block(bad, "active_slice")
+            target[key] = value
+
+        return mutate
+
+    def _drop_full_key(bad: dict[str, Any]) -> None:
+        _lookup_block(bad, "full_grid").pop("mae")
+
+    _expect_refusal("frozen_at wrong type", lambda bad: bad.update(frozen_at=123))
+    _expect_refusal(
+        "frozen_at unparsable", lambda bad: bad.update(frozen_at="not-a-timestamp")
+    )
+    _expect_refusal("git_sha wrong type", lambda bad: bad.update(git_sha=123))
+    _expect_refusal("git_sha not 40-hex", lambda bad: bad.update(git_sha="z" * 40))
+    _expect_refusal(
+        "headline_model not a string", lambda bad: bad.update(headline_model=None)
+    )
+    _expect_refusal("notes not a list", lambda bad: bad.update(notes="not-a-list"))
+    _expect_refusal("notes with non-string entries", lambda bad: bad.update(notes=[1]))
+    _expect_refusal("fold_phase not a list", lambda bad: bad.update(fold_phase={}))
+    _expect_refusal("freeze_phase not a list", lambda bad: bad.update(freeze_phase={}))
+    _expect_refusal("non-finite rmsle", lambda bad: _set_full("rmsle", math.inf)(bad))
+    _expect_refusal("nan rmsle", lambda bad: _set_full("rmsle", math.nan)(bad))
+    _expect_refusal("negative mae", lambda bad: _set_full("mae", -0.5)(bad))
+    _expect_refusal("negative rmse", lambda bad: _set_full("rmse", -0.5)(bad))
+    _expect_refusal(
+        "non-finite active-slice mae",
+        lambda bad: _set_active("mae", math.inf)(bad),
+    )
+    _expect_refusal("negative n_rows", lambda bad: _set_full("n_rows", -1)(bad))
+    _expect_refusal(
+        "negative n_rows_active", lambda bad: _set_full("n_rows_active", -1)(bad)
+    )
+    _expect_refusal("missing score key in a slice", _drop_full_key)
+    _expect_refusal("empty model list", lambda bad: bad.update(freeze_phase=[]))
+    _expect_refusal(
+        "model count below the registry",
+        lambda bad: bad.update(freeze_phase=_drop_last_freeze_model(bad)),
+    )
+    _expect_refusal(
+        "headline_model naming an unregistered model",
+        lambda bad: bad.update(headline_model="not_a_registered_model"),
+    )
+    print(
+        f"PASS freeze-results: field validation refused {refused} broken "
+        "payloads with friendly ContractErrors (missing field / wrong type / "
+        "non-finite / negative metric / empty model list / registry count "
+        "mismatch / unregistered headline)"
+    )
+
+
+def _check_christmas_slice_selection() -> None:
+    """Christmas-2016 slice: selected by date; 1,782 rows pinned."""
+    if not _freeze_body_ready():
+        print(
+            "INFO christmas-slice: freeze body not landed in this tree; "
+            "slice-selection battery pending the Day-5 body"
+        )
+        return
+    with tempfile.TemporaryDirectory() as tmp_name:
+        tmp_dir = Path(tmp_name)
+        rc, out, payload, stats = _synthetic_freeze_run(
+            tmp_dir, convention="frame-order", christmas_intact=True
+        )
+        if rc != 0:
+            tail = out.strip().splitlines()[-3:]
+            raise ContractError(
+                f"synthetic freeze exited {rc}; last lines: {' | '.join(tail)}"
+            )
+        if "Traceback" in out:
+            raise ContractError("synthetic freeze leaked a traceback")
+        if stats["christmas_rows"] != _CHRISTMAS_ROWS:
+            raise ContractError(
+                f"fixture sanity: the synthetic local_test carries "
+                f"{stats['christmas_rows']} Christmas rows, expected {_CHRISTMAS_ROWS}"
+            )
+        if payload is None:
+            raise ContractError("the synthetic freeze wrote no freeze_results.json")
+        for index, record in enumerate(_phase_records(payload["freeze_phase"])):
+            slices = _slice_blocks(record, ("christmas",), f"freeze_phase[{index}]")
+            if slices["christmas"]["n_rows"] != _CHRISTMAS_ROWS:
+                raise ContractError(
+                    f"freeze_phase[{index}]: the christmas-2016 slice scored "
+                    f"{slices['christmas']['n_rows']} rows, expected "
+                    f"{_CHRISTMAS_ROWS}"
+                )
+    with tempfile.TemporaryDirectory() as tmp_name:
+        broken_dir = Path(tmp_name)
+        rc, out, payload, stats = _synthetic_freeze_run(
+            broken_dir, convention="frame-order", christmas_intact=False
+        )
+        if stats["christmas_rows"] != _CHRISTMAS_ROWS - 1:
+            raise ContractError(
+                f"fixture sanity: the broken fixture carries "
+                f"{stats['christmas_rows']} Christmas rows, expected "
+                f"{_CHRISTMAS_ROWS - 1}"
+            )
+        if rc != 1:
+            raise ContractError(
+                f"a one-row-short Christmas slice exited {rc}, not 1; the "
+                "selection must refuse exactly that slice"
+            )
+        if "Traceback" in out:
+            raise ContractError("the Christmas refusal leaked a traceback")
+        records = list(read_run_manifest(broken_dir / "run_manifest.json"))
+        last = records[-1]
+        if last["freeze_run"] is not False or last["status"] != "FAIL":
+            raise ContractError(
+                "the refused Christmas attempt must record freeze_run=false "
+                "with status FAIL"
+            )
+    print(
+        "PASS christmas-slice: the 1,782 rows of 2016-12-25 (54 stores x 33 "
+        "families) are selected by date; a one-row-short slice refuses with "
+        "freeze_run=false"
+    )
+
+
+def _check_prediction_alignment() -> None:
+    """Both alignment conventions yield the same local_test-aligned result."""
+    if not _freeze_body_ready():
+        print(
+            "INFO prediction-alignment: freeze body not landed in this tree; "
+            "alignment battery pending the Day-5 body"
+        )
+        return
+    payloads: dict[str, dict[str, Any]] = {}
+    for convention in ("frame-order", "local-test-only"):
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp_dir = Path(tmp_name)
+            rc, out, payload, _stats = _synthetic_freeze_run(
+                tmp_dir, convention=convention
+            )
+            if rc != 0:
+                tail = out.strip().splitlines()[-3:]
+                raise ContractError(
+                    f"synthetic freeze ({convention}) exited {rc}; last "
+                    f"lines: {' | '.join(tail)}"
+                )
+            if "Traceback" in out:
+                raise ContractError(
+                    f"synthetic freeze ({convention}) leaked a traceback"
+                )
+            if payload is None:
+                raise ContractError(
+                    f"synthetic freeze ({convention}) wrote no freeze_results.json"
+                )
+            payloads[convention] = payload
+    left = copy.deepcopy(payloads["frame-order"])
+    right = copy.deepcopy(payloads["local-test-only"])
+    left.pop("frozen_at", None)
+    right.pop("frozen_at", None)
+    if left != right:
+        differences = list(_payload_differences(left, right))[:5]
+        raise ContractError(
+            "the two alignment conventions produced different freeze "
+            f"payloads; first divergences: {differences}"
+        )
+    print(
+        "PASS prediction-alignment: predict_frame-order and local_test-rows-only "
+        "predictions produce the identical local_test-aligned freeze payload "
+        "(modulo frozen_at)"
+    )
+
+
+def _payload_differences(
+    left: Any, right: Any, path: str = "$"
+) -> Generator[str, None, None]:
+    """Dotted paths where two JSON trees disagree (diagnostics only)."""
+    if type(left) is not type(right):
+        yield f"{path}: {type(left).__name__} vs {type(right).__name__}"
+        return
+    if isinstance(left, dict):
+        for key in sorted(set(left) | set(right)):
+            if key not in left:
+                yield f"{path}.{key}: only in the local-test-only payload"
+            elif key not in right:
+                yield f"{path}.{key}: only in the frame-order payload"
+            else:
+                yield from _payload_differences(left[key], right[key], f"{path}.{key}")
+        return
+    if isinstance(left, list):
+        if len(left) != len(right):
+            yield f"{path}: length {len(left)} vs {len(right)}"
+            return
+        for index, (item_left, item_right) in enumerate(zip(left, right, strict=True)):
+            yield from _payload_differences(item_left, item_right, f"{path}[{index}]")
+        return
+    if left != right:
+        yield f"{path}: {left!r} vs {right!r}"
+
+
 def _check_registry() -> None:
     """Day-2 block: registered homes; strays fail loud, files validate."""
     directory = ARTIFACTS_DIR
@@ -3374,6 +6202,220 @@ def _check_registry() -> None:
     print("PASS registry: all registered artifacts validated")
 
 
+def _check_freeze_safety() -> None:
+    """Day-5 safety: the whitelist, the atomic write, no partial artifacts.
+
+    The freeze output must not be mistaken for a stray artifact by the
+    next run's scan, the write must publish atomically, and a failed
+    write must leave neither a temp file nor a half-written artifact.
+    """
+    if FREEZE_RESULTS_FILENAME not in CONTRACT_ARTIFACT_FILENAMES:
+        raise ContractError(
+            f"{FREEZE_RESULTS_FILENAME} must be in CONTRACT_ARTIFACT_FILENAMES "
+            "so the registry scan does not treat the freeze output as an "
+            "unregistered stray on later runs"
+        )
+    with tempfile.TemporaryDirectory() as tmp_name:
+        base = Path(tmp_name)
+        whitelist_dir = base / "whitelist"
+        whitelist_dir.mkdir()
+        (whitelist_dir / FREEZE_RESULTS_FILENAME).write_text("{}", encoding="utf-8")
+        try:
+            _scan_registered_artifacts(whitelist_dir)
+        except ContractError as error:
+            raise ContractError(
+                f"{FREEZE_RESULTS_FILENAME} is whitelisted but was refused "
+                f"as a stray: {error}"
+            ) from error
+    print(
+        f"PASS freeze safety: {FREEZE_RESULTS_FILENAME} is whitelisted as "
+        "contract furniture and the registry scan accepts it"
+    )
+
+    from unittest import mock
+
+    with tempfile.TemporaryDirectory() as tmp_name:
+        directory = Path(tmp_name)
+        target = directory / FREEZE_RESULTS_FILENAME
+        payload = {"headline_model": "naive", "ok": True}
+        _write_freeze_results(target, payload)
+        if not target.is_file():
+            raise ContractError(
+                f"the atomic writer did not create {FREEZE_RESULTS_FILENAME}"
+            )
+        if json.loads(target.read_text(encoding="utf-8")) != payload:
+            raise ContractError(
+                f"{FREEZE_RESULTS_FILENAME} drifted on re-read after the write"
+            )
+        leftovers = sorted(directory.glob(f"{FREEZE_RESULTS_FILENAME}.*.tmp"))
+        if leftovers:
+            raise ContractError(
+                f"the atomic write left temp file(s) behind: {leftovers}"
+            )
+
+        def _boom(src: Any, dst: Any, *args: Any, **kwargs: Any) -> None:
+            raise OSError("injected replace failure")
+
+        fresh_dir = directory / "fresh"
+        fresh_dir.mkdir()
+        with mock.patch.object(os, "replace", new=_boom):
+            try:
+                _write_freeze_results(fresh_dir / FREEZE_RESULTS_FILENAME, {"a": 1})
+            except ContractError as error:
+                if FREEZE_RESULTS_FILENAME not in str(error):
+                    raise ContractError(
+                        f"the atomic write failed with the wrong lead: {error}"
+                    ) from error
+            else:
+                raise ContractError(
+                    "the atomic write accepted an injected replace failure"
+                )
+        if (fresh_dir / FREEZE_RESULTS_FILENAME).exists():
+            raise ContractError(
+                f"the atomic write left a partial {FREEZE_RESULTS_FILENAME} "
+                "behind on failure"
+            )
+        if list(fresh_dir.glob(f"{FREEZE_RESULTS_FILENAME}.*.tmp")):
+            raise ContractError(
+                "the atomic write left a temp file behind after a failed replace"
+            )
+
+        keep_dir = directory / "keep"
+        keep_dir.mkdir()
+        original = {"ok": "original"}
+        kept = keep_dir / FREEZE_RESULTS_FILENAME
+        kept.write_text(json.dumps(original, indent=2) + "\n", encoding="utf-8")
+        with mock.patch.object(os, "replace", new=_boom):
+            try:
+                _write_freeze_results(kept, {"ok": "new"})
+            except ContractError:
+                pass
+            else:
+                raise ContractError(
+                    "the atomic write accepted a failure over an existing file"
+                )
+        if json.loads(kept.read_text(encoding="utf-8")) != original:
+            raise ContractError(
+                f"the atomic write did not preserve an existing "
+                f"{FREEZE_RESULTS_FILENAME} on failure"
+            )
+    print(
+        "PASS freeze safety: the freeze output is written through a same-dir "
+        "temp and a rename, re-reads to the same payload, leaves no temp "
+        "file, and leaves no partial or touched artifact on failure"
+    )
+
+
+def _check_fold_phase() -> None:
+    """The fold phase agrees with the shared fold table, fold for fold.
+
+    The fold phase is derived from the validated artifacts and the one
+    shared fold table, never re-derived per track: the three pinned
+    windows, 28,512 rows each, 85,536 pooled, every registered model
+    present in the registry's order, and every per-fold score block
+    carried straight from the artifact. A corrupted artifact must be
+    refused loudly rather than scored.
+    """
+    if not ARTIFACTS_DIR.exists():
+        print(
+            "INFO fold-phase: artifacts/ absent; the fold-phase checks are "
+            "pending the S3/S4 merges (expected before Day 4)"
+        )
+        return
+    try:
+        payloads = _registered_payloads(ARTIFACTS_DIR)
+    except ContractError as error:
+        print(
+            f"INFO fold-phase: the registered artifacts are not readable yet "
+            f"({error}); the fold-phase checks are pending the S3/S4 merges"
+        )
+        return
+    if not payloads:
+        print(
+            "INFO fold-phase: no registered artifacts present; the fold-phase "
+            "checks are pending the S3/S4 merges (expected before Day 4)"
+        )
+        return
+    derived = _fold_phase_from_artifacts(payloads)
+    table = folds_table().to_dict("records")
+    fold_records = _fold_records(derived)
+    expected_models = [
+        name for spec in ARTIFACT_REGISTRY.values() for name in spec["model_names"]
+    ]
+    derived_models = [str(model["name"]) for model in derived["models"]]
+    if derived_models != expected_models:
+        raise ContractError(
+            f"fold_phase: derived model order {derived_models} != the "
+            f"registered {expected_models}"
+        )
+    if len(fold_records) != len(expected_models) * len(FOLD_TABLE_PINS):
+        raise ContractError(
+            f"fold_phase holds {len(fold_records)} records, expected "
+            f"{len(expected_models) * len(FOLD_TABLE_PINS)} (model x fold)"
+        )
+    pooled_per_model: dict[str, int] = {}
+    for index, record in enumerate(fold_records):
+        label = f"fold_phase[{index}]"
+        fold = record.get("fold")
+        if isinstance(fold, bool) or not isinstance(fold, int):
+            raise ContractError(f"{label}: fold must be an int")
+        pinned = FOLD_TABLE_PINS[fold - 1]
+        for key, want in (
+            ("origin", pinned[1]),
+            ("window_start", pinned[2]),
+            ("window_end", pinned[3]),
+        ):
+            if record.get(key) != want:
+                raise ContractError(
+                    f"{label}: {key} {record.get(key)!r} != the pinned {want!r}"
+                )
+        if record.get("n_rows") != FOLD_ROWS:
+            raise ContractError(
+                f"{label}: n_rows {record.get('n_rows')!r} != {FOLD_ROWS}"
+            )
+        slices = record.get("slices")
+        if not isinstance(slices, dict):
+            raise ContractError(f"{label}: slices must be an object")
+        for kind in ("full_grid", "active_slice"):
+            block = slices.get(kind)
+            if not isinstance(block, dict) or set(block) != set(SCORE_KEYS):
+                raise ContractError(
+                    f"{label}: the {kind} slice must carry exactly {list(SCORE_KEYS)}"
+                )
+            for key in SCORE_KEYS:
+                value = block[key]
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise ContractError(
+                        f"{label}: {kind}.{key} must be a number, got {value!r}"
+                    )
+                if not math.isfinite(float(value)) or float(value) < 0.0:
+                    raise ContractError(
+                        f"{label}: {kind}.{key} must be finite and "
+                        f"non-negative, got {value!r}"
+                    )
+        model_name = str(record.get("name", ""))
+        pooled_per_model[model_name] = pooled_per_model.get(model_name, 0) + int(
+            record["n_rows"]
+        )
+    for model_name, pooled_rows in pooled_per_model.items():
+        if pooled_rows != POOLED_FOLD_ROWS:
+            raise ContractError(
+                f"fold_phase: model {model_name!r} pools {pooled_rows} rows "
+                f"!= the pinned {POOLED_FOLD_ROWS}"
+            )
+    for row in table:
+        if int(row["n_rows"]) != FOLD_ROWS:
+            raise ContractError(
+                f"folds_table() row {row} does not carry the pinned {FOLD_ROWS} rows"
+            )
+    print(
+        f"PASS fold-phase: {len(derived_models)} models x "
+        f"{len(FOLD_TABLE_PINS)} folds derived from the artifacts and the "
+        f"shared table ({FOLD_ROWS:,} rows per fold, {POOLED_FOLD_ROWS:,} pooled), "
+        "in the registry's order"
+    )
+
+
 def run_check() -> None:
     """Run all contract verification checks."""
     print("contract.py --check")
@@ -3381,6 +6423,14 @@ def run_check() -> None:
     _check_data_contract()
     _check_folds()
     _check_freeze_gates()
+    _check_freeze_body()
+    _check_freeze_run_invariants()
+    _check_christmas_slice_selection()
+    _check_freeze_results_writer()
+    _check_freeze_results_validation()
+    _check_prediction_alignment()
+    _check_freeze_safety()
+    _check_fold_phase()
     _check_registry()
     _check_scorer()
     _check_manifest_writer()
