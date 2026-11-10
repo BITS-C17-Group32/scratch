@@ -5,5 +5,11 @@ __pycache__/
 .python-version
 .ruff_cache/
 /splits/
-/artifacts/run_manifest.json.lock
-/artifacts/run_manifest.json.*.tmp
+
+# artifacts/ holds generated output: deep-learning checkpoints, temp files
+# and the per-invocation run manifest. Only the pinned registry files are
+# tracked; the run manifest is force-added once, in the Day-5 freeze PR.
+/artifacts/*
+!/artifacts/classical_results.json
+!/artifacts/deep_results.json
+!/artifacts/freeze_results.json
