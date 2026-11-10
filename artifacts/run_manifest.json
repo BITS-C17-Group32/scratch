@@ -1,0 +1,135 @@
+[
+  {
+    "created": "2026-11-09T19:06:58Z",
+    "git_sha": "0f79914007ced960847d8b90f0c53e837711ad3b",
+    "command": "contract.py --check",
+    "exit": 0,
+    "exit_ok": true,
+    "versions": {
+      "python": "3.13.18",
+      "uv": "0.13.7",
+      "pandas": "3.1.0",
+      "numpy": "2.5.4"
+    },
+    "elapsed_seconds": 0.0,
+    "arguments": {},
+    "status": "PASS",
+    "freeze_run": false,
+    "notes": []
+  },
+  {
+    "created": "2026-11-09T19:07:35Z",
+    "git_sha": "0f79914007ced960847d8b90f0c53e837711ad3b",
+    "command": "contract.py --check",
+    "exit": 0,
+    "exit_ok": true,
+    "versions": {
+      "python": "3.13.18",
+      "uv": "0.13.7",
+      "pandas": "3.1.0",
+      "numpy": "2.5.4"
+    },
+    "elapsed_seconds": 0.0,
+    "arguments": {},
+    "status": "PASS",
+    "freeze_run": false,
+    "notes": []
+  },
+  {
+    "created": "2026-11-10T02:33:10Z",
+    "git_sha": "8642edad1a5877685be69f1f40b73933507bde8b",
+    "command": "contract.py --check",
+    "exit": 1,
+    "exit_ok": false,
+    "versions": {
+      "python": "3.14.6",
+      "uv": "0.13.7",
+      "pandas": "3.0.3",
+      "numpy": "2.4.6"
+    },
+    "elapsed_seconds": 1.2630910000007134,
+    "arguments": {},
+    "status": "FAIL",
+    "freeze_run": false,
+    "notes": [
+      "run_manifest.json record 0: git_sha must be a 40-hex sha (or empty)"
+    ]
+  },
+  {
+    "created": "2026-11-10T03:09:45Z",
+    "git_sha": "8642edad1a5877685be69f1f40b73933507bde8b",
+    "command": "contract.py --check",
+    "exit": 0,
+    "exit_ok": true,
+    "versions": {
+      "python": "3.13.18",
+      "uv": "0.13.7",
+      "pandas": "3.1.0",
+      "numpy": "2.5.4"
+    },
+    "elapsed_seconds": 0.854064082999912,
+    "arguments": {},
+    "status": "PASS",
+    "freeze_run": false,
+    "notes": []
+  },
+  {
+    "created": "2026-11-10T03:10:02Z",
+    "git_sha": "8642edad1a5877685be69f1f40b73933507bde8b",
+    "command": "contract.py --freeze",
+    "exit": 1,
+    "exit_ok": false,
+    "versions": {
+      "python": "3.13.18",
+      "uv": "0.13.7",
+      "pandas": "3.1.0",
+      "numpy": "2.5.4"
+    },
+    "elapsed_seconds": 0.0,
+    "arguments": {
+      "freeze": "1"
+    },
+    "status": "FAIL",
+    "freeze_run": false,
+    "notes": [
+      "failed phase: pre-flight gates",
+      "freeze refused: set FREEZE_RUN=1 and go through the freeze path only; local_test is never read ad hoc and never tuned on"
+    ]
+  },
+  {
+    "created": "2026-11-10T08:31:22Z",
+    "git_sha": "f497e4263050d454c26808a424f9ed593780bd3f",
+    "command": "contract.py --check",
+    "exit": 0,
+    "exit_ok": true,
+    "versions": {
+      "python": "3.13.18",
+      "uv": "0.13.7",
+      "pandas": "3.1.0",
+      "numpy": "2.5.4"
+    },
+    "elapsed_seconds": 0.8954490830001305,
+    "arguments": {},
+    "status": "PASS",
+    "freeze_run": false,
+    "notes": []
+  },
+  {
+    "created": "2026-11-10T16:05:36Z",
+    "git_sha": "e5521c8186accdd6d340887671096b2687c30d34",
+    "command": "contract.py --check",
+    "exit": 0,
+    "exit_ok": true,
+    "versions": {
+      "python": "3.13.18",
+      "uv": "0.13.7",
+      "pandas": "3.1.0",
+      "numpy": "2.5.4"
+    },
+    "elapsed_seconds": 3.345887583003787,
+    "arguments": {},
+    "status": "PASS",
+    "freeze_run": false,
+    "notes": []
+  }
+]

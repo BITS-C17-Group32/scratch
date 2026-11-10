@@ -5,3 +5,5 @@ __pycache__/
 .python-version
 .ruff_cache/
 /splits/
+/artifacts/run_manifest.json.lock
+/artifacts/run_manifest.json.*.tmp
