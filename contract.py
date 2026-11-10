@@ -982,7 +982,16 @@ def _tool_versions() -> dict[str, str]:
     }
 
 
-TRACKED_SOURCES = ("contract.py", "features.py", "main.py")
+TRACKED_SOURCES = (
+    "contract.py",
+    "classical.py",
+    "features.py",
+    "main.py",
+    "train.py",
+    "holidays.py",
+    "oil.py",
+    "transactions.py",
+)
 
 
 def _head_resolves() -> bool:
