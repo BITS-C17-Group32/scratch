@@ -159,6 +159,7 @@ def train_one(arch, cfg, device, train_df, valid_df=None, cat_maps=None, scaler=
     best_epoch = 0
     patience_counter = 0
     epochs_run = 0
+    val_inference_seconds = 0.0
     per_horizon = []
 
     for epoch in range(1, cfg.max_epochs + 1):
@@ -192,6 +193,7 @@ def train_one(arch, cfg, device, train_df, valid_df=None, cat_maps=None, scaler=
 
         if valid_panels is not None:
             model.eval()
+            _t0 = _time.time()
             y_true, y_pred, per_horizon, _counts = _batched_eval(
                 model,
                 valid_panels,
@@ -201,6 +203,7 @@ def train_one(arch, cfg, device, train_df, valid_df=None, cat_maps=None, scaler=
                 cfg.eval_block_days,
                 device,
             )
+            val_inference_seconds = _time.time() - _t0
             val_metrics = compute_metrics(y_true, y_pred)
             val_rmsle = val_metrics["rmsle"]
             print("E", epoch, "mse", round(avg_train_loss, 4))
@@ -245,6 +248,7 @@ def train_one(arch, cfg, device, train_df, valid_df=None, cat_maps=None, scaler=
         "best_valid_rmsle": best_valid_rmsle,
         "metrics": best_metrics or {},
         "per_horizon": per_horizon,
+        "inference_seconds": val_inference_seconds,
         "rows_available": len(apply_store52_mask(train_df.copy())),
         "rows_masked": rows_masked,
         "train_rows_available": len(train_masked),
@@ -448,7 +452,7 @@ def main():
                     "rmse": m.get("rmse_active", 0),
                 },
                 "per_horizon_rmsle": res.get("per_horizon", []),
-                "inference_seconds": 0.0,
+                "inference_seconds": res.get("inference_seconds", 0.0),
             }
 
         # ablation handling

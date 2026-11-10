@@ -5,6 +5,3 @@ __pycache__/
 .python-version
 .ruff_cache/
 /splits/
-
-# Deep learning checkpoints (generated, not tracked)
-artifacts/*.pt

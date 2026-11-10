@@ -35,14 +35,26 @@ def load_split_manifest(repo_root: Path) -> dict:
         return json.load(f)
 
 
+DELAYS_OPEN_UNTIL = {
+    20: pd.Timestamp("2015-02-13"),
+    21: pd.Timestamp("2015-07-24"),
+    22: pd.Timestamp("2015-10-09"),
+    29: pd.Timestamp("2015-03-20"),
+    36: pd.Timestamp("2013-05-09"),
+    42: pd.Timestamp("2015-08-21"),
+    52: pd.Timestamp("2017-04-20"),
+    53: pd.Timestamp("2014-05-29"),
+}
+
+
 def store52_mask(df: pd.DataFrame) -> pd.Series:
-    """Rows to DROP in training: store 52 pre-opening with a real id."""
+    """Rows to DROP in training: stores that opened late, pre-opening with a real id."""
     date = pd.to_datetime(df["date"])
-    mask = (
-        (df["store_nbr"] == 52)
-        & (date < pd.Timestamp("2017-04-20"))
-        & (df["id"].notna())
-    )
+    mask = pd.Series(False, index=df.index)
+    for store, open_date in DELAYS_OPEN_UNTIL.items():
+        mask = mask | (
+            (df["store_nbr"] == store) & (date < open_date) & (df["id"].notna())
+        )
     return mask
 
 
