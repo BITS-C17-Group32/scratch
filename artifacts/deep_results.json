@@ -173,7 +173,14 @@
       "fold_metrics": []
     }
   ],
-  "notes": "percentage-error metric excluded at 35.2% zeros in train+valid",
+  "notes": [
+    "earthquake history contamination: fold windows contain no quake rows",
+    "store-52 training mask consequence",
+    "absence of local_test",
+    "percentage-error metric excluded at 35.2% zeros in train+valid",
+    "calendar encoding decision",
+    "rolling-origin protocol"
+  ],
   "track": "S4",
   "comparison": {
     "status": "pending_s3",
@@ -201,5 +208,141 @@
       "deep_params": null
     },
     "reason": "S3 artifact missing; re-run within 24h of S3 landing"
+  },
+  "ablation_2015plus": {
+    "status": "run",
+    "architecture": "lstm",
+    "train_start": "2015-01-01",
+    "train_rows_available": 762927,
+    "train_rows_used": 762927,
+    "train_rows_masked": 207801,
+    "epochs_run": 6,
+    "best_epoch": 1,
+    "stop_reason": "early_stopping",
+    "valid": {
+      "n_rows": 299376,
+      "n_active": 245303,
+      "full_grid": {
+        "rmsle": 0.5638316484362367,
+        "mae": 116.60534279966863,
+        "rmse": 577.3529798921606
+      },
+      "active_slice": {
+        "rmsle": 0.5097554845662853,
+        "mae": 141.4328206997501,
+        "rmse": 636.8241405397496
+      },
+      "per_horizon_rmsle": [
+        0.4950696338932774,
+        0.5199696193210258,
+        0.5473001670827476,
+        0.5565059539275433,
+        0.574743618472968,
+        0.5681608167748403,
+        0.583346109590283,
+        0.5425082546129555,
+        0.5597061687732207,
+        0.5848284253493152,
+        0.5630102903283088,
+        0.5817883100469944,
+        0.5702522738205764,
+        0.6077098358717821,
+        0.5789861326549611,
+        0.5887764808789534
+      ],
+      "inference_seconds": 3.420119285583496
+    },
+    "delta_vs_full_history_rmsle": null,
+    "reason": ""
+  },
+  "schema_version": "1.0",
+  "generated_at": "2026-11-11T20:02:42.412506",
+  "git_sha": "eed3768e7ddc06918502377865f2d8dff201def6",
+  "data_fingerprint": {
+    "manifest_sha256": "308e7ec5af085e76fd810ce085b662e1726d9bfa0d6e4db5be9798d4953bae18",
+    "columns_sha256": "2caefc5a8bcbb94f95ebbef1cda58a0d62ca2fdf799b905259a3ecb9a1ef5c27",
+    "train_rows": 2106324,
+    "valid_rows": 299376,
+    "train_bounds": [
+      "2013-01-01",
+      "2016-03-27"
+    ],
+    "valid_bounds": [
+      "2016-03-28",
+      "2016-09-11"
+    ]
+  },
+  "shared_config": {
+    "lookback_days": 60,
+    "horizon_days": 16,
+    "num_layers": 2,
+    "hidden_size": 128,
+    "dropout": 0.2,
+    "batch_size": 256,
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001,
+    "grad_clip": 1.0,
+    "max_epochs": 30,
+    "patience": 5,
+    "min_delta": 0.0001,
+    "seed": 42,
+    "train_window_stride": 8,
+    "eval_block_days": 16,
+    "target_transform": "log1p",
+    "loss": "mse",
+    "embedding_dims": {
+      "store_nbr": 8,
+      "family": 8,
+      "city": 4,
+      "state": 4,
+      "store_type": 2,
+      "cluster": 4
+    },
+    "numeric_features": [
+      "onpromotion_scaled",
+      "sales_log_scaled",
+      "earthquake_decay",
+      "is_event",
+      "is_national_holiday",
+      "is_regional_holiday",
+      "is_local_holiday",
+      "is_holiday",
+      "is_national_holiday_tomorrow",
+      "is_national_holiday_in_2days",
+      "is_regional_holiday_tomorrow",
+      "is_regional_holiday_in_2days",
+      "is_local_holiday_tomorrow",
+      "is_local_holiday_in_2days",
+      "is_holiday_tomorrow",
+      "is_holiday_in_2days",
+      "is_event_tomorrow",
+      "is_event_in_2days",
+      "dow_sin",
+      "dow_cos",
+      "doy_sin",
+      "doy_cos"
+    ],
+    "categorical_features": [
+      "store_nbr",
+      "family",
+      "city",
+      "state",
+      "store_type",
+      "cluster"
+    ],
+    "calendar_encoding": true,
+    "store52_mask": true,
+    "train_start": "2015-01-01",
+    "dtype": "float32",
+    "device": "cuda",
+    "torch_version": "2.15.0+cu132",
+    "num_workers": 0,
+    "amp": false
+  },
+  "config_sha256": "1e22737b850421140f80aef3f9d6252c30d8e6e3581abe1b9fa129dc14d6b0c0",
+  "runtime_tradeoff": {
+    "headline_device": "cuda",
+    "devices": [],
+    "colab_gpu_hours_used": null
   }
 }
