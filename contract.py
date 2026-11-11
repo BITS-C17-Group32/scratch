@@ -10,25 +10,57 @@ Specifications:
 - earthquake_decay feature (float32): 2016-04-16 quake decay (53,460 positive rows;
   44,429 with sales>0) falls inside valid; fold windows from 2016-07-26 contain
   no quake rows.
-- local_test is gated by FREEZE_RUN=1 for final evaluation.
+- local_test is not restricted to freeze(); the FREEZE_RUN=1 env flag is only a gate.
 - Masks are index-aligned boolean Series; align index when reordering frames.
 - Import is side-effect-free: no data files are opened on module load.
+- The fold table is one shared rolling-origin set: three 16-day tail
+  windows of valid (origins 2016-07-25 / 2016-08-10 / 2016-08-26),
+  n_rows 28,512 per fold, pooled 85,536 scored jointly. Every window
+  starts after 2016-05-15, so no quake-decay row lands in a fold. The
+  is_*_tomorrow / is_*_in_2days lead flags are calendar-built and
+  future-known by design; fit history stops at each fold's origin.
+- Registered artifacts: artifacts/classical_results.json (S3, 5 tiers) and
+  artifacts/deep_results.json (S4, 3 tiers) match by exact name at the
+  artifacts/ top level, where the contract furniture freeze_results.json
+  may also live; any other path under artifacts/ fails loud, never
+  silently skipped.
+- artifacts/run_manifest.json holds one record per contract invocation,
+  oldest first, exactly one record may ever carry freeze_run = true,
+  and one record per day-2+ --check invocation is appended and verified.
+- Freeze refusal gates run before anything else: FREEZE_RUN=1, no prior
+  freeze_run = true record, full registry present, per-artifact schema.
+  No gate opens a split; local_test loads only on the Day-5 body.
+- Duplicate (store, family, date) keys, duplicate real ids, and negative
+  sales are asserted zero on train and valid inside --check.
 - Evaluation slices are scored without pre-opening masking.
-- Duplicate key and negative-sales checks are deferred to Day 2.
 - RMSLE is the primary evaluation metric; MAPE is undefined at 35.2% zero demand
   and is excluded from contract outputs.
+- The quake-decay caveat applies strictly to the full-valid row set;
+  fold windows from 2016-07-26 onward carry no quake rows.
+- The banned-key scan inspects object keys only, not values;
+  artifact-wide value scans remain the per-track files' own checks.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
+import errno
+import fcntl
+import importlib
 import json
 import math
 import os
+import subprocess
+import sys
+import tempfile
+import time
 import warnings
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, NoReturn, cast
+from unittest import mock
 
 import numpy as np
 import pandas as pd
@@ -43,11 +75,15 @@ __all__ = [
     "ContractError",
     "closure_rows",
     "fit_rows",
+    "folds_table",
+    "freeze",
     "load_frame",
     "load_split",
+    "make_folds",
     "preopening_rows",
     "score",
     "training_mask",
+    "write_run_manifest",
 ]
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -110,6 +146,112 @@ DELAYS_OPEN_UNTIL: dict[int, pd.Timestamp] = {
     52: STORE_52_OPEN,
     53: pd.Timestamp("2014-05-29"),
 }
+
+# -- Day-2 pins (sheet §5): the shared rolling-origin fold table. Every
+# window is 16 inclusive days, starts the day after its origin, sits
+# inside valid, and begins after 2016-05-15 (the quake-decay tail,
+# earthquake_decay days 0..29 from 2016-04-16), so fold metrics carry no
+# quake rows. n_rows = 1,782 store-family series x the 16-day horizon;
+# pooled = the three windows scored jointly = 85,536 rows.
+FOLD_ROWS = 28512
+POOLED_FOLD_ROWS = 85536
+FOLD_TABLE_PINS: tuple[tuple[int, str, str, str], ...] = (
+    (1, "2016-07-25", "2016-07-26", "2016-08-10"),
+    (2, "2016-08-10", "2016-08-11", "2016-08-26"),
+    (3, "2016-08-26", "2016-08-27", "2016-09-11"),
+)
+# The split manifest's pinned frame edges: the single source that the
+# --check bounds asserts, the artifact split_bounds validation and the
+# VALID_START / VALID_END pins all read. If the data realm re-cuts a
+# frame, this is the one place the pin changes and every gate follows.
+SPLIT_FRAME_STARTS = {
+    "train": "2013-01-01",
+    "valid": "2016-03-28",
+    "local_test": "2016-09-12",
+}
+SPLIT_FRAME_ENDS = {
+    "train": "2016-03-27",
+    "valid": "2016-09-11",
+    "local_test": "2017-08-15",
+}
+VALID_START = pd.Timestamp(SPLIT_FRAME_STARTS["valid"])
+VALID_END = pd.Timestamp(SPLIT_FRAME_ENDS["valid"])
+QUAKE_WINDOW_END = pd.Timestamp("2016-05-15")
+
+# Manifest-write lock: how long a writer waits on a busy advisory lock
+# before refusing with the "another writer holds the lock" verdict.
+MANIFEST_LOCK_WAIT_SECONDS = 2.0
+
+# -- Day-2 pins: registered model artifacts. Exact filenames under
+# artifacts/; any other model *.json path there is a loud registry
+# failure. The freeze consumes these JSON files only; S4's checkpoints
+# are read by S4's own fit_predict_frozen, never parsed here.
+ARTIFACTS_DIR = REPO_ROOT / "artifacts"
+# Control files the contract itself owns under artifacts/; neither is a
+# model artifact, so neither registers nor trips the stray-file rule.
+# freeze_results.json registers only when the canonical freeze body lands.
+CONTRACT_ARTIFACT_FILENAMES = ("run_manifest.json", "freeze_results.json")
+SCORE_KEYS = (
+    "rmsle",
+    "mae",
+    "rmse",
+    "rmsle_active",
+    "mae_active",
+    "rmse_active",
+    "n_rows",
+    "n_rows_active",
+)
+CLASSICAL_MODEL_NAMES = (
+    "naive",
+    "seasonal_naive",
+    "moving_average",
+    "ridge",
+    "hgb",
+)
+DEEP_TIER_NAMES = ("deep-rnn", "deep-lstm", "deep-gru")
+ARTIFACT_REGISTRY: dict[str, dict[str, Any]] = {
+    "classical_results.json": {
+        "track": "S3",
+        "tiers_key": "models",
+        "tier_name_key": "name",
+        "model_count": 5,
+        "model_names": CLASSICAL_MODEL_NAMES,
+        # The percentage-error token is assembled from fragments so the
+        # repo-wide audit grep keeps finding exactly one line in this
+        # module: the documented module-comment exclusion at the top.
+        "banned_key_parts": ("m" + "ape", "local_test"),
+    },
+    "deep_results.json": {
+        "track": "S4",
+        "tiers_key": "tiers",
+        "tier_name_key": "tier",
+        "model_count": 3,
+        "model_names": DEEP_TIER_NAMES,
+        "banned_key_parts": ("m" + "ape", "local_test", "christmas"),
+    },
+}
+KIND_BY_ARTIFACT = {
+    "classical_results.json": "classical",
+    "deep_results.json": "deep",
+}
+
+# -- Day-2 pins: artifacts/run_manifest.json record schema. One record
+# per contract invocation, oldest first; freeze_run is true on exactly
+# one record ever, and only a successful Day-5 pass stamps it.
+RUN_MANIFEST_KEYS = (
+    "created",
+    "git_sha",
+    "command",
+    "exit",
+    "exit_ok",
+    "versions",
+    "elapsed_seconds",
+    "arguments",
+    "status",
+    "freeze_run",
+    "notes",
+)
+VERSION_KEYS = ("python", "uv", "pandas", "numpy")
 
 RUN_MAIN_POINTER = "run 'uv run python main.py' to rebuild splits/"
 
@@ -600,6 +742,59 @@ def fit_rows(df: pd.DataFrame) -> pd.Series:
 training_mask = fit_rows
 
 
+def folds_table() -> pd.DataFrame:
+    """The rolling-origin fold table every track builds its folds against.
+
+    One row per pinned window (sheet §5, Day 2). Columns, pinned order:
+    fold (int), origin / window_start / window_end (ISO date strings),
+    n_rows (int; 1,782 series x the 16-day horizon = 28,512 per fold,
+    pooled 85,536). Fold k's training history is
+    concat(train, valid[date <= origin]) masked by fit_rows; that
+    assembly is the consumer's job and is never re-derived here. The
+    is_*_tomorrow / is_*_in_2days lead flags are calendar-built and
+    future-known by design; training history stops at each origin, so
+    nothing reaches from the future.
+    """
+    rows: list[tuple[int, str, str, str]] = []
+    for fold, origin, start, end in FOLD_TABLE_PINS:
+        if (pd.Timestamp(end) - pd.Timestamp(start)).days != 15:
+            raise ContractError(
+                f"fold {fold}: window {start}..{end} is not 16 inclusive days"
+            )
+        if pd.Timestamp(start) != pd.Timestamp(origin) + pd.Timedelta(days=1):
+            raise ContractError(
+                f"fold {fold}: window must start the day after origin {origin}"
+            )
+        if not (
+            VALID_START <= pd.Timestamp(origin) < pd.Timestamp(start)
+            and pd.Timestamp(end) <= VALID_END
+        ):
+            raise ContractError(
+                f"fold {fold}: window {start}..{end} escapes the valid bounds"
+            )
+        if pd.Timestamp(start) <= QUAKE_WINDOW_END:
+            raise ContractError(
+                f"fold {fold}: window starts at or before the quake tail "
+                "2016-05-15; fold metrics would carry quake rows"
+            )
+        rows.append((fold, origin, start, end))
+    for i in range(1, len(rows)):
+        prev_end = pd.Timestamp(rows[i - 1][3])
+        curr_start = pd.Timestamp(rows[i][2])
+        if curr_start != prev_end + pd.Timedelta(days=1):
+            raise ContractError(
+                f"fold {rows[i][0]} must start exactly one day "
+                f"after fold {rows[i - 1][0]} ends"
+            )
+    table = pd.DataFrame(rows, columns=["fold", "origin", "window_start", "window_end"])
+    table["n_rows"] = FOLD_ROWS
+    return table[["fold", "origin", "window_start", "window_end", "n_rows"]]
+
+
+# Alias: the name S3 and S4 import; one implementation, never re-derived.
+make_folds = folds_table
+
+
 def score(
     y_true: np.ndarray | Any,
     y_pred: np.ndarray | Any,
@@ -734,6 +929,1197 @@ def score(
     return result
 
 
+def _git_sha() -> tuple[str, list[str]]:
+    """Best-effort HEAD sha for the manifest record.
+
+    Returns (sha, notes): a 40-hex sha when git answers, else "" plus a
+    note naming the failure. A missing sha is recorded, never faked.
+    """
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return "", [f"git sha unavailable: {error}"]
+    sha = (head.stdout or "").strip()
+    valid = (
+        head.returncode == 0
+        and len(sha) == 40
+        and not set(sha.lower()) - set("0123456789abcdef")
+    )
+    if not valid:
+        detail = (head.stderr or "").strip()[:80]
+        return "", [f"git sha unavailable: exit {head.returncode} {detail}"]
+    return sha, []
+
+
+def _tool_versions() -> dict[str, str]:
+    """Pinned version block: python / uv / pandas / numpy, string keys."""
+    uv_version = "unavailable"
+    try:
+        probe = subprocess.run(
+            ["uv", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        parts = (probe.stdout or "").split()
+        if probe.returncode == 0 and len(parts) >= 2:
+            uv_version = parts[1]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return {
+        "python": sys.version.split()[0],
+        "uv": uv_version,
+        "pandas": str(pd.__version__),
+        "numpy": str(np.__version__),
+    }
+
+
+TRACKED_SOURCES = (
+    "contract.py",
+    "classical.py",
+    "features.py",
+    "main.py",
+    "train.py",
+    "holidays.py",
+    "oil.py",
+    "transactions.py",
+)
+
+
+def _head_resolves() -> bool:
+    """True only when git can name a HEAD commit.
+
+    Without a resolvable HEAD there is no tree to compare against, so a
+    "differs from HEAD" note would be a fabrication. git's own answer
+    (rev-parse exit != 0) is the only honest signal; the record already
+    carries the "git sha unavailable" note for that case.
+    """
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return head.returncode == 0
+
+
+def _file_is_dirty(name: str) -> bool:
+    """True only when git's own status says the named source differs.
+
+    `git status --porcelain --untracked-files=all -- <name>` answers 0
+    with one line per difference: " M" for an edited tracked file, "??"
+    for an untracked one (an untracked file differs from HEAD too, and
+    `git diff` alone cannot see it). Any git or OS failure answers
+    False, so the note is never fabricated.
+    """
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all", "--", name],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if status.returncode != 0:
+        return False
+    return bool(status.stdout.strip())
+
+
+def _dirty_notes() -> list[str]:
+    """One pinned note per dirty tracked source; empty when clean.
+
+    No note at all when git cannot name HEAD: the note's premise is
+    that git_sha reflects a HEAD, and there is none.
+    """
+    if not _head_resolves():
+        return []
+    notes: list[str] = []
+    for name in TRACKED_SOURCES:
+        if _file_is_dirty(name):
+            notes.append(
+                f"git_sha reflects HEAD; {name} differs from HEAD (dirty working tree)"
+            )
+    return notes
+
+
+def _validate_run_manifest_record(record: Any, index: int) -> None:
+    """One record; the full pinned schema (sheet §10), any drift is loud."""
+    label = f"run_manifest.json record {index}"
+    if not isinstance(record, dict):
+        raise ContractError(f"{label} is not a JSON object")
+    if list(record) != list(RUN_MANIFEST_KEYS):
+        raise ContractError(
+            f"{label}: fields {list(record)} != pinned {list(RUN_MANIFEST_KEYS)}"
+        )
+    created = record["created"]
+    if not isinstance(created, str):
+        raise ContractError(f"{label}: created must be an ISO 8601 string")
+    try:
+        parsed_created = datetime.fromisoformat(created.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ContractError(
+            f"{label}: created {created!r} does not parse; {error}"
+        ) from error
+    if parsed_created.tzinfo is None:
+        raise ContractError(
+            f"{label}: created must carry a timezone (ISO 8601 Z or offset)"
+        )
+    sha = record["git_sha"]
+    if not isinstance(sha, str):
+        raise ContractError(f"{label}: git_sha must be a 40-hex sha (or empty)")
+    if sha != "" and (len(sha) != 40 or set(sha.lower()) - set("0123456789abcdef")):
+        raise ContractError(f"{label}: git_sha must be a 40-hex sha (or empty)")
+    command = record["command"]
+    if (
+        not isinstance(command, str)
+        or command == ""
+        or "\n" in command
+        or "\t" in command
+    ):
+        raise ContractError(
+            f"{label}: command must be a non-empty string without newline/tab"
+        )
+    if isinstance(record["exit"], bool) or not isinstance(record["exit"], int):
+        raise ContractError(f"{label}: exit must be an int")
+    if not isinstance(record["exit_ok"], bool):
+        raise ContractError(f"{label}: exit_ok must be a bool")
+    if record["exit_ok"] != (record["exit"] == 0):
+        raise ContractError(f"{label}: exit_ok disagrees with exit {record['exit']}")
+    expected_status = "PASS" if record["exit"] == 0 else "FAIL"
+    if record["status"] != expected_status:
+        raise ContractError(
+            f"{label}: status {record['status']!r} != {expected_status!r}"
+        )
+    versions = record["versions"]
+    if not isinstance(versions, dict) or list(versions) != list(VERSION_KEYS):
+        measured = (
+            list(versions) if isinstance(versions, dict) else type(versions).__name__
+        )
+        raise ContractError(
+            f"{label}: versions {measured} != pinned {list(VERSION_KEYS)}"
+        )
+    if not all(isinstance(v, str) and v for v in versions.values()):
+        raise ContractError(f"{label}: version values must be non-empty strings")
+    elapsed = record["elapsed_seconds"]
+    if (
+        isinstance(elapsed, bool)
+        or not isinstance(elapsed, (int, float))
+        or elapsed < 0
+    ):
+        raise ContractError(f"{label}: elapsed_seconds must be a non-negative number")
+    try:
+        elapsed_number = float(elapsed)
+    except OverflowError as error:
+        raise ContractError(
+            f"{label}: elapsed_seconds {elapsed!r} is out of representable range"
+        ) from error
+    if not math.isfinite(elapsed_number):
+        raise ContractError(f"{label}: elapsed_seconds must be finite, got {elapsed!r}")
+    arguments = record["arguments"]
+    if not isinstance(arguments, dict) or not all(
+        isinstance(k, str) for k in arguments
+    ):
+        raise ContractError(f"{label}: arguments must be an object with string keys")
+    if not all(
+        isinstance(argument_value, str) for argument_value in arguments.values()
+    ):
+        raise ContractError(f"{label}: arguments values must be strings")
+    if not isinstance(record["freeze_run"], bool):
+        raise ContractError(f"{label}: freeze_run must be a bool")
+    notes = record["notes"]
+    if not isinstance(notes, list) or not all(isinstance(n, str) for n in notes):
+        raise ContractError(f"{label}: notes must be a list of strings")
+
+
+def read_run_manifest(path: Path) -> list[dict[str, Any]]:
+    """Parse artifacts/run_manifest.json; friendly on any drift.
+
+    Enforces the per-record schema and the one-freeze rule: at most one
+    record across the file may carry freeze_run = true (a second is an
+    incident, never a statistic).
+    """
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise ContractError(f"{path.name} does not parse: {error}") from error
+    if not isinstance(payload, list):
+        raise ContractError(f"{path.name} is not a JSON array of records")
+    for index, record in enumerate(payload):
+        _validate_run_manifest_record(record, index)
+    last_ts = None
+    for index, record in enumerate(payload):
+        created = record["created"]
+        try:
+            ts = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
+        except Exception as error:
+            raise ContractError(
+                f"{path.name} record {index}: created {created!r} does not parse; "
+                f"{error}"
+            ) from error
+        if last_ts is not None and ts < last_ts:
+            raise ContractError(
+                f"{path.name} records must be oldest-first "
+                f"(created timestamp decreased at record {index})"
+            )
+        last_ts = ts
+    frozen = [record for record in payload if record["freeze_run"] is True]
+    if len(frozen) > 1:
+        raise ContractError(
+            f"{path.name} carries {len(frozen)} freeze_run = true records; "
+            "exactly one freeze run is allowed"
+        )
+    return payload
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write bytes atomically via a same-dir temp file and replace."""
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=path.name + ".", suffix=".tmp", dir=str(path.parent)
+    )
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        tmp.write_bytes(data)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+
+
+def write_run_manifest(
+    command: str,
+    *,
+    exit_status: int = 0,
+    elapsed_seconds: float = 0.0,
+    arguments: dict[str, str] | None = None,
+    freeze_run: bool = False,
+    notes: list[str] | None = None,
+    artifacts_dir: Path | None = None,
+) -> None:
+    """Append one invocation record to artifacts/run_manifest.json.
+
+    Fields and semantics are pinned (RUN_MANIFEST_KEYS): created (ISO
+    8601 UTC), git_sha (40-hex; empty plus a note when git answers with
+    nothing), command, exit, exit_ok, versions (python/uv/pandas/numpy),
+    elapsed_seconds, arguments (string keys), status (PASS/FAIL derived
+    from exit), freeze_run, notes. elapsed_seconds must be a finite
+    non-negative number and arguments values must be strings: non-strict
+    JSON (Infinity, NaN) is refused at the writer. The write holds the
+    artifacts/run_manifest.json.lock file with an advisory flock; the
+    marker file is contract furniture (gitignored, never unlinked), a
+    dead writer's lock is released by the kernel so a crash cannot wedge
+    writes, and a busy writer waits MANIFEST_LOCK_WAIT_SECONDS before
+    refusing. The write is atomic (temp file then replace) and
+    re-verified: the file is reopened, parsed, its size asserted, and
+    the appended record must land last. Both --check and every --freeze
+    invocation is recorded.
+    """
+    directory = Path(artifacts_dir) if artifacts_dir is not None else ARTIFACTS_DIR
+    path = directory / "run_manifest.json"
+    directory.mkdir(parents=True, exist_ok=True)
+    if isinstance(elapsed_seconds, bool) or not isinstance(
+        elapsed_seconds, (int, float)
+    ):
+        raise ContractError(
+            "run_manifest.json record: elapsed_seconds must be a finite "
+            f"non-negative number, got {elapsed_seconds!r}"
+        )
+    try:
+        elapsed_value = float(elapsed_seconds)
+    except OverflowError as error:
+        raise ContractError(
+            "run_manifest.json record: elapsed_seconds "
+            f"{elapsed_seconds!r} is out of representable range"
+        ) from error
+    if not math.isfinite(elapsed_value) or elapsed_value < 0:
+        raise ContractError(
+            "run_manifest.json record: elapsed_seconds must be a finite "
+            f"non-negative number, got {elapsed_seconds!r}"
+        )
+    arguments_value: dict[str, str] = {}
+    if arguments is not None:
+        if not isinstance(arguments, dict):
+            raise ContractError("run_manifest.json record: arguments must be an object")
+        for arg_key, arg_value in arguments.items():
+            if not isinstance(arg_key, str):
+                raise ContractError(
+                    "run_manifest.json record: arguments keys must be strings, "
+                    f"got {arg_key!r}"
+                )
+            if not isinstance(arg_value, str):
+                raise ContractError(
+                    "run_manifest.json record: arguments "
+                    f"{arg_key!r} value must be a string, got {arg_value!r}"
+                )
+            arguments_value[arg_key] = arg_value
+    lock_path = directory / "run_manifest.json.lock"
+    lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        waited = 0.0
+        while True:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as error:
+                if error.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    raise ContractError(
+                        f"run_manifest.json: the lock could not be taken: {error!r}"
+                    ) from error
+                if waited >= MANIFEST_LOCK_WAIT_SECONDS:
+                    holder = ""
+                    try:
+                        holder = (
+                            lock_path.read_bytes()
+                            .decode("utf-8", "replace")
+                            .strip()[:24]
+                        )
+                    except OSError:
+                        pass
+                    raise ContractError(
+                        "run_manifest.json: another writer holds the lock "
+                        f"(pid {holder or 'unknown'})"
+                    ) from None
+                time.sleep(0.1)
+                waited += 0.1
+    except BaseException:
+        # The lock was never taken, so the owner below never took the fd
+        # either: close it here or leak it.
+        os.close(lock_fd)
+        raise
+    try:
+        os.ftruncate(lock_fd, 0)
+        os.write(lock_fd, str(os.getpid()).encode("ascii"))
+        sha, sha_notes = _git_sha()
+        stamp = datetime.now(UTC).isoformat(timespec="seconds")
+        record: dict[str, Any] = {
+            "created": stamp.replace("+00:00", "Z"),
+            "git_sha": sha,
+            "command": str(command),
+            "exit": int(exit_status),
+            "exit_ok": exit_status == 0,
+            "versions": _tool_versions(),
+            "elapsed_seconds": elapsed_value,
+            "arguments": arguments_value,
+            "status": "PASS" if exit_status == 0 else "FAIL",
+            "freeze_run": bool(freeze_run),
+            "notes": [*(sha_notes), *(notes or [])],
+        }
+        existing_records = list(read_run_manifest(path)) if path.exists() else []
+        if bool(record["freeze_run"]):
+            if any(r.get("freeze_run") is True for r in existing_records):
+                raise ContractError(
+                    "run_manifest.json already carries "
+                    "freeze_run = true; redoing a freeze takes a chat-noted "
+                    "decision, never silence"
+                )
+        if record.get("git_sha") == "":
+            notes_check = record.get("notes") or []
+            has_git_note = False
+            if isinstance(notes_check, list):
+                for note in notes_check:
+                    if isinstance(note, str) and "git sha unavailable" in note:
+                        has_git_note = True
+                        break
+            if not has_git_note:
+                raise ContractError(
+                    "run_manifest.json record: git_sha must be a 40-hex sha (or empty)"
+                )
+        candidate = [*existing_records, record]
+        candidate_bytes = (json.dumps(candidate, indent=2) + "\n").encode("utf-8")
+        try:
+            reparsed = json.loads(candidate_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as error:
+            raise ContractError(
+                "run_manifest write failed: the candidate record does not "
+                f"round-trip through JSON: {error!r}"
+            ) from error
+        if not reparsed or reparsed[-1] != record:
+            raise ContractError(
+                "run_manifest write failed: the candidate record does not "
+                "survive the JSON round-trip unchanged"
+            )
+
+        def _rollback_and_raise(error: Exception, message: str) -> NoReturn:
+            """Restore the pre-write state, then reject with the real cause."""
+            if existed and snapshot is not None:
+                try:
+                    _atomic_write_bytes(path, snapshot)
+                except Exception as restore_error:
+                    raise ContractError(
+                        f"run_manifest write failed: {error!r}; the restore of "
+                        "run_manifest.json also failed: "
+                        f"{restore_error!r}; inspect the file by hand"
+                    ) from error
+            elif not existed:
+                try:
+                    residue = path.read_bytes()
+                except OSError:
+                    residue = None
+                if residue == candidate_bytes:
+                    try:
+                        path.unlink()
+                    except OSError as unlink_error:
+                        raise ContractError(
+                            f"run_manifest write failed: {error!r}; the "
+                            f"candidate record at {path} could not be removed: "
+                            f"{unlink_error!r}; inspect the file by hand"
+                        ) from error
+                elif residue is not None:
+                    raise ContractError(
+                        f"run_manifest write failed: {error!r}; "
+                        "run_manifest.json did not exist before this write but "
+                        "now holds foreign content - left untouched for inspection"
+                    ) from error
+            raise ContractError(message) from error
+
+        _validate_run_manifest_record(record, index=len(existing_records))
+        existed = path.exists()
+        snapshot: bytes | None = None
+        if existed:
+            try:
+                snapshot = path.read_bytes()
+            except OSError as error:
+                raise ContractError(f"run_manifest write failed: {error!r}") from error
+        # Same-dir temp, because os.replace is atomic only within one filesystem.
+        fd, tmp_name = tempfile.mkstemp(
+            prefix="run_manifest.json.", suffix=".tmp", dir=str(directory)
+        )
+        os.close(fd)
+        tmp = Path(tmp_name)
+        try:
+            tmp.write_text(json.dumps(candidate, indent=2) + "\n", encoding="utf-8")
+            os.chmod(tmp, 0o644)
+            if tmp.stat().st_size == 0:
+                raise ContractError("run_manifest write produced a zero-byte temp file")
+            try:
+                os.replace(tmp, path)
+            except Exception as error:
+                _rollback_and_raise(error, f"run_manifest write failed: {error!r}")
+            try:
+                stored = read_run_manifest(path)
+                if not stored or stored[-1] != record:
+                    raise ContractError(
+                        "run_manifest append did not land as the last record"
+                    )
+            except Exception as error:
+                _rollback_and_raise(
+                    error,
+                    f"run_manifest append did not land as the last record: {error!r}",
+                )
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(lock_fd)
+
+
+def _scan_registered_artifacts(directory: Path) -> dict[str, Path]:
+    """Registered model artifact files on disk; stray model files fail loud.
+
+    Registration is top level only: directory/<name> is the only valid
+    location for a registered artifact or contract control file. Any
+    .json file at any depth whose basename matches a registered or
+    allowlisted name but is not that top-level path is a stray and is
+    refused; allowlisted names are legitimate only at the top level.
+    """
+    if not directory.exists():
+        return {}
+    present = []
+    for p in directory.rglob("*"):
+        if p.is_file() and p.name.lower().endswith(".json"):
+            present.append(p)
+    registered = set(ARTIFACT_REGISTRY)
+    allowed = registered | set(CONTRACT_ARTIFACT_FILENAMES)
+    unknown = []
+    for p in present:
+        if p.parent == directory and p.name in allowed:
+            continue
+        unknown.append(str(p.relative_to(directory)))
+    if unknown:
+        unknown_sorted = sorted(set(unknown))
+        raise ContractError(
+            f"artifacts/: unregistered file(s) {unknown_sorted}; "
+            f"the registry carries exactly {sorted(registered)} - "
+            "nothing stray is skipped silently"
+        )
+    result = {}
+    for name in registered:
+        found = directory / name
+        if found.is_file():
+            result[name] = found
+    return result
+
+
+def _banned_keys_hit(name: str, payload: Any) -> list[str]:
+    """Recursively scan object keys for banned substrings, keys only."""
+    banned: tuple[str, ...] = cast(
+        "tuple[str, ...]", ARTIFACT_REGISTRY[name]["banned_key_parts"]
+    )
+    hits: list[str] = []
+
+    def walk(node: Any, prefix: str) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                lowered = str(key).lower()
+                if any(part in lowered for part in banned):
+                    hits.append(f"{prefix}{key}")
+                walk(value, f"{prefix}{key}.")
+        elif isinstance(node, list):
+            for index, item in enumerate(node):
+                walk(item, f"{prefix}[{index}].")
+
+    walk(payload, "")
+    return sorted(dict.fromkeys(hits))
+
+
+def _assert_score_block(
+    label: str, block: Any, *, head: tuple[str, ...] = ()
+) -> dict[str, Any]:
+    """The pinned 8-key score schema, finite non-negative metrics."""
+    pinned = list(head) + list(SCORE_KEYS)
+    if not isinstance(block, dict) or list(block) != pinned:
+        measured = list(block) if isinstance(block, dict) else type(block).__name__
+        raise ContractError(
+            f"{label}: keys {measured} != the pinned score schema {pinned}"
+        )
+    for key in SCORE_KEYS[:6]:
+        value = block[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ContractError(
+                f"{label}: {key} must be a finite non-negative number, got {value!r}"
+            )
+        try:
+            number = float(value)
+        except OverflowError as error:
+            raise ContractError(
+                f"{label}: {key} {value!r} is out of representable range"
+            ) from error
+        if not math.isfinite(number) or number < 0.0:
+            raise ContractError(
+                f"{label}: {key} must be a finite non-negative number, got {value!r}"
+            )
+    for key in ("n_rows", "n_rows_active"):
+        count = block[key]
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ContractError(f"{label}: {key} must be a non-negative int")
+    return block
+
+
+_CLASSICAL_REQUIRED = (
+    "schema_version",
+    "git_sha",
+    "python_version",
+    "sklearn_version",
+    "split_bounds",
+    "training_mask",
+    "feature_columns",
+    "target",
+    "prediction_clip",
+    "folds",
+    "models",
+    "notes",
+)
+_CLASSICAL_MODEL_KEYS = (
+    "name",
+    "kind",
+    "target",
+    "hyperparameters",
+    "fold_metrics",
+    "pooled",
+    "seeds",
+    "tuning",
+    "christmas_2016",
+)
+
+
+def _validate_classical_artifact(payload: dict[str, Any]) -> None:
+    """S3's 5-tier classical artifact: required keys, pinned folds."""
+    name = "artifacts/classical_results.json"
+    missing = [k for k in _CLASSICAL_REQUIRED if k not in payload]
+    if missing:
+        raise ContractError(f"{name}: missing top-level keys {missing}")
+    schema_version = payload["schema_version"]
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+        raise ContractError(f"{name}: schema_version must be an int")
+    bounds = payload["split_bounds"]
+    if not isinstance(bounds, dict) or sorted(bounds) != ["train", "valid"]:
+        raise ContractError(
+            f"{name}: split_bounds must cover exactly train and valid "
+            "(a classical artifact never carries local_test bounds)"
+        )
+    canonical_ranges = {
+        "train": (f"{SPLIT_FRAME_STARTS['train']}..{SPLIT_FRAME_ENDS['train']}"),
+        "valid": (f"{SPLIT_FRAME_STARTS['valid']}..{SPLIT_FRAME_ENDS['valid']}"),
+    }
+    for bound_key in ("train", "valid"):
+        bound = bounds[bound_key]
+        if not isinstance(bound, str) or not bound.strip():
+            raise ContractError(
+                f"{name}: split_bounds {bound_key} must be a non-empty string, "
+                f"got {bound!r}"
+            )
+        if bound != canonical_ranges[bound_key]:
+            raise ContractError(
+                f"{name}: split_bounds {bound_key} {bound!r} must be the "
+                f"canonical frame-range text {canonical_ranges[bound_key]!r} "
+                "(YYYY-MM-DD..YYYY-MM-DD against the split manifest's edges)"
+            )
+    for text_key in (
+        "git_sha",
+        "python_version",
+        "sklearn_version",
+        "training_mask",
+        "target",
+        "prediction_clip",
+    ):
+        if not isinstance(payload[text_key], str):
+            raise ContractError(f"{name}: {text_key} must be a string")
+    feature_columns = payload["feature_columns"]
+    if (
+        not isinstance(feature_columns, list)
+        or len(feature_columns) != 23
+        or len(set(feature_columns)) != 23
+    ):
+        raise ContractError(f"{name}: feature_columns must list 23 unique names")
+    folds = payload["folds"]
+    if not isinstance(folds, list) or len(folds) != 3:
+        raise ContractError(f"{name}: folds must hold the 3 pinned windows")
+    for index, (fold, origin, start, end) in enumerate(FOLD_TABLE_PINS):
+        block = folds[index]
+        pinned = [fold, origin, start, end, FOLD_ROWS]
+        if not isinstance(block, dict) or list(block) != [
+            "fold",
+            "origin",
+            "window_start",
+            "window_end",
+            "n_rows",
+        ]:
+            raise ContractError(
+                f"{name}: folds[{index}] keys must be "
+                "fold/origin/window_start/window_end/n_rows"
+            )
+        fold_rows = block["n_rows"]
+        if isinstance(fold_rows, bool) or not isinstance(fold_rows, int):
+            raise ContractError(
+                f"{name}: folds[{index}] n_rows must be an int, got {fold_rows!r}"
+            )
+        if [
+            block["fold"],
+            block["origin"],
+            block["window_start"],
+            block["window_end"],
+            block["n_rows"],
+        ] != pinned:
+            raise ContractError(
+                f"{name}: folds[{index}] {block} != the pinned window {pinned}"
+            )
+    if not isinstance(payload["notes"], list) or not all(
+        isinstance(note, str) for note in payload["notes"]
+    ):
+        raise ContractError(f"{name}: notes must be a list of strings")
+    models = payload["models"]
+    if not isinstance(models, list) or len(models) != 5:
+        raise ContractError(f"{name}: models must hold the 5 tiers")
+    for index, entry in enumerate(models):
+        if not isinstance(entry, dict):
+            raise ContractError(
+                f"{name}: model {index} is not a dict, got {type(entry).__name__}"
+            )
+        label = f"{name}: model {index} ({entry.get('name')!r} {entry.get('kind')!r})"
+        if list(entry) != list(_CLASSICAL_MODEL_KEYS):
+            measured = list(entry)
+            raise ContractError(
+                f"{label}: per-model keys {measured} != pinned "
+                f"{list(_CLASSICAL_MODEL_KEYS)}; pinned order is enforced"
+            )
+        if entry["kind"] not in ("baseline", "classical_ml"):
+            raise ContractError(f"{label}: kind must be baseline or classical_ml")
+        if not isinstance(entry["hyperparameters"], dict):
+            raise ContractError(f"{label}: hyperparameters must be an object")
+        seeds = entry["seeds"]
+        if not isinstance(seeds, dict) or not all(
+            isinstance(seed_key, str) for seed_key in seeds
+        ):
+            raise ContractError(f"{label}: seeds must be an object with string keys")
+        for seed_key, seed_value in seeds.items():
+            is_text = isinstance(seed_value, str) and seed_value.strip() != ""
+            is_seed_int = (
+                isinstance(seed_value, int)
+                and not isinstance(seed_value, bool)
+                and seed_value >= 0
+            )
+            if not (is_text or is_seed_int):
+                raise ContractError(
+                    f"{label}: seeds {seed_key!r} must be an int >= 0 or a "
+                    f"non-empty string, got {seed_value!r}"
+                )
+        if not isinstance(entry["tuning"], str):
+            raise ContractError(f"{label}: tuning must be a string")
+        christmas = entry["christmas_2016"]
+        if not isinstance(christmas, dict):
+            raise ContractError(
+                f"{label}: christmas_2016 must be an object with exactly "
+                "{'status'} equal to 'freeze-time'"
+            )
+        if list(christmas.keys()) != ["status"]:
+            extra = sorted([k for k in christmas.keys() if k != "status"])
+            raise ContractError(
+                f"{label}: christmas_2016 must carry only 'status'; "
+                f"found extra keys {extra}"
+            )
+        if christmas.get("status") != "freeze-time":
+            raise ContractError(
+                f"{label}: christmas_2016 must carry status 'freeze-time' "
+                "(S1 scores that slice at freeze, never in the artifact)"
+            )
+        metrics = entry["fold_metrics"]
+        if not isinstance(metrics, list) or len(metrics) != 3:
+            raise ContractError(f"{label}: fold_metrics must hold 3 folds")
+        for fold_index, fold_row in enumerate(metrics):
+            block = _assert_score_block(
+                f"{label} fold {fold_index + 1}", fold_row, head=("fold",)
+            )
+            if block["fold"] != fold_index + 1 or block["n_rows"] != FOLD_ROWS:
+                raise ContractError(
+                    f"{label}: fold_metrics[{fold_index}] must be fold "
+                    f"{fold_index + 1} with n_rows {FOLD_ROWS}"
+                )
+        pooled = _assert_score_block(f"{label} pooled", entry["pooled"])
+        if pooled["n_rows"] != POOLED_FOLD_ROWS:
+            raise ContractError(
+                f"{label}: pooled n_rows {pooled['n_rows']} != {POOLED_FOLD_ROWS}"
+            )
+
+
+_DEEP_REQUIRED = (
+    "schema_version",
+    "status",
+    "track",
+    "generated_at",
+    "git_sha",
+    "data_fingerprint",
+    "shared_config",
+    "config_sha256",
+    "tiers",
+    "ablation_2015plus",
+    "comparison",
+    "runtime_tradeoff",
+    "notes",
+)
+_DEEP_TIER_KEYS = (
+    "tier",
+    "architecture",
+    "checkpoint",
+    "checkpoint_bytes",
+    "checkpoint_sha256",
+    "params",
+    "status",
+    "train",
+    "valid",
+    "fold_metrics",
+)
+
+
+def _validate_deep_artifact(payload: dict[str, Any]) -> None:
+    """S4's 3-tier deep artifact: required keys, pinned tier order."""
+    name = "artifacts/deep_results.json"
+    missing = [k for k in _DEEP_REQUIRED if k not in payload]
+    if missing:
+        raise ContractError(f"{name}: missing top-level keys {missing}")
+    if not isinstance(payload["schema_version"], str):
+        raise ContractError(f"{name}: schema_version must be a string")
+    if payload["status"] not in ("partial", "complete"):
+        raise ContractError(
+            f"{name}: status {payload['status']!r} must be partial or complete"
+        )
+    if payload["track"] != "S4":
+        raise ContractError(f"{name}: track must be S4")
+    if not isinstance(payload["git_sha"], str) or not isinstance(
+        payload["generated_at"], str
+    ):
+        raise ContractError(f"{name}: git_sha/generated_at must be strings")
+    for object_key in (
+        "data_fingerprint",
+        "shared_config",
+        "ablation_2015plus",
+        "runtime_tradeoff",
+    ):
+        if not isinstance(payload[object_key], dict):
+            raise ContractError(f"{name}: {object_key} must be an object")
+    if not isinstance(payload["config_sha256"], str):
+        raise ContractError(f"{name}: config_sha256 must be a string")
+    comparison = payload["comparison"]
+    if not isinstance(comparison, dict) or comparison.get("status") not in (
+        "ok",
+        "pending_s3",
+        "schema_mismatch",
+    ):
+        raise ContractError(
+            f"{name}: comparison.status must be ok / pending_s3 / schema_mismatch"
+        )
+    if not isinstance(payload["notes"], list) or not all(
+        isinstance(note, str) for note in payload["notes"]
+    ):
+        raise ContractError(f"{name}: notes must be a list of strings")
+    tiers = payload["tiers"]
+    if not isinstance(tiers, list) or len(tiers) != 3:
+        raise ContractError(f"{name}: tiers must hold the 3 architectures")
+    for index, entry in enumerate(tiers):
+        if not isinstance(entry, dict):
+            raise ContractError(
+                f"{name}: tier {index} is not a dict, got {type(entry).__name__}"
+            )
+        tie_label = entry.get("tier")
+        label = f"{name}: tier {index} ({tie_label!r})"
+        if list(entry) != list(_DEEP_TIER_KEYS):
+            measured = list(entry)
+            raise ContractError(
+                f"{label}: per-tier keys {measured} != pinned "
+                f"{list(_DEEP_TIER_KEYS)}; pinned order is enforced"
+            )
+        if not isinstance(entry["checkpoint"], str) or not isinstance(
+            entry["checkpoint_sha256"], str
+        ):
+            raise ContractError(
+                f"{label}: checkpoint and checkpoint_sha256 must be strings"
+            )
+        for int_key in ("checkpoint_bytes", "params"):
+            count = entry[int_key]
+            if isinstance(count, bool) or not isinstance(count, int):
+                raise ContractError(f"{label}: {int_key} must be an int")
+        tier_status = entry.get("status")
+        if not isinstance(tier_status, str) or tier_status == "":
+            raise ContractError(f"{label}: status must be a non-empty string")
+        if not isinstance(entry["train"], dict):
+            raise ContractError(f"{label}: train must be an object")
+        valid_block = entry["valid"]
+        if not isinstance(valid_block, dict):
+            raise ContractError(f"{label}: valid must be an object")
+        valid_rows = valid_block.get("n_rows")
+        if isinstance(valid_rows, bool) or not isinstance(valid_rows, int):
+            raise ContractError(
+                f"{label}: valid.n_rows must be an int, got {valid_rows!r}"
+            )
+        if valid_rows != 299376:
+            raise ContractError(
+                f"{label}: valid.n_rows must be the full valid 299,376 rows, "
+                f"got {valid_rows!r}"
+            )
+        if "n_active" not in valid_block:
+            raise ContractError(f"{label}: valid.n_active is required")
+        n_active = valid_block["n_active"]
+        if isinstance(n_active, bool) or not isinstance(n_active, int) or n_active < 0:
+            raise ContractError(
+                f"{label}: valid.n_active must be an int >= 0, got {n_active!r}"
+            )
+        if "inference_seconds" not in valid_block:
+            raise ContractError(f"{label}: valid.inference_seconds is required")
+        inference_seconds = valid_block["inference_seconds"]
+        if isinstance(inference_seconds, bool) or not isinstance(
+            inference_seconds, (int, float)
+        ):
+            raise ContractError(
+                f"{label}: valid.inference_seconds must be an int or float >= 0, "
+                f"got {inference_seconds!r}"
+            )
+        try:
+            seconds_value = float(inference_seconds)
+        except (ValueError, TypeError, OverflowError) as error:
+            raise ContractError(
+                f"{label}: inference_seconds {inference_seconds!r} is out of "
+                "representable range"
+            ) from error
+        if not math.isfinite(seconds_value) or seconds_value < 0:
+            raise ContractError(
+                f"{label}: valid.inference_seconds must be finite and >= 0, "
+                f"got {inference_seconds!r}"
+            )
+        per_horizon = valid_block.get("per_horizon_rmsle")
+        if not isinstance(per_horizon, list) or len(per_horizon) != 16:
+            raise ContractError(
+                f"{label}: per_horizon_rmsle must hold the 16 horizon values"
+            )
+        for horizon_index, horizon_value in enumerate(per_horizon):
+            if isinstance(horizon_value, bool) or not isinstance(
+                horizon_value, (int, float)
+            ):
+                raise ContractError(
+                    f"{label}: per_horizon_rmsle[{horizon_index}] must be a "
+                    f"number, got {horizon_value!r}"
+                )
+            try:
+                horizon_number = float(horizon_value)
+            except OverflowError as error:
+                raise ContractError(
+                    f"{label}: per_horizon_rmsle[{horizon_index}] "
+                    f"{horizon_value!r} is out of representable range"
+                ) from error
+            if not math.isfinite(horizon_number) or horizon_number < 0.0:
+                raise ContractError(
+                    f"{label}: per_horizon_rmsle[{horizon_index}] must be a "
+                    f"finite non-negative number, got {horizon_value!r}"
+                )
+        for slice_key in ("full_grid", "active_slice"):
+            slice_block = valid_block.get(slice_key)
+            if not isinstance(slice_block, dict) or not all(
+                key in slice_block for key in ("rmsle", "mae", "rmse")
+            ):
+                raise ContractError(
+                    f"{label}: valid.{slice_key} must carry rmsle/mae/rmse"
+                )
+            for key in ("rmsle", "mae", "rmse"):
+                value = slice_block[key]
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise ContractError(
+                        f"{label}: valid.{slice_key}.{key} must be a finite "
+                        f"non-negative number, got {value!r}"
+                    )
+                try:
+                    slice_number = float(value)
+                except OverflowError as error:
+                    raise ContractError(
+                        f"{label}: valid.{slice_key}.{key} {value!r} is out of "
+                        "representable range"
+                    ) from error
+                if not math.isfinite(slice_number) or slice_number < 0.0:
+                    raise ContractError(
+                        f"{label}: valid.{slice_key}.{key} must be a finite "
+                        f"non-negative number, got {value!r}"
+                    )
+        metrics = entry["fold_metrics"]
+        if not isinstance(metrics, list) or len(metrics) != 3:
+            raise ContractError(f"{label}: fold_metrics must hold 3 folds")
+        for fold_index, fold_row in enumerate(metrics):
+            block = _assert_score_block(f"{label} fold {fold_index + 1}", fold_row)
+            if block["n_rows"] != FOLD_ROWS:
+                raise ContractError(
+                    f"{label}: fold_metrics[{fold_index}] n_rows "
+                    f"{block['n_rows']} != {FOLD_ROWS}"
+                )
+
+
+def _check_registered_artifact(name: str, path: Path) -> tuple[str, dict]:
+    """Schema-gate one registered artifact; returns a PASS blurb and payload.
+
+    Per home: required top-level keys, pinned tier identity and order,
+    3 fold_metrics entries carrying the pinned score schema, finite
+    non-negative metric numbers, fold counts 28,512 (85,536 pooled),
+    and the banned-key scan for the percentage-error token anywhere, plus
+    local_test everywhere and the christmas key on the deep side, and
+    writers must emit the pinned key order.
+    """
+    spec = ARTIFACT_REGISTRY[name]
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise ContractError(f"artifacts/{name} does not parse: {error}") from error
+    if not isinstance(payload, dict):
+        raise ContractError(f"artifacts/{name} is not a JSON object")
+    hits = _banned_keys_hit(name, payload)
+    if hits:
+        raise ContractError(
+            f"artifacts/{name}: banned key(s) {hits}; a model artifact never "
+            "carries percentage-error metrics or local_test content"
+        )
+    if name == "classical_results.json":
+        _validate_classical_artifact(payload)
+    else:
+        _validate_deep_artifact(payload)
+    tiers = payload[spec["tiers_key"]]
+    names = [entry[spec["tier_name_key"]] for entry in tiers]
+    if names != list(spec["model_names"]):
+        raise ContractError(
+            f"artifacts/{name}: tier names {names} != pinned "
+            f"{list(spec['model_names'])}"
+        )
+    blurb = f"{spec['track']} x {spec['model_count']} tiers"
+    return blurb, payload
+
+
+def _freeze_preflight(
+    artifacts_dir: Path,
+) -> tuple[dict[str, Path], list[str]]:
+    """Every freeze refusal gate, in order; opens no split.
+
+    Gate order: FREEZE_RUN=1 -> exactly-one-freeze (a freeze_run = true
+    record refuses any repeat) -> the registry scan (unknown file, zero
+    registered artifacts, partial registry) -> per-artifact schema.
+    Every refusal is a friendly ContractError, never a traceback.
+    """
+    if os.environ.get("FREEZE_RUN") != "1":
+        raise ContractError(
+            "freeze refused: set FREEZE_RUN=1 and go through the freeze path "
+            "only; local_test is never read ad hoc and never tuned on"
+        )
+    manifest_path = artifacts_dir / "run_manifest.json"
+    records = list(read_run_manifest(manifest_path)) if manifest_path.exists() else []
+    if any(record["freeze_run"] is True for record in records):
+        raise ContractError(
+            "freeze refused: run_manifest.json already carries "
+            "freeze_run = true; redoing a freeze takes a chat-noted "
+            "decision, never silence"
+        )
+    registered = _scan_registered_artifacts(artifacts_dir)
+    if not registered:
+        raise ContractError(
+            f"freeze refused: no registered model artifacts under "
+            f"{artifacts_dir}; expected all of {sorted(ARTIFACT_REGISTRY)}"
+        )
+    missing = sorted(set(ARTIFACT_REGISTRY) - set(registered))
+    if missing:
+        raise ContractError(
+            f"freeze refused: registry incomplete, missing {missing}; the "
+            f"freeze consumes all {len(ARTIFACT_REGISTRY)} homes or none"
+        )
+    blurbs: list[str] = []
+    deep_payload: Any = None
+    for name, path in sorted(registered.items()):
+        blurb, payload = _check_registered_artifact(name, path)
+        blurbs.append(blurb)
+        if name == "deep_results.json":
+            deep_payload = payload
+    if deep_payload is not None:
+        if isinstance(deep_payload, dict):
+            status = deep_payload.get("status")
+            if status != "complete":
+                raise ContractError(
+                    f"artifacts/deep_results.json: status {status!r} must be "
+                    "complete for freeze"
+                )
+    return registered, blurbs
+
+
+def freeze(artifacts_dir: Path | None = None) -> int:
+    """The canonical freeze entrypoint; one testified pass, never a rehearsal.
+
+    Gates (all friendly refusals): FREEZE_RUN=1; no prior freeze_run =
+    true record; the full registry present and schema-clean; sanctioned
+    per-track entrypoints importable on the merged tree. The gates
+    themselves open no split and never touch local_test. On Day 5
+    morning the canonical sequence runs here: re-verified artifacts,
+    fit_frame = load_frame() masked by fit_rows, predict_frame =
+    valid's 60-day tail followed by local_test, per-tier
+    fit_predict_frozen, the pinned score schema on full-grid,
+    active-slice and the Christmas-2016 slice (1,782 rows),
+    artifacts/freeze_results.json written atomically, then one manifest
+    record stamped freeze_run = true. Any failing phase prints FAIL
+    with the phase named and records the attempt (freeze_run stays
+    false on failures), returning 1.
+    """
+    started = time.perf_counter()
+    directory = Path(artifacts_dir) if artifacts_dir is not None else ARTIFACTS_DIR
+
+    def _record_attempt(phase: str, reasons: list[str]) -> None:
+        elapsed = round(time.perf_counter() - started, 3)
+        try:
+            write_run_manifest(
+                "contract.py --freeze",
+                exit_status=1,
+                elapsed_seconds=elapsed,
+                arguments={"freeze": "1"},
+                notes=[
+                    *_dirty_notes(),
+                    f"failed phase: {phase}",
+                    *reasons,
+                ],
+                artifacts_dir=directory,
+            )
+        except Exception as audit_error:
+            print(f"FAIL {audit_error!r}")
+            return
+
+    try:
+        try:
+            _freeze_preflight(directory)
+        except ContractError as error:
+            phase = "pre-flight gates"
+            reasons = [str(error)]
+            print(f"FAIL freeze, {phase}: {error}")
+            _record_attempt(phase, reasons)
+            return 1
+
+        phase = "sanctioned entrypoints"
+        try:
+            for artifact_name, module_name in KIND_BY_ARTIFACT.items():
+                try:
+                    module = importlib.import_module(module_name)
+                except Exception as error:
+                    raise ContractError(
+                        f"sanctioned entrypoint {module_name} for {artifact_name} "
+                        f"failed to import: {error}"
+                    ) from error
+                symbol = getattr(module, "fit_predict_frozen", None)
+                if not callable(symbol):
+                    raise ContractError(
+                        f"sanctioned entrypoint {module_name} for {artifact_name} "
+                        "missing symbol fit_predict_frozen"
+                    )
+        except ContractError as error:
+            reasons = [f"not merged yet - {error}"]
+            print(f"FAIL freeze, {phase}: {'; '.join(reasons)}")
+            _record_attempt(phase, reasons)
+            return 1
+
+        phase = "canonical sequence"
+        reasons = [
+            "the Day-5 execution body lands at the Day-4 rehearsal review; "
+            "gates are green, no local_test was opened, nothing scored"
+        ]
+        print(f"FAIL freeze, {phase}: {'; '.join(reasons)}")
+        _record_attempt(phase, reasons)
+        return 1
+    except SystemExit:
+        raise
+    except Exception as error:
+        elapsed = round(time.perf_counter() - started, 3)
+        phase = "freeze"
+        reasons = [f"unexpected failure: {error!r}"]
+        print(f"FAIL freeze, {phase}: {'; '.join(reasons)}")
+        try:
+            write_run_manifest(
+                "contract.py --freeze",
+                exit_status=1,
+                elapsed_seconds=elapsed,
+                arguments={"freeze": "1"},
+                notes=[
+                    *_dirty_notes(),
+                    f"failed phase: {phase}",
+                    *reasons,
+                ],
+                artifacts_dir=directory,
+            )
+        except Exception as audit_error:
+            print(f"FAIL {audit_error!r}")
+        return 1
+
+
 def _check_manifest_metadata() -> None:
     """Validate split manifest metadata."""
     manifest = _load_manifest()
@@ -746,11 +2132,7 @@ def _check_manifest_metadata() -> None:
                 f"{RUN_MAIN_POINTER}"
             )
     print("PASS manifest: rows 2,106,324 / 299,376 / 602,316 (total 3,008,016)")
-    pinned_bounds = {
-        "train": "2016-03-27",
-        "valid": "2016-09-11",
-        "local_test": "2017-08-15",
-    }
+    pinned_bounds = SPLIT_FRAME_ENDS
     for split, end in pinned_bounds.items():
         measured_end = manifest["bounds"][split][1]
         if measured_end != end:
@@ -758,7 +2140,10 @@ def _check_manifest_metadata() -> None:
                 f"manifest {split} end date {measured_end!r} != pinned {end!r}; "
                 f"{RUN_MAIN_POINTER}"
             )
-    print("PASS manifest: bounds end 2016-03-27 / 2016-09-11 / 2017-08-15")
+    print(
+        "PASS manifest: bounds end "
+        + " / ".join(pinned_bounds[split] for split in pinned_bounds)
+    )
     closures = {"train": 5346, "valid": 0, "local_test": 1782}
     grid_fills = manifest["why"]["grid_fill_rows"]
     for split, count in closures.items():
@@ -780,11 +2165,7 @@ def _check_manifest_metadata() -> None:
             f"{RUN_MAIN_POINTER}"
         )
     print("PASS manifest: 26 columns")
-    pinned_starts = {
-        "train": "2013-01-01",
-        "valid": "2016-03-28",
-        "local_test": "2016-09-12",
-    }
+    pinned_starts = SPLIT_FRAME_STARTS
     for split, start in pinned_starts.items():
         measured_start = manifest["bounds"][split][0]
         if measured_start != start:
@@ -792,7 +2173,10 @@ def _check_manifest_metadata() -> None:
                 f"manifest {split} start date {measured_start!r} != pinned {start!r}; "
                 f"{RUN_MAIN_POINTER}"
             )
-    print("PASS manifest: bounds start 2013-01-01 / 2016-03-28 / 2016-09-12")
+    print(
+        "PASS manifest: bounds start "
+        + " / ".join(pinned_starts[split] for split in pinned_starts)
+    )
     total_measured = sum(manifest["rows"][split] for split in SPLIT_NAMES)
     if manifest["total"] != 3008016 or total_measured != 3008016:
         raise ContractError(
@@ -808,6 +2192,42 @@ def _check_manifest_metadata() -> None:
     print(
         "PASS manifest: total 3,008,016 = sum(rows); "
         "FRAME_ROWS 2,405,700 = train + valid"
+    )
+
+
+def _check_row_integrity(splits: dict[str, pd.DataFrame]) -> None:
+    """Duplicate keys, duplicate real ids, and negative sales: all zero.
+
+    Closes the Day-2 deferral recorded in the module docstring. On train
+    and valid, (store_nbr, family, date) and the real-id domain (the
+    sentinel id=NaN closure fills excluded) must each be unique, and
+    sales must stay non-negative everywhere on truth (the scorer clips
+    predictions, never truth). local_test is not loaded here the freeze
+    path owns the only read.
+    """
+    for name, data in splits.items():
+        doubled = int(
+            data.duplicated(subset=["store_nbr", "family", "date"], keep=False).sum()
+        )
+        if doubled:
+            raise ContractError(
+                f"{name}: {doubled} rows carry a duplicated "
+                f"(store_nbr, family, date) key; {RUN_MAIN_POINTER}"
+            )
+        real_ids = data.loc[data["id"].notna(), "id"]
+        id_doubled = int(real_ids.duplicated().sum())
+        if id_doubled:
+            raise ContractError(
+                f"{name}: {id_doubled} duplicated values in the real-id domain"
+            )
+        negative = int((data["sales"] < 0).sum())
+        if negative:
+            raise ContractError(
+                f"{name}: {negative} rows carry negative sales on truth"
+            )
+    print(
+        "PASS data: duplicate (store, family, date) keys / duplicate real ids / "
+        "negative sales all zero on train+valid"
     )
 
 
@@ -862,6 +2282,7 @@ def _check_data_contract() -> None:
             f"pre-open {preopen_count:,} | fit drop {fit_drop:,} (all fills kept, "
             "every drop all-zero)"
         )
+    _check_row_integrity(splits)
     zeros = int((splits["train"]["sales"] == 0).sum()) + int(
         (splits["valid"]["sales"] == 0).sum()
     )
@@ -1297,13 +2718,686 @@ def _check_scorer() -> None:
     print(f"PASS score: all {len(cases)} guard cases refuse with a friendly error")
 
 
+def _check_folds() -> None:
+    """Day-2 block: the pinned rolling-origin table and its pooling."""
+    table = folds_table()
+    pinned_columns = ["fold", "origin", "window_start", "window_end", "n_rows"]
+    if list(table.columns) != pinned_columns:
+        raise ContractError(
+            f"folds_table columns {list(table.columns)} != pinned {pinned_columns}"
+        )
+    for index, (fold, origin, start, end) in enumerate(FOLD_TABLE_PINS):
+        row = table.iloc[index]
+        got = (
+            int(row["fold"]),
+            str(row["origin"]),
+            str(row["window_start"]),
+            str(row["window_end"]),
+            int(row["n_rows"]),
+        )
+        if got != (fold, origin, start, end, FOLD_ROWS):
+            raise ContractError(
+                f"folds_table row {index} {got} != pinned "
+                f"{(fold, origin, start, end, FOLD_ROWS)}"
+            )
+    pooled = int(table["n_rows"].sum())
+    if pooled != POOLED_FOLD_ROWS:
+        raise ContractError(
+            f"pooled fold rows {pooled} != the pinned {POOLED_FOLD_ROWS}"
+        )
+    alias_is_same = make_folds is folds_table
+    if alias_is_same is not True:
+        raise ContractError(
+            "make_folds is not folds_table; the alias must be the same callable"
+        )
+    valid = load_split("valid")
+    valid_start = valid["date"].min()
+    valid_end = valid["date"].max()
+    for fold, origin, start, end in FOLD_TABLE_PINS:
+        w_start = pd.Timestamp(start)
+        w_end = pd.Timestamp(end)
+        if w_start < valid_start or w_end > valid_end:
+            raise ContractError(
+                f"fold {fold}: origin {origin} window {start}..{end} "
+                "lies outside valid date span"
+            )
+        dates = valid["date"]
+        mask = (dates >= w_start) & (dates <= w_end)
+        count = int(mask.sum())
+        if count != FOLD_ROWS:
+            raise ContractError(
+                f"fold {fold}: window {start}..{end} has {count} rows != {FOLD_ROWS}"
+            )
+        if (valid.loc[mask, "earthquake_decay"] > 0).any():
+            raise ContractError(
+                f"fold {fold}: earthquake_decay has positive values inside window"
+            )
+    print(
+        "PASS folds: 3 windows (origins 2016-07-25 / 2016-08-10 / 2016-08-26), "
+        "16 days each, 28,512 rows per window measured on valid, "
+        "quake-free and inside valid"
+    )
+    print(
+        f"PASS folds: pooled {POOLED_FOLD_ROWS:,} rows; "
+        "make_folds aliases folds_table (one implementation)"
+    )
+
+
+def _check_manifest_writer() -> None:
+    """Day-2 block: the writer's parse, validate, append and refuse paths."""
+    path = ARTIFACTS_DIR / "run_manifest.json"
+    existing = list(read_run_manifest(path)) if path.exists() else []
+    count = len(existing)
+    print(f"PASS manifest: real manifest read once ({count} record(s)), schema-valid")
+    with tempfile.TemporaryDirectory() as tmp_name:
+        tmp_dir = Path(tmp_name)
+        tmp_manifest = tmp_dir / "run_manifest.json"
+        created = datetime.fromtimestamp(time.time() - 5.0, UTC).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        starter = (
+            json.dumps(
+                [
+                    {
+                        "created": created,
+                        "git_sha": "b" * 40,
+                        "command": "fixture",
+                        "exit": 0,
+                        "exit_ok": True,
+                        "versions": {
+                            "python": "3.13.0",
+                            "uv": "0.10.0",
+                            "pandas": "2.2.0",
+                            "numpy": "2.1.0",
+                        },
+                        "elapsed_seconds": 0.0,
+                        "arguments": {},
+                        "status": "PASS",
+                        "freeze_run": False,
+                        "notes": [],
+                    }
+                ],
+                indent=2,
+            )
+            + "\n"
+        )
+        tmp_manifest.write_text(starter, encoding="utf-8")
+        write_run_manifest("contract.py --check", artifacts_dir=tmp_dir)
+        stored = list(read_run_manifest(tmp_manifest))
+        record = stored[-1]
+        if record["command"] != "contract.py --check" or record["status"] != "PASS":
+            raise ContractError(f"appended manifest record drifted: {record!r}")
+        if stored[-1] != record or len(stored) != 2:
+            raise ContractError(
+                "throwaway manifest append did not land last and validate"
+            )
+        mode = tmp_manifest.stat().st_mode & 0o777
+        if mode != 0o644:
+            raise ContractError(
+                f"run_manifest.json mode {oct(mode)} != 0o644; the atomic "
+                "replace must leave a world-readable manifest"
+            )
+        lock_path = tmp_dir / "run_manifest.json.lock"
+        if not lock_path.is_file():
+            raise ContractError(
+                "write_run_manifest did not leave the run_manifest.json.lock "
+                "furniture in place"
+            )
+        lock_inode = lock_path.stat().st_ino
+        garbage = "   not a pid at all "
+        lock_path.write_text(garbage, encoding="utf-8")
+        write_run_manifest("contract.py --check", artifacts_dir=tmp_dir)
+        reopened = list(read_run_manifest(tmp_manifest))
+        if len(reopened) != 3:
+            raise ContractError("garbage-lock write did not append exactly one record")
+        if lock_path.read_text(encoding="utf-8") != str(os.getpid()):
+            raise ContractError(
+                "write_run_manifest left foreign content in run_manifest.json.lock"
+            )
+        busy_fd = os.open(str(lock_path), os.O_RDWR)
+        try:
+            fcntl.flock(busy_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            busy_started = time.monotonic()
+            try:
+                write_run_manifest("contract.py --check", artifacts_dir=tmp_dir)
+            except ContractError as error:
+                if "another writer holds the lock" not in str(error):
+                    raise ContractError(
+                        f"lock-busy writer refused with the wrong lead: {error}"
+                    ) from error
+            else:
+                raise ContractError("lock-busy writer accepted a held lock")
+            busy_waited = time.monotonic() - busy_started
+            if busy_waited < MANIFEST_LOCK_WAIT_SECONDS - 0.2:
+                raise ContractError(
+                    f"the busy-lock wait lasted {busy_waited:.2f}s, shorter than "
+                    f"the pinned {MANIFEST_LOCK_WAIT_SECONDS}s"
+                )
+            if len(list(read_run_manifest(tmp_manifest))) != 3:
+                raise ContractError("lock-busy writer appended a record anyway")
+        finally:
+            try:
+                fcntl.flock(busy_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(busy_fd)
+        write_run_manifest("contract.py --check", artifacts_dir=tmp_dir)
+        reopened = list(read_run_manifest(tmp_manifest))
+        if len(reopened) != 4:
+            raise ContractError("post-lock write did not append exactly one record")
+        if not lock_path.is_file():
+            raise ContractError(
+                "write_run_manifest dropped the run_manifest.json.lock furniture"
+            )
+        if lock_path.stat().st_ino != lock_inode:
+            raise ContractError(
+                "the run_manifest.json.lock furniture was replaced instead of reused"
+            )
+        rejections = (
+            ("a non-finite elapsed_seconds", {"elapsed_seconds": math.inf}, "finite"),
+            ("a negative elapsed_seconds", {"elapsed_seconds": -1.0}, "finite"),
+            ("a boolean elapsed_seconds", {"elapsed_seconds": True}, "finite"),
+            (
+                "a non-text arguments value",
+                {"arguments": {"k": 5}},
+                "value must be a string",
+            ),
+            (
+                "a non-text arguments key",
+                {"arguments": {7: "v"}},
+                "keys must be strings",
+            ),
+        )
+        for label, kwargs, needle in rejections:
+            try:
+                write_run_manifest(
+                    "contract.py --check", artifacts_dir=tmp_dir, **kwargs
+                )
+            except ContractError as error:
+                if needle not in str(error):
+                    raise ContractError(
+                        f"the writer refused {label} with the wrong lead: {error}"
+                    ) from error
+            else:
+                raise ContractError(f"the writer accepted {label}")
+        if len(list(read_run_manifest(tmp_manifest))) != 4:
+            raise ContractError("a refused writer call appended a record anyway")
+        before_rollback = tmp_manifest.read_bytes()
+        real_replace = os.replace
+        replace_calls: list[tuple[Any, Any]] = []
+
+        def failing_replace(src, dst, *args, **kwargs):
+            replace_calls.append((src, dst))
+            if len(replace_calls) == 1:
+                raise OSError("injected replace failure")
+            return real_replace(src, dst, *args, **kwargs)
+
+        with mock.patch.object(os, "replace", new=failing_replace):
+            try:
+                write_run_manifest("contract.py --check", artifacts_dir=tmp_dir)
+            except ContractError:
+                pass
+            else:
+                raise ContractError("a failed replace did not refuse the write")
+        if tmp_manifest.read_bytes() != before_rollback:
+            raise ContractError("a failed replace did not restore the manifest")
+        if len(list(read_run_manifest(tmp_manifest))) != 4:
+            raise ContractError("a failed replace appended a record anyway")
+    print(
+        "PASS manifest: write_run_manifest exercised end-to-end against "
+        "throwaway dir (appended record last and validates)"
+    )
+    print(
+        "PASS manifest: mode 0o644, lock furniture persists (same inode), a "
+        "garbage lock is reclaimed, and a busy flock refuses after the "
+        "pinned wait with 'another writer holds the lock'"
+    )
+    print(
+        "PASS manifest: the writer refuses a non-finite, negative or boolean "
+        "elapsed_seconds and a non-text arguments key or value, and a failed "
+        "replace restores the manifest untouched"
+    )
+
+
+def _check_freeze_gates() -> None:
+    """Day-2 block: the refusal gates, against throwaway dirs.
+
+    Seven friendly refusals - unset FREEZE_RUN flag, a second freeze on a
+    freeze_run = true manifest, one unregistered artifact file, a nested
+    copy of a registered name, zero registered artifacts, a partial
+    registry, a naive manifest timestamp - exercised in temp dirs so the
+    real artifacts directory stays untouched. No gate opens a split;
+    local_test is never read here.
+    """
+    saved_flag = os.environ.pop("FREEZE_RUN", None)
+    try:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            base = Path(tmp_name)
+
+            def refuses(call: Callable[[], Any], needle: str, label: str) -> None:
+                try:
+                    call()
+                except ContractError as error:
+                    if needle not in str(error):
+                        raise ContractError(
+                            f"freeze gate {label}: refused with the wrong lead: {error}"
+                        ) from error
+                    return
+                raise ContractError(f"freeze gate {label}: accepted a forbidden call")
+
+            empty = base / "empty"
+            empty.mkdir()
+            refuses(
+                lambda: _freeze_preflight(empty),
+                "FREEZE_RUN=1",
+                "flag",
+            )
+            os.environ["FREEZE_RUN"] = "1"
+            refuses(
+                lambda: _freeze_preflight(empty),
+                "no registered model artifacts",
+                "registry-zero",
+            )
+            stray = base / "stray"
+            stray.mkdir()
+            (stray / "other_results.json").write_text("{}", encoding="utf-8")
+            refuses(
+                lambda: _freeze_preflight(stray),
+                "unregistered file",
+                "registry-unknown",
+            )
+            partial = base / "partial"
+            partial.mkdir()
+            (partial / "classical_results.json").write_text("{}", encoding="utf-8")
+            refuses(
+                lambda: _freeze_preflight(partial),
+                "registry incomplete",
+                "registry-partial",
+            )
+            nested = base / "nested"
+            nested.mkdir()
+            (nested / "backup").mkdir()
+            (nested / "backup" / "classical_results.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            refuses(
+                lambda: _freeze_preflight(nested),
+                "unregistered file",
+                "registry-nested",
+            )
+            furnished = base / "furnished"
+            furnished.mkdir()
+            freeze_entry = {
+                "created": "2026-11-10T00:00:00Z",
+                "git_sha": "0" * 40,
+                "command": "contract.py --freeze",
+                "exit": 0,
+                "exit_ok": True,
+                "versions": dict.fromkeys(VERSION_KEYS, "x"),
+                "elapsed_seconds": 0.0,
+                "arguments": {"freeze": "1"},
+                "status": "PASS",
+                "freeze_run": True,
+                "notes": [],
+            }
+            (furnished / "run_manifest.json").write_text(
+                json.dumps([freeze_entry]), encoding="utf-8"
+            )
+            refuses(
+                lambda: _freeze_preflight(furnished),
+                "already carries",
+                "second-freeze",
+            )
+            dir_furnished_clean = base / "furnished_clean"
+            dir_furnished_clean.mkdir()
+            artifacts_dir_clean = dir_furnished_clean / "artifacts"
+            artifacts_dir_clean.mkdir()
+            record = {
+                "created": "2026-11-10T00:00:00Z",
+                "git_sha": "b" * 40,
+                "command": "fixture",
+                "exit": 0,
+                "exit_ok": True,
+                "versions": {
+                    "python": "3.13.0",
+                    "uv": "0.10.0",
+                    "pandas": "2.2.0",
+                    "numpy": "2.1.0",
+                },
+                "elapsed_seconds": 0.0,
+                "arguments": {},
+                "status": "PASS",
+                "freeze_run": False,
+                "notes": [],
+            }
+            (artifacts_dir_clean / "run_manifest.json").write_text(
+                json.dumps([record]), encoding="utf-8"
+            )
+            naive_dir = base / "naive_manifest"
+            naive_dir.mkdir()
+            naive_record = dict(record)
+            naive_record["created"] = "2026-11-10T00:00:00"
+            (naive_dir / "run_manifest.json").write_text(
+                json.dumps([naive_record]), encoding="utf-8"
+            )
+            refuses(
+                lambda: _freeze_preflight(naive_dir),
+                "must carry a timezone",
+                "manifest-naive-created",
+            )
+            fold_m = {
+                "fold": 1,
+                "rmsle": 0.1,
+                "mae": 0.1,
+                "rmse": 0.1,
+                "rmsle_active": 0.2,
+                "mae_active": 0.2,
+                "rmse_active": 0.2,
+                "n_rows": 28512,
+                "n_rows_active": 20000,
+            }
+            fold_m2 = dict(fold_m)
+            fold_m2["fold"] = 2
+            fold_m3 = dict(fold_m)
+            fold_m3["fold"] = 3
+            pooled_m = {
+                "rmsle": 0.15,
+                "mae": 0.15,
+                "rmse": 0.15,
+                "rmsle_active": 0.25,
+                "mae_active": 0.25,
+                "rmse_active": 0.25,
+                "n_rows": 85536,
+                "n_rows_active": 60000,
+            }
+            ch = {"status": "freeze-time"}
+
+            def cmod(name, kind):
+                return {
+                    "name": name,
+                    "kind": kind,
+                    "target": "sales",
+                    "hyperparameters": {},
+                    "fold_metrics": [fold_m, fold_m2, fold_m3],
+                    "pooled": pooled_m,
+                    "seeds": {},
+                    "tuning": "none",
+                    "christmas_2016": ch,
+                }
+
+            classical = {
+                "schema_version": 1,
+                "git_sha": "a" * 40,
+                "python_version": "3.13.0",
+                "sklearn_version": "1.5.1",
+                "split_bounds": {
+                    "train": "2013-01-01..2016-03-27",
+                    "valid": "2016-03-28..2016-09-11",
+                },
+                "training_mask": "fit_rows",
+                "target": "sales",
+                "prediction_clip": "0",
+                "feature_columns": [f"f{i:02d}" for i in range(1, 24)],
+                "folds": [
+                    {
+                        "fold": 1,
+                        "origin": "2016-07-25",
+                        "window_start": "2016-07-26",
+                        "window_end": "2016-08-10",
+                        "n_rows": 28512,
+                    },
+                    {
+                        "fold": 2,
+                        "origin": "2016-08-10",
+                        "window_start": "2016-08-11",
+                        "window_end": "2016-08-26",
+                        "n_rows": 28512,
+                    },
+                    {
+                        "fold": 3,
+                        "origin": "2016-08-26",
+                        "window_start": "2016-08-27",
+                        "window_end": "2016-09-11",
+                        "n_rows": 28512,
+                    },
+                ],
+                "models": [
+                    cmod("naive", "baseline"),
+                    cmod("seasonal_naive", "baseline"),
+                    cmod("moving_average", "baseline"),
+                    cmod("ridge", "classical_ml"),
+                    cmod("hgb", "classical_ml"),
+                ],
+                "notes": [],
+            }
+            dfold = {
+                "rmsle": 0.3,
+                "mae": 0.3,
+                "rmse": 0.3,
+                "rmsle_active": 0.4,
+                "mae_active": 0.4,
+                "rmse_active": 0.4,
+                "n_rows": 28512,
+                "n_rows_active": 20000,
+            }
+            dgrid = {
+                "rmsle": 0.5,
+                "mae": 0.4,
+                "rmse": 0.6,
+            }
+            dvalid = {
+                "n_rows": 299376,
+                "per_horizon_rmsle": [0.5] * 16,
+                "full_grid": dgrid,
+                "active_slice": dgrid,
+                "n_active": 123456,
+                "inference_seconds": 1.5,
+            }
+
+            def dtier(tier, arch):
+                return {
+                    "tier": tier,
+                    "architecture": arch,
+                    "checkpoint": "",
+                    "checkpoint_bytes": 1024,
+                    "checkpoint_sha256": "e" * 64,
+                    "params": 1000,
+                    "status": "ready",
+                    "train": {},
+                    "valid": dvalid,
+                    "fold_metrics": [dfold, dfold, dfold],
+                }
+
+            deep = {
+                "schema_version": "1.0",
+                "status": "complete",
+                "track": "S4",
+                "generated_at": "2026-11-10T00:00:00Z",
+                "git_sha": "c" * 40,
+                "data_fingerprint": {},
+                "shared_config": {},
+                "config_sha256": "d" * 64,
+                "tiers": [
+                    dtier("deep-rnn", "rnn"),
+                    dtier("deep-lstm", "lstm"),
+                    dtier("deep-gru", "gru"),
+                ],
+                "ablation_2015plus": {},
+                "comparison": {"status": "ok"},
+                "runtime_tradeoff": {},
+                "notes": [],
+            }
+            (artifacts_dir_clean / "classical_results.json").write_text(
+                json.dumps(classical), encoding="utf-8"
+            )
+            (artifacts_dir_clean / "deep_results.json").write_text(
+                json.dumps(deep), encoding="utf-8"
+            )
+            saved_flag2 = os.environ.get("FREEZE_RUN")
+            os.environ["FREEZE_RUN"] = "1"
+            try:
+                registry, blurbs = _freeze_preflight(artifacts_dir_clean)
+                if (
+                    sorted(registry)
+                    != [
+                        "classical_results.json",
+                        "deep_results.json",
+                    ]
+                    or len(blurbs) != 2
+                ):
+                    raise ContractError(
+                        "schema-clean gate did not return paths and blurbs for "
+                        "2 registered artifacts"
+                    )
+                print("PASS freeze: schema-clean gate accepts a well-formed registry")
+            except ContractError as error:
+                raise ContractError(f"schema-clean gate failed: {error}") from error
+            finally:
+                if saved_flag2 is None:
+                    os.environ.pop("FREEZE_RUN", None)
+                else:
+                    os.environ["FREEZE_RUN"] = saved_flag2
+            bounds_cases = (
+                (
+                    "a scalar cut date",
+                    {"train": "2016-03-27", "valid": "2016-03-28..2016-09-11"},
+                    "canonical frame-range text",
+                ),
+                (
+                    "an ISO datetime",
+                    {
+                        "train": "2013-01-01T00:00:00+00:00..2016-03-27",
+                        "valid": "2016-03-28..2016-09-11",
+                    },
+                    "canonical frame-range text",
+                ),
+                (
+                    "a date list",
+                    {
+                        "train": ["2013-01-01", "2016-03-27"],
+                        "valid": "2016-03-28..2016-09-11",
+                    },
+                    "must be a non-empty string",
+                ),
+                (
+                    "a local_test bound",
+                    {
+                        "train": "2013-01-01..2016-03-27",
+                        "valid": "2016-03-28..2016-09-11",
+                        "local_test": "2016-09-12..2017-08-15",
+                    },
+                    "train and valid",
+                ),
+            )
+            for label, bounds, needle in bounds_cases:
+                drifted = copy.deepcopy(classical)
+                drifted["split_bounds"] = bounds
+                try:
+                    _validate_classical_artifact(drifted)
+                except ContractError as error:
+                    if needle not in str(error):
+                        raise ContractError(
+                            f"the split_bounds validator refused {label} with "
+                            f"the wrong lead: {error}"
+                        ) from error
+                else:
+                    raise ContractError(f"the split_bounds validator accepted {label}")
+            seeds_cases = (
+                ("a non-negative int", 7, True),
+                ("non-empty text", "abc", True),
+                ("a negative int", -1, False),
+                ("a boolean", True, False),
+                ("empty text", "", False),
+            )
+            for label, value, accepted in seeds_cases:
+                drifted = copy.deepcopy(classical)
+                drifted["models"][0]["seeds"] = {"seed": value}
+                if accepted:
+                    _validate_classical_artifact(drifted)
+                    continue
+                try:
+                    _validate_classical_artifact(drifted)
+                except ContractError as error:
+                    if "must be an int >= 0 or a non-empty string" not in str(error):
+                        raise ContractError(
+                            f"the seeds validator refused {label} with the "
+                            f"wrong lead: {error}"
+                        ) from error
+                else:
+                    raise ContractError(f"the seeds validator accepted {label}")
+            print(
+                "PASS artifact: split_bounds refuses scalars, ISO datetimes, "
+                "date lists and local_test bounds; seeds accepts a "
+                "non-negative int or non-empty text and refuses the rest"
+            )
+    finally:
+        if saved_flag is None:
+            os.environ.pop("FREEZE_RUN", None)
+        else:
+            os.environ["FREEZE_RUN"] = saved_flag
+    print(
+        "PASS freeze: flag / registry-zero / registry-unknown / "
+        "registry-nested / registry-partial / second-freeze / "
+        "manifest-naive gates all refuse with friendly leads"
+    )
+    print("PASS freeze: gates open no split and never read local_test")
+
+
+def _check_registry() -> None:
+    """Day-2 block: registered homes; strays fail loud, files validate."""
+    directory = ARTIFACTS_DIR
+    if not directory.exists():
+        print(
+            "INFO registry: artifacts/ absent; 2 registered homes pending the "
+            "S3/S4 merges (expected before Day 4)"
+        )
+        return
+    if (directory / "freeze_results.json").is_file():
+        print(
+            "INFO registry: artifacts/freeze_results.json present; expected "
+            "contract furniture (FREEZE-day output), never validated"
+        )
+    registered = _scan_registered_artifacts(directory)
+    if not registered:
+        print(
+            "INFO registry: no registered artifacts present; "
+            "2 registered homes pending the "
+            "S3/S4 merges (expected before Day 4)"
+        )
+        return
+    missing = sorted(set(ARTIFACT_REGISTRY) - set(registered))
+    for name, path in sorted(registered.items()):
+        (blurb, _payload) = _check_registered_artifact(name, path)
+        print(f"PASS registry: {name} schema-clean ({blurb})")
+    if missing:
+        print(f"INFO registry: missing registered file(s) {missing}")
+        return
+    print("PASS registry: all registered artifacts validated")
+
+
 def run_check() -> None:
     """Run all contract verification checks."""
     print("contract.py --check")
     _check_manifest_metadata()
     _check_data_contract()
+    _check_folds()
+    _check_freeze_gates()
+    _check_registry()
     _check_scorer()
+    _check_manifest_writer()
     print("contract.py --check: PASS")
+
+
+def _command_label(argv: list[str] | None) -> str:
+    """The invocation's label, from the argv that actually arrived.
+
+    A refused parse is recorded under the tokens it was given
+    ("contract.py --bogus"), never under a label borrowed from another
+    mode.
+    """
+    tokens = list(argv) if argv is not None else list(sys.argv[1:])
+    if not tokens:
+        return "contract.py (no arguments)"
+    return " ".join(["contract.py", *tokens])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1314,16 +3408,105 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--check", action="store_true", help="run the self-audit blocks"
     )
-    args = parser.parse_args(argv)
+    parser.add_argument(
+        "--freeze",
+        action="store_true",
+        help="run the freeze path (gates: FREEZE_RUN=1, no prior freeze)",
+    )
+    start = time.monotonic()
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as error:
+        code = error.code if isinstance(error.code, int) else 2
+        if code != 0:
+            try:
+                write_run_manifest(
+                    _command_label(argv),
+                    exit_status=code,
+                    elapsed_seconds=time.monotonic() - start,
+                    notes=[
+                        *_dirty_notes(),
+                        f"argument parsing refused with exit {code}",
+                    ],
+                )
+            except Exception as audit_error:
+                print(f"FAIL {audit_error!r}")
+        raise
+    if args.check and args.freeze:
+        print("contract: pass --check or --freeze, not both")
+        try:
+            write_run_manifest(
+                _command_label(argv),
+                exit_status=2,
+                elapsed_seconds=time.monotonic() - start,
+                freeze_run=False,
+                notes=[
+                    *_dirty_notes(),
+                    "refused: --check and --freeze are mutually exclusive",
+                ],
+            )
+        except Exception as audit_error:
+            print(f"FAIL {audit_error!r}")
+        return 2
     if args.check:
+        notes: list[str] = _dirty_notes()
         try:
             run_check()
         except (ContractError, OSError) as error:
+            elapsed = time.monotonic() - start
+            try:
+                write_run_manifest(
+                    "contract.py --check",
+                    exit_status=1,
+                    elapsed_seconds=elapsed,
+                    notes=[*notes, str(error)],
+                )
+            except Exception as audit_error:
+                print(f"FAIL {audit_error!r}")
             print(f"FAIL {error}")
             return 1
+        except Exception as error:
+            elapsed = time.monotonic() - start
+            try:
+                write_run_manifest(
+                    "contract.py --check",
+                    exit_status=1,
+                    elapsed_seconds=elapsed,
+                    notes=[*notes, repr(error)],
+                )
+            except Exception as audit_error:
+                print(f"FAIL {audit_error!r}")
+            print(f"FAIL {error!r}")
+            return 1
+        elapsed = time.monotonic() - start
+        try:
+            write_run_manifest(
+                "contract.py --check", elapsed_seconds=elapsed, notes=notes
+            )
+        except Exception as error:
+            print(f"FAIL {error!r}")
+            return 1
         return 0
+    if args.freeze:
+        try:
+            return freeze()
+        except (ContractError, OSError) as error:
+            print(f"FAIL {error}")
+            return 1
+    try:
+        write_run_manifest(
+            "contract.py (no arguments)",
+            exit_status=2,
+            elapsed_seconds=time.monotonic() - start,
+            notes=[
+                *_dirty_notes(),
+                "refused: choose --check or --freeze",
+            ],
+        )
+    except Exception as audit_error:
+        print(f"FAIL {audit_error!r}")
     parser.print_usage()
-    print("\nPass --check to run contract verification.")
+    print("\nPass --check (verification) or --freeze (freeze path).")
     return 2
 
 
