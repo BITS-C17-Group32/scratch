@@ -140,8 +140,14 @@ def train_one(
         )
         score_dt = pd.Timestamp(valid_df["date"].min())
 
+    _g = torch.Generator()
+    _g.manual_seed(cfg.seed)
     train_loader = DataLoader(
-        train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers
+        train_ds,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        generator=_g,
     )
 
     cat_levels = {c: len(m) for c, m in cat_maps.items()}
@@ -171,9 +177,15 @@ def train_one(
     epochs_run = 0
     val_inference_seconds = 0.0
     stopped_early = False
+    wall_cap_hit = False
     per_horizon = []
+    _run_start = _time.time()
 
     for epoch in range(1, cfg.max_epochs + 1):
+        if (_time.time() - _run_start) / 3600.0 >= cfg.max_hours_per_arch:
+            wall_cap_hit = True
+            stopped_early = False
+            break
         model.train()
         loss_sum = torch.zeros((), device=device)
         pbar = tqdm(
@@ -263,9 +275,9 @@ def train_one(
         "metrics": best_metrics or {},
         "per_horizon": best_per_horizon,
         "inference_seconds": val_inference_seconds,
-        "stop_reason": "early_stopping"
-        if stopped_early
-        else ("max_epochs" if epochs_run >= cfg.max_epochs else "wall_clock_cap"),
+        "stop_reason": "wall_clock_cap"
+        if wall_cap_hit
+        else ("early_stopping" if stopped_early else "max_epochs"),
         "rows_available": len(apply_store52_mask(train_df.copy())),
         "rows_masked": rows_masked,
         "train_rows_available": len(train_masked),
