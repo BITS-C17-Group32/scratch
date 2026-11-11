@@ -14,6 +14,16 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from deep.artifact import (
+    config_sha256 as artifact_config_sha256,
+    empty_ablation as artifact_empty_ablation,
+    finalize as artifact_finalize,
+    migrate_legacy as artifact_migrate_legacy,
+    notes as artifact_notes,
+    shared_config as artifact_shared_config,
+    write_artifact as artifact_write_artifact,
+)
+from deep.benchmark import runtime_tradeoff
 from deep.config import DeepConfig
 from deep.data import (
     CAT_COLS,
@@ -323,13 +333,6 @@ def train_one(
     }
 
 
-def _write_json_atomic(path, obj):
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, default=str)
-    os.replace(tmp, path)
-
-
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--audit", action="store_true")
@@ -375,66 +378,49 @@ def main(argv=None) -> int:
     print(f"Using compute device: {device} | torch {torch.__version__}")
 
     if args.benchmark_steps and args.benchmark_steps > 0:
-        import time as _t
-
-        _train_df = pd.read_parquet(Path(".") / "splits" / "train.parquet")
-        masked = apply_store52_mask(_train_df)
-        cm = build_category_maps(masked)
-        sc = build_scaler(masked)
-        panels = build_series_panels(
-            masked.head(20000), cm, sc, cfg.lookback_days, cfg.horizon_days
-        )
-        ds = TrainWindowDataset(
-            panels, cfg.lookback_days, cfg.horizon_days, cfg.train_window_stride
-        )
-        loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=False)
-        cards = {c: len(m) for c, m in cm.items()}
-        m = DeepForecaster(
-            arch=args.arch,
-            num_numeric=NUM_NUMERIC,
-            cat_levels=cards,
-            embedding_dims=cfg.embedding_dims,
-            hidden_size=cfg.hidden_size,
-            num_layers=cfg.num_layers,
-            dropout=cfg.dropout,
-            horizon=cfg.horizon_days,
-            lookback=cfg.lookback_days,
-        ).to(device)
-        m.train()
-        t0 = _t.time()
-        n = 0
-        for batch in loader:
-            if n >= args.benchmark_steps:
-                break
-            x_num = batch["x_num"].to(device)
-            x_cat = batch["x_cat"].to(device)
-            y_log = batch["y_log"].to(device)
-            out = m(x_num, x_cat)
-            loss = nn.MSELoss()(out, y_log)
-            loss.backward()
-            n += 1
-        elapsed = _t.time() - t0
-        sps = elapsed / max(1, n)
+        # The measured device sweep: real training steps, the device
+        # synchronised around the timing, the peak memory read from the
+        # allocator. A launch-async number is not a measurement.
+        repo_root = Path(".")
         results_path = Path(args.out_dir) / "deep_results.json"
-        results = json.load(open(results_path)) if results_path.exists() else {}
-        results["runtime_tradeoff"] = {
-            "headline_device": str(device),
-            "devices": [
-                {
-                    "device": str(device),
-                    "torch_version": str(torch.__version__),
-                    "steps": n,
-                    "seconds": elapsed,
-                    "seconds_per_step": sps,
-                    "peak_memory_mb": None,
-                    "notes": "benchmark",
-                }
-            ],
-            "colab_gpu_hours_used": None,
-        }
+        if not results_path.is_file():
+            print(
+                f"{results_path} does not exist; the benchmark updates an "
+                "existing artifact, it does not create one. Run the training "
+                "first."
+            )
+            return 1
+        results, migrated = artifact_migrate_legacy(json.load(open(results_path)))
+        for line in migrated:
+            print(f"  migrated: {line}")
+        # The headline device is the one the three headline runs used, from
+        # the shared config: the CLI device is where the BENCHMARK runs, and
+        # the two are different facts.
+        headline_device = str(
+            (results.get("shared_config") or {}).get("device") or str(device)
+        )
+        # An explicit --device measures that device; "auto" sweeps every
+        # device this machine can run.
+        results["runtime_tradeoff"] = runtime_tradeoff(
+            headline_device,
+            steps=args.benchmark_steps,
+            devices=[str(device)] if args.device != "auto" else None,
+        )
         os.makedirs(args.out_dir, exist_ok=True)
-        _write_json_atomic(results_path, results)
-        print(f"Benchmark: {n} steps in {elapsed:.3f}s ({sps:.4f}s/step)")
+        # The benchmark publishes the artifact too, so it goes out through
+        # the same checked writer: a benchmark run must never publish an
+        # artifact the freeze would refuse.
+        artifact_write_artifact(
+            results_path,
+            artifact_finalize(results, repo_root=repo_root),
+            complete=results.get("status") == "complete",
+        )
+        for measured in results["runtime_tradeoff"]["devices"]:
+            print(
+                f"Benchmark: {measured['device']} {measured['steps']} steps in "
+                f"{measured['seconds']:.3f}s "
+                f"({measured['seconds_per_step']:.4f}s/step)"
+            )
         return 0
 
     if args.seed_check:
@@ -445,14 +431,33 @@ def main(argv=None) -> int:
         results_path = Path(args.out_dir) / "deep_results.json"
         results = json.load(open(results_path)) if results_path.exists() else {}
         cmp = results.get("comparison", {})
+        # The range is the spread between the seed the headline runs used
+        # and the seed this check ran; one run's number is not a range.
+        seed_42 = None
+        for tier in results.get("tiers", []):
+            seed_42 = (tier.get("valid") or {}).get("full_grid", {}).get("rmsle")
+            if seed_42 is not None:
+                break
+        seed_43 = res.get("best_valid_rmsle")
+        spread = (
+            abs(float(seed_42) - float(seed_43))
+            if seed_42 is not None and seed_43 is not None
+            else None
+        )
         cmp["seed_check"] = {
             "status": "run",
             "seeds": [42, 43],
-            "rmsle_range": res.get("best_valid_rmsle"),
+            "rmsle_range": spread,
         }
         results["comparison"] = cmp
         os.makedirs(args.out_dir, exist_ok=True)
-        _write_json_atomic(results_path, results)
+        # The seed check publishes the artifact too, so it goes out through
+        # the same checked writer.
+        artifact_write_artifact(
+            results_path,
+            artifact_finalize(results, repo_root=Path(".")),
+            complete=False,
+        )
         print("Seed check: RMSLE", res.get("best_valid_rmsle"))
         return 0
 
@@ -510,9 +515,17 @@ def main(argv=None) -> int:
     }
     if results_path.exists():
         try:
-            results = json.load(open(results_path))
-        except Exception:
-            pass
+            results, migrated = artifact_migrate_legacy(json.load(open(results_path)))
+            for line in migrated:
+                print(f"  migrated: {line}")
+        except Exception as error:
+            # The previous artifact could not be read: say so, and start
+            # from a clean stub rather than pretending it was fine.
+            print(
+                f"WARNING: the existing {results_path} could not be read ({error});"
+                " the run starts from an empty artifact"
+            )
+            results = {}
 
     archs_to_run = ["rnn", "lstm", "gru"] if args.all else [args.arch]
 
@@ -558,7 +571,6 @@ def main(argv=None) -> int:
             "checkpoint_sha256": _sha256_file(ckpt_path),
             "params": res["params"],
             "status": "complete",
-            "config_sha256": cfg.get_sha256(),
             "train": {
                 "rows_available": res["train_rows_available"],
                 "rows_used": res["train_rows_available"],
@@ -640,61 +652,13 @@ def main(argv=None) -> int:
             ]
             results["tiers"].append(tier_entry)
 
-    # top-level fields
-    import hashlib
-    import json as _json
-
-    manifest = load_split_manifest(Path("."))
-    manifest_path = Path("splits") / "split_manifest.json"
-    manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-    columns_sha = hashlib.sha256(
-        _json.dumps(manifest.get("columns", []), sort_keys=True).encode()
-    ).hexdigest()
-
-    results["schema_version"] = "1.0"
-    results["status"] = "complete"
-    results["track"] = "S4"
-    results["generated_at"] = pd.Timestamp.now().isoformat()
-    results["git_sha"] = git_sha()
-    results["data_fingerprint"] = {
-        "manifest_sha256": manifest_sha,
-        "columns_sha256": columns_sha,
-        "train_rows": manifest.get("rows", {}).get("train", 0),
-        "valid_rows": manifest.get("rows", {}).get("valid", 0),
-        "train_bounds": manifest.get("bounds", {}).get("train", []),
-        "valid_bounds": manifest.get("bounds", {}).get("valid", []),
-    }
-    results["shared_config"] = {
-        "lookback_days": cfg.lookback_days,
-        "horizon_days": cfg.horizon_days,
-        "num_layers": cfg.num_layers,
-        "hidden_size": cfg.hidden_size,
-        "dropout": cfg.dropout,
-        "batch_size": cfg.batch_size,
-        "learning_rate": cfg.learning_rate,
-        "weight_decay": cfg.weight_decay,
-        "grad_clip": cfg.grad_clip,
-        "max_epochs": cfg.max_epochs,
-        "patience": cfg.patience,
-        "min_delta": cfg.min_delta,
-        "seed": cfg.seed,
-        "train_window_stride": cfg.train_window_stride,
-        "eval_block_days": cfg.eval_block_days,
-        "target_transform": cfg.target_transform,
-        "loss": cfg.loss,
-        "embedding_dims": cfg.embedding_dims,
-        "numeric_features": cfg.numeric_features,
-        "categorical_features": cfg.categorical_features,
-        "calendar_encoding": True,
-        "store52_mask": True,
-        "train_start": cfg.train_start,
-        "dtype": cfg.dtype,
-        "device": str(device),
-        "torch_version": str(torch.__version__),
-        "num_workers": cfg.num_workers,
-        "amp": cfg.amp,
-    }
-    results["config_sha256"] = cfg.get_sha256()
+    # top-level fields: the shared config, the config hash and the whole
+    # artifact shape are owned by deep.artifact: the key set, the key
+    # order, the tier order and the data fingerprint are pinned there, and
+    # the write is checked before it lands.
+    shared = artifact_shared_config(cfg, str(device), str(torch.__version__))
+    results["shared_config"] = shared
+    results["config_sha256"] = artifact_config_sha256(shared)
     results["runtime_tradeoff"] = results.get(
         "runtime_tradeoff",
         {
@@ -703,37 +667,26 @@ def main(argv=None) -> int:
             "colab_gpu_hours_used": None,
         },
     )
-    results.setdefault(
-        "ablation_2015plus",
-        {
-            "status": "not_run",
-            "architecture": None,
-            "train_start": None,
-            "train_rows_available": None,
-            "train_rows_used": None,
-            "train_rows_masked": None,
-            "epochs_run": None,
-            "best_epoch": None,
-            "stop_reason": None,
-            "valid": {},
-            "delta_vs_full_history_rmsle": None,
-            "reason": "not run",
-        },
+    results.setdefault("ablation_2015plus", artifact_empty_ablation())
+    results["notes"] = artifact_notes(
+        [
+            "this artifact was written by a training run; the fold metrics are "
+            "filled in by the comparison run, which re-predicts the three "
+            "shared tail folds from the checkpoints",
+        ]
     )
-    results["notes"] = [
-        "earthquake history contamination: fold windows contain no quake rows",
-        "store-52 training mask consequence",
-        "absence of local_test",
-        "percentage-error metric excluded at 35.2% zeros in train+valid",
-        "calendar encoding decision",
-        "rolling-origin protocol",
-    ]
-    # POSIX checkpoint paths
-    for t in results.get("tiers", []):
-        if t.get("checkpoint"):
-            t["checkpoint"] = t["checkpoint"].replace("\\\\", "/")
+    # "complete" means the artifact can be frozen: all three tiers AND
+    # their fold metrics. A training run alone has the tiers but not the
+    # folds, so it publishes a partial artifact.
+    results["status"] = (
+        "complete"
+        if len(results.get("tiers", [])) == 3
+        and all(len(tier.get("fold_metrics", [])) == 3 for tier in results["tiers"])
+        else "partial"
+    )
+    finalized = artifact_finalize(results, repo_root=repo_root, shared=shared)
     if not args.no_artifact:
-        _write_json_atomic(results_path, results)
+        artifact_write_artifact(results_path, finalized, complete=False)
     print("\nTraining complete. Artifacts written to", args.out_dir)
     return 0
 

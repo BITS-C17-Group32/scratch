@@ -46,6 +46,7 @@ from __future__ import annotations
 import argparse
 import copy
 import errno
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows
