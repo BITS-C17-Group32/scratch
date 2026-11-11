@@ -90,94 +90,6 @@
       ]
     },
     {
-      "tier": "deep-lstm",
-      "architecture": "lstm",
-      "checkpoint": "artifacts\\deep_lstm.pt",
-      "checkpoint_bytes": 952349,
-      "checkpoint_sha256": "b2a667346fe036b811216af4081d73f3b2ef1601f4b8b383844e983db89cfb49",
-      "params": 235532,
-      "status": "complete",
-      "config_sha256": "3d7a3d3503ee14a2d05dbe7e5587cb8ef0f4cf5de016fe1b1d96d9f341294240",
-      "train": {
-        "rows_available": 1898523,
-        "rows_used": 1898523,
-        "rows_masked": 207801,
-        "windows": 221958,
-        "epochs_run": 11,
-        "best_epoch": 6,
-        "stop_reason": "early_stopping",
-        "seconds": 236.9476761817932,
-        "seconds_per_epoch": 21.540697834708475,
-        "device": "cuda",
-        "torch_version": "2.15.0+cu132"
-      },
-      "valid": {
-        "n_rows": 299376,
-        "n_active": 245303,
-        "full_grid": {
-          "rmsle": 0.5228520805454685,
-          "mae": 94.375807817249,
-          "rmse": 515.8104232452488
-        },
-        "active_slice": {
-          "rmsle": 0.4676427559806702,
-          "mae": 114.39575325648444,
-          "rmse": 569.088248562144
-        },
-        "per_horizon_rmsle": [
-          0.4810469836547883,
-          0.4904387329068885,
-          0.5045974423343621,
-          0.5440138234312674,
-          0.5318570071430194,
-          0.544622430184182,
-          0.552093513432209,
-          0.5713581464665989,
-          0.5477079473346321,
-          0.5330310665948014,
-          0.5236338354423434,
-          0.5146820703959173,
-          0.5703658215112607,
-          0.5522572667806448,
-          0.5652112043515346,
-          0.5896753042178605
-        ],
-        "inference_seconds": 5.307415723800659
-      },
-      "fold_metrics": [
-        {
-          "rmsle": 0.48542672931693404,
-          "mae": 94.59378977259861,
-          "rmse": 348.58306737991677,
-          "rmsle_active": 0.4834122096458471,
-          "mae_active": 115.53540252700135,
-          "rmse_active": 385.42230042004996,
-          "n_rows": 28512,
-          "n_rows_active": 23322
-        },
-        {
-          "rmsle": 0.7401274671603313,
-          "mae": 85.5937045452113,
-          "rmse": 300.7407363176778,
-          "rmsle_active": 0.49934052662398676,
-          "mae_active": 99.25718607061387,
-          "rmse_active": 319.6568606450607,
-          "n_rows": 28512,
-          "n_rows_active": 23173
-        },
-        {
-          "rmsle": 0.5844889028087604,
-          "mae": 114.50780913811482,
-          "rmse": 457.1513698586781,
-          "rmsle_active": 0.4998523675724017,
-          "mae_active": 141.93826021891238,
-          "rmse_active": 509.6010147516459,
-          "n_rows": 28512,
-          "n_rows_active": 22944
-        }
-      ]
-    },
-    {
       "tier": "deep-gru",
       "architecture": "gru",
       "checkpoint": "artifacts\\deep_gru.pt",
@@ -264,6 +176,63 @@
           "n_rows_active": 22944
         }
       ]
+    },
+    {
+      "tier": "deep-lstm",
+      "architecture": "lstm",
+      "checkpoint": "artifacts/deep_lstm.pt",
+      "checkpoint_bytes": 952349,
+      "checkpoint_sha256": "4f5cf43fa6d54bd379581b25543dfcb4e2c654f7e216fd6922ee6821a9cd1d95",
+      "params": 235532,
+      "status": "complete",
+      "config_sha256": "3d7a3d3503ee14a2d05dbe7e5587cb8ef0f4cf5de016fe1b1d96d9f341294240",
+      "train": {
+        "rows_available": 1898523,
+        "rows_used": 1898523,
+        "rows_masked": 207801,
+        "windows": 221958,
+        "epochs_run": 11,
+        "best_epoch": 6,
+        "stop_reason": "early_stopping",
+        "seconds": 178.91821146011353,
+        "seconds_per_epoch": 16.265291950919412,
+        "device": "cuda",
+        "torch_version": "2.15.0+cu132"
+      },
+      "valid": {
+        "n_rows": 299376,
+        "n_active": 245303,
+        "full_grid": {
+          "rmsle": 0.5064287845393184,
+          "mae": 97.62355033955676,
+          "rmse": 528.253322594629
+        },
+        "active_slice": {
+          "rmsle": 0.45921187140138325,
+          "mae": 118.41726816216463,
+          "rmse": 582.8150710047989
+        },
+        "per_horizon_rmsle": [
+          0.4482272922588674,
+          0.46922859489151036,
+          0.47602159842318365,
+          0.5013074986578774,
+          0.5224382113836339,
+          0.5130955018944515,
+          0.5162563970242976,
+          0.501192391688908,
+          0.5105076451048738,
+          0.5179462058533265,
+          0.4983241485798423,
+          0.5199533939905318,
+          0.5147409967251088,
+          0.5380439242064944,
+          0.5202744749747317,
+          0.53646500761493
+        ],
+        "inference_seconds": 4.65242600440979
+      },
+      "fold_metrics": []
     }
   ],
   "notes": [
@@ -349,8 +318,8 @@
     "reason": ""
   },
   "schema_version": "1.0",
-  "generated_at": "2026-11-11T20:02:42.412506",
-  "git_sha": "eed3768e7ddc06918502377865f2d8dff201def6",
+  "generated_at": "2026-11-11T20:10:31.788149",
+  "git_sha": "b3cbd5780bc4d6348ae0f0b50b4425dce08f9e1d",
   "data_fingerprint": {
     "manifest_sha256": "308e7ec5af085e76fd810ce085b662e1726d9bfa0d6e4db5be9798d4953bae18",
     "columns_sha256": "2caefc5a8bcbb94f95ebbef1cda58a0d62ca2fdf799b905259a3ecb9a1ef5c27",
@@ -425,14 +394,14 @@
     ],
     "calendar_encoding": true,
     "store52_mask": true,
-    "train_start": "2015-01-01",
+    "train_start": null,
     "dtype": "float32",
     "device": "cuda",
     "torch_version": "2.15.0+cu132",
     "num_workers": 0,
     "amp": false
   },
-  "config_sha256": "1e22737b850421140f80aef3f9d6252c30d8e6e3581abe1b9fa129dc14d6b0c0",
+  "config_sha256": "3d7a3d3503ee14a2d05dbe7e5587cb8ef0f4cf5de016fe1b1d96d9f341294240",
   "runtime_tradeoff": {
     "headline_device": "cuda",
     "devices": [],
