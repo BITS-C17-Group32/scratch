@@ -218,7 +218,7 @@ def train_one(
                 x_num = x_num.half()
                 # Refresh the fp16 execution copy from the fp32 master.
                 with torch.no_grad():
-                    for p_e, p_m in zip(exec_params, model.parameters()):
+                    for p_e, p_m in zip(exec_params, model.parameters(), strict=True):
                         p_e.copy_(p_m)
 
             optimizer.zero_grad(set_to_none=True)
@@ -230,7 +230,7 @@ def train_one(
             loss = criterion(preds, y_log)
             loss.backward()
             if use_amp:
-                for p_e, p_m in zip(exec_params, model.parameters()):
+                for p_e, p_m in zip(exec_params, model.parameters(), strict=True):
                     if p_e.grad is not None:
                         p_m.grad = p_e.grad.detach().to(torch.float32)
             nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
