@@ -204,6 +204,8 @@ def train_one(
             stopped_early = False
             break
         model.train()
+        if use_amp:
+            exec_model.train()
         loss_sum = torch.zeros((), device=device)
         pbar = tqdm(
             train_loader,
@@ -251,6 +253,8 @@ def train_one(
 
         if valid_panels is not None:
             model.eval()
+            if use_amp:
+                exec_model.eval()
             _t0 = _time.time()
             y_true, y_pred, per_horizon, _counts = _batched_eval(
                 model,
