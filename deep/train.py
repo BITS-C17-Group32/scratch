@@ -495,7 +495,7 @@ def main(argv=None) -> int:
         tier_entry = {
             "tier": f"deep-{arch}",
             "architecture": arch,
-            "checkpoint": str(ckpt_path),
+            "checkpoint": str(ckpt_path).replace("\\", "/"),
             "checkpoint_bytes": int(ckpt_path.stat().st_size),
             "checkpoint_sha256": _sha256_file(ckpt_path),
             "params": res["params"],
@@ -583,12 +583,99 @@ def main(argv=None) -> int:
             results["tiers"].append(tier_entry)
 
     # top-level fields
+    import hashlib
+    import json as _json
+
+    manifest = load_split_manifest(Path("."))
+    manifest_path = Path("splits") / "split_manifest.json"
+    manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    columns_sha = hashlib.sha256(
+        _json.dumps(manifest.get("columns", []), sort_keys=True).encode()
+    ).hexdigest()
+
+    results["schema_version"] = "1.0"
     results["status"] = "complete"
     results["track"] = "S4"
-    results.setdefault(
-        "notes", "percentage-error metric excluded at 35.2% zeros in train+valid"
+    results["generated_at"] = pd.Timestamp.now().isoformat()
+    results["git_sha"] = git_sha()
+    results["data_fingerprint"] = {
+        "manifest_sha256": manifest_sha,
+        "columns_sha256": columns_sha,
+        "train_rows": manifest.get("rows", {}).get("train", 0),
+        "valid_rows": manifest.get("rows", {}).get("valid", 0),
+        "train_bounds": manifest.get("bounds", {}).get("train", []),
+        "valid_bounds": manifest.get("bounds", {}).get("valid", []),
+    }
+    results["shared_config"] = {
+        "lookback_days": cfg.lookback_days,
+        "horizon_days": cfg.horizon_days,
+        "num_layers": cfg.num_layers,
+        "hidden_size": cfg.hidden_size,
+        "dropout": cfg.dropout,
+        "batch_size": cfg.batch_size,
+        "learning_rate": cfg.learning_rate,
+        "weight_decay": cfg.weight_decay,
+        "grad_clip": cfg.grad_clip,
+        "max_epochs": cfg.max_epochs,
+        "patience": cfg.patience,
+        "min_delta": cfg.min_delta,
+        "seed": cfg.seed,
+        "train_window_stride": cfg.train_window_stride,
+        "eval_block_days": cfg.eval_block_days,
+        "target_transform": cfg.target_transform,
+        "loss": cfg.loss,
+        "embedding_dims": cfg.embedding_dims,
+        "numeric_features": cfg.numeric_features,
+        "categorical_features": cfg.categorical_features,
+        "calendar_encoding": True,
+        "store52_mask": True,
+        "train_start": cfg.train_start,
+        "dtype": cfg.dtype,
+        "device": str(device),
+        "torch_version": str(torch.__version__),
+        "num_workers": cfg.num_workers,
+        "amp": cfg.amp,
+    }
+    results["config_sha256"] = cfg.get_sha256()
+    results["runtime_tradeoff"] = results.get(
+        "runtime_tradeoff",
+        {
+            "headline_device": str(device),
+            "devices": [],
+            "colab_gpu_hours_used": None,
+        },
     )
-    _write_json_atomic(results_path, results)
+    results.setdefault(
+        "ablation_2015plus",
+        {
+            "status": "not_run",
+            "architecture": None,
+            "train_start": None,
+            "train_rows_available": None,
+            "train_rows_used": None,
+            "train_rows_masked": None,
+            "epochs_run": None,
+            "best_epoch": None,
+            "stop_reason": None,
+            "valid": {},
+            "delta_vs_full_history_rmsle": None,
+            "reason": "not run",
+        },
+    )
+    results["notes"] = [
+        "earthquake history contamination: fold windows contain no quake rows",
+        "store-52 training mask consequence",
+        "absence of local_test",
+        "percentage-error metric excluded at 35.2% zeros in train+valid",
+        "calendar encoding decision",
+        "rolling-origin protocol",
+    ]
+    # POSIX checkpoint paths
+    for t in results.get("tiers", []):
+        if t.get("checkpoint"):
+            t["checkpoint"] = t["checkpoint"].replace("\\\\", "/")
+    if not args.no_artifact:
+        _write_json_atomic(results_path, results)
     print("\nTraining complete. Artifacts written to", args.out_dir)
     return 0
 
