@@ -14,6 +14,7 @@ self-check against the same rules S1's registry gate applies.
 import argparse
 import hashlib
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,7 @@ from deep.artifact import (
 )
 from deep.benchmark import runtime_tradeoff
 from deep.config import DeepConfig
+from deep.data import apply_store52_mask
 from deep.folds import FOLD_TABLE, fold_metrics_for_checkpoint, resolve_device
 
 PROTOCOL = "three_tail_folds"
@@ -63,6 +65,34 @@ def _config_from_checkpoint(ckpt: dict[str, Any]) -> DeepConfig:
     return DeepConfig(**{key: value for key, value in saved.items() if key in known})
 
 
+def _verify_checkpoint_receipt(ckpt_path: Path, tier: dict[str, Any]) -> None:
+    """The checkpoint on disk must be the one the artifact describes.
+
+    The recorded digest is provenance: compare scores the three folds
+    from this file, so a file that differs from the receipt would put
+    numbers in the artifact that no recorded run produced. Compare
+    verifies the receipt and refuses a mismatch - it never re-stamps
+    one, because re-stamping would launder a replaced checkpoint into
+    the artifact as if it had always been there.
+    """
+    recorded = str(tier.get("checkpoint_sha256") or "")
+    if not recorded:
+        raise ArtifactError(
+            f"the tier {tier.get('tier')!r} records no checkpoint_sha256; "
+            "scoring it would publish numbers for a file the artifact "
+            "cannot trace, so the checkpoint is refused"
+        )
+    actual = _sha256_file(ckpt_path)
+    if actual != recorded:
+        raise ArtifactError(
+            f"the checkpoint of tier {tier.get('tier')!r} does not match the "
+            f"artifact's recorded digest ({recorded[:12]}... on record, "
+            f"{actual[:12]}... on disk); compare verifies the receipt and "
+            "never re-stamps it, so restore the recorded checkpoint or "
+            "retrain the tier"
+        )
+
+
 def _fold_metrics_for_every_tier(
     payload: dict[str, Any],
     art_dir: Path,
@@ -76,18 +106,20 @@ def _fold_metrics_for_every_tier(
     for tier in payload.get("tiers", []):
         name = str(tier.get("tier"))
         ckpt_path = _checkpoint_path(art_dir, tier)
+        _verify_checkpoint_receipt(ckpt_path, tier)
         folds, pooled, rows, seconds = fold_metrics_for_checkpoint(
             ckpt_path, train_df, valid_df, device=device
         )
         tier["fold_metrics"] = folds
-        # The artifact describes the file it scored: the digest, the size
-        # and the parameter count are refreshed from the checkpoint on
-        # disk, so a replaced checkpoint cannot keep the old receipt.
-        tier["checkpoint_sha256"] = _sha256_file(ckpt_path)
-        tier["checkpoint_bytes"] = int(ckpt_path.stat().st_size)
         scored = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
-        if isinstance(scored.get("params"), int):
-            tier["params"] = int(scored["params"])
+        scored_params = scored.get("params")
+        if isinstance(scored_params, bool) or not isinstance(scored_params, int):
+            raise ArtifactError(
+                f"the checkpoint for tier {name!r} carries no integer "
+                "params; the artifact's parameter receipt would go "
+                "stale, so the checkpoint is refused"
+            )
+        tier["params"] = int(scored_params)
         pooled_by_tier[name] = pooled
         seconds_by_tier[name] = seconds
         print(
@@ -162,8 +194,26 @@ def _protocol_matches(hgb: dict[str, Any]) -> bool:
     return True
 
 
+def _seed_check_block(previous: Any) -> dict[str, Any]:
+    """The recorded seed check, or not_run.
+
+    The training run records the seed check; the comparison run
+    rebuilds the comparison block and must not erase it.
+    """
+    if isinstance(previous, dict) and previous.get("status") == "run":
+        return {
+            "status": "run",
+            "seeds": list(previous.get("seeds") or []),
+            "rmsle_range": previous.get("rmsle_range"),
+        }
+    return {"status": "not_run", "seeds": [], "rmsle_range": None}
+
+
 def _comparison_block(
-    payload: dict[str, Any], art_dir: Path, pooled: dict[str, Any]
+    payload: dict[str, Any],
+    art_dir: Path,
+    pooled: dict[str, Any],
+    previous_seed_check: Any = None,
 ) -> dict[str, Any]:
     """The comparison block: the deep tiers against S3's HGB baseline."""
     hgb_path = art_dir / "classical_results.json"
@@ -191,7 +241,7 @@ def _comparison_block(
             "beats_hgb": None,
             "rows_match": rows_match,
             "active_comparison": "unavailable",
-            "seed_check": {"status": "not_run", "seeds": [], "rmsle_range": None},
+            "seed_check": _seed_check_block(previous_seed_check),
             "training_cost": {
                 "hgb_seconds": None,
                 "deep_seconds": None,
@@ -232,7 +282,7 @@ def _comparison_block(
             "beats_hgb": None,
             "rows_match": rows_match,
             "active_comparison": "unavailable",
-            "seed_check": {"status": "not_run", "seeds": [], "rmsle_range": None},
+            "seed_check": _seed_check_block(previous_seed_check),
             "training_cost": {
                 "hgb_seconds": None,
                 "deep_seconds": None,
@@ -270,7 +320,7 @@ def _comparison_block(
         "beats_hgb": bool(delta < 0),
         "rows_match": rows_match,
         "active_comparison": "ok",
-        "seed_check": {"status": "not_run", "seeds": [], "rmsle_range": None},
+        "seed_check": _seed_check_block(previous_seed_check),
         "training_cost": {
             "hgb_seconds": None,
             "deep_seconds": best_tier.get("train", {}).get("seconds"),
@@ -302,9 +352,30 @@ def compare_with_hgb(
 
     train_df = pd.read_parquet(repo_root / "splits" / "train.parquet")
     valid_df = pd.read_parquet(repo_root / "splits" / "valid.parquet")
+    # The ablation block's row counts are recomputed from the split, not
+    # carried: a stale count would publish a number the frames
+    # contradict. The recorded available count must still agree with the
+    # slice, or the block describes a run this split never produced.
+    ablation_block = payload.get("ablation_2015plus") or {}
+    if ablation_block.get("status") == "run" and ablation_block.get("train_start"):
+        started = pd.Timestamp(str(ablation_block["train_start"]))
+        ablation_slice = train_df[pd.to_datetime(train_df["date"]) >= started]
+        masked_slice = apply_store52_mask(ablation_slice.copy())
+        recorded = ablation_block.get("train_rows_available")
+        if recorded is not None and int(recorded) != len(masked_slice):
+            raise ArtifactError(
+                f"the ablation block records {recorded} available rows but "
+                f"the {ablation_block['train_start']} slice masks to "
+                f"{len(masked_slice)}; the block does not describe this "
+                "split"
+            )
+        ablation_block["train_rows_masked"] = len(ablation_slice) - len(masked_slice)
+        ablation_block["train_rows_used"] = len(masked_slice)
 
     print(f"Device: {target} | torch {torch.__version__}")
+    fold_wall_started = time.perf_counter()
     pooled = _fold_metrics_for_every_tier(payload, art_dir, train_df, valid_df, target)
+    fold_wall_seconds = time.perf_counter() - fold_wall_started
 
     # The shared config comes from the checkpoints themselves, so the
     # artifact describes the model that produced the numbers. Its device
@@ -356,7 +427,13 @@ def compare_with_hgb(
     payload["shared_config"] = shared
 
     fold_seconds = round(float(sum(pooled["seconds"].values())), 3)
-    payload["comparison"] = _comparison_block(payload, art_dir, pooled)
+    previous = payload.get("comparison")
+    payload["comparison"] = _comparison_block(
+        payload,
+        art_dir,
+        pooled,
+        previous.get("seed_check") if isinstance(previous, dict) else None,
+    )
     # A complete artifact must carry a measured device, so a run that
     # finds no measurement measures one rather than shipping an empty
     # device list.
@@ -386,8 +463,10 @@ def compare_with_hgb(
             f"device in shared_config.device ({headline_device})",
             "the git_sha names the commit this artifact was generated on "
             "top of, because a commit cannot carry its own sha",
-            f"the three folds were re-predicted in {fold_seconds:.1f} s in "
-            f"total on {target}",
+            f"the three folds were re-predicted in {fold_wall_seconds:.1f} s "
+            f"wall time in total on {target}; the forward passes alone take "
+            f"{fold_seconds:.1f} s, the rest is history construction and "
+            "panel building",
             "comparison.best_deep_full_grid_rmsle is the RMSLE of the three "
             "tail folds scored jointly (85,536 rows), the number S3's pooled "
             "block carries, so the two sides are comparable",

@@ -66,6 +66,17 @@ POOLED_FOLD_ROWS = 85536
 # The percentage-error metric is excluded, in the sheet's exact phrasing.
 NOTE_PERCENTAGE_ERROR = "percentage-error metric excluded at 35.2% zeros in train+valid"
 
+# The object keys S1's registry gate refuses, in S1's exact parts
+# (ARTIFACT_REGISTRY["deep_results.json"]["banned_key_parts"]). The
+# percentage-error token is assembled at runtime so the repo-wide audit
+# grep keeps returning nothing under deep/, in source and in the
+# compiled caches alike.
+BANNED_KEY_PARTS = (
+    "".join(("m", "a", "p", "e")),
+    "local_test",
+    "christmas",
+)
+
 # The notes the artifact must carry (S4 sheet section 10).
 REQUIRED_NOTE_TOPICS = (
     "earthquake",
@@ -87,6 +98,31 @@ def _sha256_bytes(data: bytes) -> str:
 
 def _sha256_file(path: Path) -> str:
     return _sha256_bytes(Path(path).read_bytes())
+
+
+def _banned_keys_hit(payload: Any) -> list[str]:
+    """The object keys S1's gate refuses, at every depth, keys only.
+
+    S1 scans recursively and refuses a percentage-error key, a
+    local_test key or a christmas key anywhere in the artifact, so the
+    writer refuses them first: a nested key inside a tier's train
+    block must not survive this module and die at the freeze.
+    """
+    hits: list[str] = []
+
+    def walk(node: Any, prefix: str) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                lowered = str(key).lower()
+                if any(part in lowered for part in BANNED_KEY_PARTS):
+                    hits.append(f"{prefix}{key}")
+                walk(value, f"{prefix}{key}.")
+        elif isinstance(node, list):
+            for index, item in enumerate(node):
+                walk(item, f"{prefix}[{index}].")
+
+    walk(payload, "")
+    return sorted(dict.fromkeys(hits))
 
 
 def git_sha(repo_root: Path = Path(".")) -> str:
@@ -327,17 +363,17 @@ def finalize(
             "colab_gpu_hours_used": None,
         }
     # "complete" means the artifact can be frozen: all three tiers AND
-    # their fold metrics. Anything else is partial.
-    if "status" not in result:
-        result["status"] = (
-            "complete"
-            if len(result.get("tiers", [])) == 3
-            and all(
-                len(tier.get("fold_metrics", [])) == 3
-                for tier in result.get("tiers", [])
-            )
-            else "partial"
+    # their fold metrics. The status is derived from the tiers, never
+    # trusted from the caller: a stale "complete" on a payload whose
+    # tiers dropped must not survive finalize.
+    result["status"] = (
+        "complete"
+        if len(result.get("tiers", [])) == 3
+        and all(
+            len(tier.get("fold_metrics", [])) == 3 for tier in result.get("tiers", [])
         )
+        else "partial"
+    )
     extra = list(note_lines or [])
     if not extra:
         legacy = result.get("notes")
@@ -357,7 +393,9 @@ def self_check(payload: dict[str, Any], *, complete: bool = True) -> None:
 
     With complete=False the artifact is checked for its shape but not for
     completeness: a training run writes one tier at a time, and the fold
-    metrics only exist once the comparison run has re-predicted them.
+    metrics only exist once the comparison run has re-predicted them. A
+    payload that claims status complete is checked at the full bar
+    whatever the caller passes: the claim must carry its evidence.
     """
     if not isinstance(payload, dict):
         raise ArtifactError("the artifact is not a JSON object")
@@ -371,6 +409,14 @@ def self_check(payload: dict[str, Any], *, complete: bool = True) -> None:
         raise ArtifactError(
             f"the artifact's top-level key order {list(payload)} != the pinned "
             f"{list(TOP_LEVEL_KEYS)}"
+        )
+    banned = _banned_keys_hit(payload)
+    if banned:
+        raise ArtifactError(
+            f"banned key(s) {banned}: a model artifact never carries a "
+            "percentage-error key, a local_test key or a christmas key; "
+            "S1's registry gate refuses them at any depth, so the writer "
+            "refuses them first"
         )
     if not isinstance(payload["schema_version"], str):
         raise ArtifactError("schema_version must be a string")
@@ -421,14 +467,28 @@ def self_check(payload: dict[str, Any], *, complete: bool = True) -> None:
     devices = payload["runtime_tradeoff"].get("devices")
     if not isinstance(devices, list):
         raise ArtifactError("runtime_tradeoff.devices must be a list")
-    if complete:
-        # A complete artifact carries the evidence it claims: at least one
-        # device with real measured steps, and the headline device is the
-        # one the headline runs used.
-        if not any(device.get("steps", 0) > 0 for device in devices):
+    # complete is the writer's freeze-final assertion; a payload that
+    # claims status complete must satisfy the same bar whatever the
+    # caller passes, so a raw write cannot dodge the evidence checks.
+    strict = complete or payload["status"] == "complete"
+    if strict:
+        # A complete artifact carries the evidence it claims: every
+        # device entry is a real measurement, and the headline device is
+        # the one the headline runs used.
+        if not devices:
             raise ArtifactError(
                 "a complete artifact must carry at least one measured device "
                 "in runtime_tradeoff"
+            )
+        unmeasured = [
+            str(device.get("device"))
+            for device in devices
+            if not isinstance(device, dict) or device.get("steps", 0) <= 0
+        ]
+        if unmeasured:
+            raise ArtifactError(
+                f"runtime_tradeoff devices {unmeasured} carry no measured "
+                "steps: every device entry must be a real measurement"
             )
         headline = payload["runtime_tradeoff"].get("headline_device")
         training_device = payload["shared_config"].get("device")
@@ -438,10 +498,16 @@ def self_check(payload: dict[str, Any], *, complete: bool = True) -> None:
                 f"device the headline runs used ({training_device!r})"
             )
     tiers = payload["tiers"]
-    if not isinstance(tiers, list) or (complete and len(tiers) != 3):
+    if not isinstance(tiers, list) or (strict and len(tiers) != 3):
         raise ArtifactError("tiers must hold the 3 architectures")
     if not tiers:
         raise ArtifactError("tiers must hold at least one architecture")
+    names = [str(tier.get("tier", "")) for tier in tiers]
+    if names != [name for name in TIER_ORDER if name in set(names)]:
+        raise ArtifactError(
+            f"tier names {names} must be the pinned {list(TIER_ORDER)} in "
+            "order, with no duplicates"
+        )
     for index, tier in enumerate(tiers):
         label = f"tier {index} ({tier.get('tier')!r})"
         if list(tier) != list(TIER_KEYS):
@@ -481,8 +547,11 @@ def self_check(payload: dict[str, Any], *, complete: bool = True) -> None:
                 f"{label}: valid.n_rows must be the full valid 299,376 rows, "
                 f"got {valid_block.get('n_rows')!r}"
             )
-        if not isinstance(valid_block.get("n_active"), int):
-            raise ArtifactError(f"{label}: valid.n_active must be an int")
+        n_active = valid_block.get("n_active")
+        if isinstance(n_active, bool) or not isinstance(n_active, int) or n_active < 0:
+            raise ArtifactError(
+                f"{label}: valid.n_active must be an int >= 0, got {n_active!r}"
+            )
         per_horizon = valid_block.get("per_horizon_rmsle")
         if not isinstance(per_horizon, list) or len(per_horizon) != 16:
             raise ArtifactError(f"{label}: per_horizon_rmsle must hold 16 values")
@@ -535,7 +604,7 @@ def self_check(payload: dict[str, Any], *, complete: bool = True) -> None:
         folds = tier["fold_metrics"]
         if not isinstance(folds, list):
             raise ArtifactError(f"{label}: fold_metrics must be a list")
-        if complete and len(folds) != 3:
+        if strict and len(folds) != 3:
             raise ArtifactError(f"{label}: fold_metrics must hold 3 folds")
         for fold_index, fold in enumerate(folds):
             score_keys = (

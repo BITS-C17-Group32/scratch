@@ -120,18 +120,18 @@ def train_one(
     t0 = _time.time()
     set_seed(cfg.seed)
 
-    if cat_maps is None:
-        train_masked = apply_store52_mask(train_df.copy())
-        cat_maps = build_category_maps(train_masked)
-        scaler = build_scaler(train_masked)
-    else:
-        train_masked = apply_store52_mask(train_df.copy())
-
-    # apply train_start slicing if set
+    train_masked = apply_store52_mask(train_df.copy())
+    # The train_start slice comes FIRST: window numbers, batch offsets
+    # and the scaler are computed on the sliced frame (sheet Day 4), so
+    # the 2015-plus ablation refits the scaler on the slice instead of
+    # scaling the slice with full-history statistics.
     if cfg.train_start:
         train_masked = train_masked[
             pd.to_datetime(train_masked["date"]) >= pd.Timestamp(cfg.train_start)
         ].reset_index(drop=True)
+    if cat_maps is None:
+        cat_maps = build_category_maps(train_masked)
+        scaler = build_scaler(train_masked)
 
     panels = build_series_panels(
         train_masked, cat_maps, scaler, cfg.lookback_days, cfg.horizon_days
@@ -333,6 +333,29 @@ def train_one(
     }
 
 
+def _valid_entry(res):
+    """The valid block one training run publishes, in the pinned shape."""
+    m = res.get("metrics") or {}
+    if not m:
+        return {}
+    return {
+        "n_rows": m.get("n_rows", 0),
+        "n_active": m.get("n_rows_active", m.get("n_active", 0)),
+        "full_grid": {
+            "rmsle": m.get("rmsle", 0),
+            "mae": m.get("mae", 0),
+            "rmse": m.get("rmse", 0),
+        },
+        "active_slice": {
+            "rmsle": m.get("rmsle_active", 0),
+            "mae": m.get("mae_active", 0),
+            "rmse": m.get("rmse_active", 0),
+        },
+        "per_horizon_rmsle": res.get("per_horizon", []),
+        "inference_seconds": res.get("inference_seconds", 0.0),
+    }
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--audit", action="store_true")
@@ -427,17 +450,36 @@ def main(argv=None) -> int:
         cfg.seed = 43
         train_df = pd.read_parquet(Path(".") / "splits" / "train.parquet")
         valid_df = pd.read_parquet(Path(".") / "splits" / "valid.parquet")
-        res = train_one("lstm", cfg, device, train_df, valid_df)
         results_path = Path(args.out_dir) / "deep_results.json"
-        results = json.load(open(results_path)) if results_path.exists() else {}
+        if not results_path.is_file():
+            print(
+                f"{results_path} does not exist; the seed check compares "
+                "against the recorded seed-42 run, so the artifact must "
+                "exist. Run the training first."
+            )
+            return 1
+        # The seed check publishes the artifact too, so a legacy artifact
+        # is migrated on the way in, like every other write path.
+        results, migrated = artifact_migrate_legacy(json.load(open(results_path)))
+        for line in migrated:
+            print(f"  migrated: {line}")
+        res = train_one("lstm", cfg, device, train_df, valid_df)
         cmp = results.get("comparison", {})
         # The range is the spread between the seed the headline runs used
         # and the seed this check ran; one run's number is not a range.
+        # The check trains the lstm, so the recorded number must be the
+        # lstm tier's, not the first tier's.
         seed_42 = None
         for tier in results.get("tiers", []):
+            if str(tier.get("architecture", "")).lower() != "lstm":
+                continue
             seed_42 = (tier.get("valid") or {}).get("full_grid", {}).get("rmsle")
-            if seed_42 is not None:
-                break
+            break
+        if seed_42 is None:
+            print(
+                "WARNING: the artifact carries no lstm tier full-grid "
+                "RMSLE; the seed check records a null range"
+            )
         seed_43 = res.get("best_valid_rmsle")
         spread = (
             abs(float(seed_42) - float(seed_43))
@@ -532,6 +574,40 @@ def main(argv=None) -> int:
     for arch in archs_to_run:
         res = train_one(arch, cfg, device, train_df, valid_df)
 
+        valid_entry = _valid_entry(res)
+
+        # The ablation handling comes FIRST: the ablation updates only
+        # ablation_2015plus (sheet Day 4), so it saves NO checkpoint --
+        # writing artifacts/deep_{arch}.pt would overwrite the headline
+        # tier's checkpoint while the artifact's tier block keeps the
+        # digest of the model it describes, and the next comparison would
+        # re-predict the folds from a checkpoint the artifact never
+        # carried. The sensitivity result is the metric; the deliverables
+        # stay the three headline checkpoints (sheet Section 10).
+        if args.ablation:
+            # The ablation's own slice, not the full train: the masked
+            # count is the rows the mask drops INSIDE the slice, so the
+            # three counts reconcile (available + masked = slice length).
+            ablation_slice = train_df[
+                pd.to_datetime(train_df["date"]) >= pd.Timestamp(cfg.train_start)
+            ]
+            ablation_masked = apply_store52_mask(ablation_slice.copy())
+            results["ablation_2015plus"] = {
+                "status": "run",
+                "architecture": arch,
+                "train_start": cfg.train_start,
+                "train_rows_available": res["train_rows_available"],
+                "train_rows_used": res["train_rows_available"],
+                "train_rows_masked": len(ablation_slice) - len(ablation_masked),
+                "epochs_run": res["epochs_run"],
+                "best_epoch": res["best_epoch"],
+                "stop_reason": res.get("stop_reason", "max_epochs"),
+                "valid": valid_entry,
+                "delta_vs_full_history_rmsle": None,
+                "reason": "",
+            }
+            continue
+
         ckpt_path = Path(args.out_dir) / f"deep_{arch}.pt"
         save_obj = {
             "state_dict": res["model_state"],
@@ -598,9 +674,11 @@ def main(argv=None) -> int:
                 ),
                 "epochs_run": res["epochs_run"],
                 "best_epoch": res["best_epoch"],
-                "stop_reason": "early_stopping"
-                if res["best_epoch"] < cfg.max_epochs
-                else "max_epochs",
+                # train_one derives the real stop reason (wall clock
+                # cap, early stopping, or the epoch cap); recomputing
+                # it here from best_epoch would mislabel a wall-cap run
+                # as a convergence claim, which the sheet forbids.
+                "stop_reason": res["stop_reason"],
                 "seconds": res.get("seconds", 0.0),
                 "seconds_per_epoch": (
                     res.get("seconds", 0.0) / max(1, res["epochs_run"])
@@ -611,54 +689,28 @@ def main(argv=None) -> int:
             "valid": {},
             "fold_metrics": [],
         }
-        if res["metrics"]:
-            m = res["metrics"]
-            tier_entry["valid"] = {
-                "n_rows": m.get("n_rows", 0),
-                "n_active": m.get("n_rows_active", m.get("n_active", 0)),
-                "full_grid": {
-                    "rmsle": m.get("rmsle", 0),
-                    "mae": m.get("mae", 0),
-                    "rmse": m.get("rmse", 0),
-                },
-                "active_slice": {
-                    "rmsle": m.get("rmsle_active", 0),
-                    "mae": m.get("mae_active", 0),
-                    "rmse": m.get("rmse_active", 0),
-                },
-                "per_horizon_rmsle": res.get("per_horizon", []),
-                "inference_seconds": res.get("inference_seconds", 0.0),
-            }
+        tier_entry["valid"] = valid_entry
 
-        # ablation handling
-        if args.ablation:
-            results["ablation_2015plus"] = {
-                "status": "run",
-                "architecture": arch,
-                "train_start": cfg.train_start,
-                "train_rows_available": res["train_rows_available"],
-                "train_rows_used": res["train_rows_available"],
-                "train_rows_masked": res["rows_masked"],
-                "epochs_run": res["epochs_run"],
-                "best_epoch": res["best_epoch"],
-                "stop_reason": res.get("stop_reason", "max_epochs"),
-                "valid": tier_entry["valid"],
-                "delta_vs_full_history_rmsle": None,
-                "reason": "",
-            }
-        else:
-            results["tiers"] = [
-                t for t in results.get("tiers", []) if t.get("tier") != f"deep-{arch}"
-            ]
-            results["tiers"].append(tier_entry)
+        results["tiers"] = [
+            t for t in results.get("tiers", []) if t.get("tier") != f"deep-{arch}"
+        ]
+        results["tiers"].append(tier_entry)
 
     # top-level fields: the shared config, the config hash and the whole
     # artifact shape are owned by deep.artifact: the key set, the key
     # order, the tier order and the data fingerprint are pinned there, and
     # the write is checked before it lands.
-    shared = artifact_shared_config(cfg, str(device), str(torch.__version__))
-    results["shared_config"] = shared
-    results["config_sha256"] = artifact_config_sha256(shared)
+    if args.ablation and results.get("shared_config") and results.get("config_sha256"):
+        # The shared_config block is the record of the three HEADLINE
+        # runs; the ablation updates only ablation_2015plus, and its own
+        # slice and device live there. Re-stamping the block would flip
+        # train_start to the ablation's slice and change config_sha256
+        # to a config the headline runs never used.
+        shared = results["shared_config"]
+    else:
+        shared = artifact_shared_config(cfg, str(device), str(torch.__version__))
+        results["shared_config"] = shared
+        results["config_sha256"] = artifact_config_sha256(shared)
     results["runtime_tradeoff"] = results.get(
         "runtime_tradeoff",
         {

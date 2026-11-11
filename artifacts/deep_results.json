@@ -2,8 +2,8 @@
   "schema_version": "1.0",
   "status": "complete",
   "track": "S4",
-  "generated_at": "2026-11-11T17:40:37Z",
-  "git_sha": "872d25d93bf2eb61c81dcc456e97b25e61eed4bf",
+  "generated_at": "2026-11-11T19:27:44Z",
+  "git_sha": "39154942a99b5ba78e1cefdf4002f3787020e005",
   "data_fingerprint": {
     "manifest_sha256": "ffcb1d0fae03a94aff3225f5194c16f6d84d9ce8a98fb0df9249079820a511ba",
     "columns_sha256": "c003c6e9bcc6a84ecc808d3fa33411ec0e214021561da9492e7432287aea1f99",
@@ -355,7 +355,7 @@
     "train_start": "2015-01-01",
     "train_rows_available": 762927,
     "train_rows_used": 762927,
-    "train_rows_masked": 207801,
+    "train_rows_masked": 42537,
     "epochs_run": 6,
     "best_epoch": 1,
     "stop_reason": "early_stopping",
@@ -363,34 +363,34 @@
       "n_rows": 299376,
       "n_active": 245303,
       "full_grid": {
-        "rmsle": 0.5638316484362367,
-        "mae": 116.60534279966863,
-        "rmse": 577.3529798921606
+        "rmsle": 0.5684707668524538,
+        "mae": 140.05709834472412,
+        "rmse": 705.5114745123219
       },
       "active_slice": {
-        "rmsle": 0.5097554845662853,
-        "mae": 141.4328206997501,
-        "rmse": 636.8241405397496
+        "rmsle": 0.5046614466634487,
+        "mae": 170.0777669786972,
+        "rmse": 778.7944940510483
       },
       "per_horizon_rmsle": [
-        0.4950696338932774,
-        0.5199696193210258,
-        0.5473001670827476,
-        0.5565059539275433,
-        0.574743618472968,
-        0.5681608167748403,
-        0.583346109590283,
-        0.5425082546129555,
-        0.5597061687732207,
-        0.5848284253493152,
-        0.5630102903283088,
-        0.5817883100469944,
-        0.5702522738205764,
-        0.6077098358717821,
-        0.5789861326549611,
-        0.5887764808789534
+        0.5018487902965031,
+        0.5094536925519619,
+        0.5431514664146396,
+        0.5642706370359455,
+        0.573446058581816,
+        0.5733763547319647,
+        0.5895607166741901,
+        0.5498248682892094,
+        0.5598095975253693,
+        0.5887048247374953,
+        0.57452014755838,
+        0.5899997128827758,
+        0.5767895003144033,
+        0.6200647494330671,
+        0.5857439389885629,
+        0.595940951557992
       ],
-      "inference_seconds": 3.420119285583496
+      "inference_seconds": 2.142305850982666
     },
     "delta_vs_full_history_rmsle": null,
     "reason": ""
@@ -459,7 +459,7 @@
     "the fold SCORING path does not apply the training mask: S1's contract says scoring paths never see fit_rows, and the masked history would leave store 52 without a lookback and drop the fold from the pinned 28,512 rows",
     "the runtime_tradeoff benchmark was measured on the machine that re-scored the folds, one device entry per device it could run, each carrying its own torch version; the headline runs used the device in shared_config.device (cuda)",
     "the git_sha names the commit this artifact was generated on top of, because a commit cannot carry its own sha",
-    "the three folds were re-predicted in 1.2 s in total on mps",
+    "the three folds were re-predicted in 17.2 s wall time in total on mps; the forward passes alone take 0.8 s, the rest is history construction and panel building",
     "comparison.best_deep_full_grid_rmsle is the RMSLE of the three tail folds scored jointly (85,536 rows), the number S3's pooled block carries, so the two sides are comparable"
   ]
 }

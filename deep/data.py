@@ -506,9 +506,17 @@ def fit_predict_frozen(tier, fit_frame, predict_frame, config=None):
 
     cfg = DeepConfig()
     if config:
+        known = set(DeepConfig.__dataclass_fields__)
+        unknown = sorted(set(config) - known)
+        if unknown:
+            # An unknown key would silently become its default, so the
+            # freeze would fit a different model than the caller
+            # asked for.
+            raise ValueError(
+                f"unknown config keys {unknown}; the pinned config has {sorted(known)}"
+            )
         for k, v in config.items():
-            if hasattr(cfg, k):
-                setattr(cfg, k, v)
+            setattr(cfg, k, v)
 
     arch = tier
     if isinstance(tier, str):
