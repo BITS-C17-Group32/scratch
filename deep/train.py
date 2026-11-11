@@ -87,16 +87,25 @@ def run_audit():
     print(f"Train rows available after mask: {len(train_df) - len(st52_masked)}")
     print(f"Train rows from 2015-01-01 onward: {len(train_2015_plus)}")
     # train/valid dates
-    trd = pd.to_datetime(train_df["date"])
-    vad = pd.to_datetime(valid_df["date"])
-    print("Train dates:", trd.min().date(), trd.max().date())
-    print("Valid dates:", vad.min().date(), vad.max().date())
+    pd.to_datetime(train_df["date"])
+    pd.to_datetime(valid_df["date"])
+    bounds = manifest.get("bounds", {})
+    print("Train bounds:", bounds.get("train"))
+    print("Valid bounds:", bounds.get("valid"))
+    print("Local test bounds:", bounds.get("local_test"))
     sys.exit(0)
 
 
-def train_one(arch, cfg, device, train_df, valid_df=None, cat_maps=None, scaler=None):
+def train_one(
+    arch, config, device, train_df=None, valid_df=None, cat_maps=None, scaler=None
+):
     import time as _time
 
+    cfg = config
+    if train_df is None:
+        train_df = pd.read_parquet(Path(".") / "splits" / "train.parquet")
+    if valid_df is None:
+        valid_df = pd.read_parquet(Path(".") / "splits" / "valid.parquet")
     t0 = _time.time()
     set_seed(cfg.seed)
 
@@ -156,16 +165,17 @@ def train_one(arch, cfg, device, train_df, valid_df=None, cat_maps=None, scaler=
     best_valid_rmsle = float("inf")
     best_state = None
     best_metrics = None
+    best_per_horizon = []
     best_epoch = 0
     patience_counter = 0
     epochs_run = 0
     val_inference_seconds = 0.0
+    stopped_early = False
     per_horizon = []
 
     for epoch in range(1, cfg.max_epochs + 1):
         model.train()
         loss_sum = torch.zeros((), device=device)
-        n_batches = len(train_loader)
         pbar = tqdm(
             train_loader,
             desc=f"Epoch {epoch}/{cfg.max_epochs} [{arch.upper()} Train]",
@@ -184,11 +194,13 @@ def train_one(arch, cfg, device, train_df, valid_df=None, cat_maps=None, scaler=
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             optimizer.step()
-            loss_sum = loss_sum + loss.detach()
+            batch_size = x_num.shape[0]
+            loss_sum = loss_sum + loss.detach() * batch_size
             if (step + 1) % 25 == 0:
-                pbar.set_postfix({"loss": f"{(loss_sum / (step + 1)).item():.4f}"})
+                _loss_val = (loss_sum / max(1, (step + 1) * cfg.batch_size)).item()
+                pbar.set_postfix(loss=f"{_loss_val:.4f}")
 
-        avg_train_loss = (loss_sum / max(1, n_batches)).item()
+        avg_train_loss = (loss_sum / max(1, len(train_ds))).item()
         epochs_run = epoch
 
         if valid_panels is not None:
@@ -210,6 +222,7 @@ def train_one(arch, cfg, device, train_df, valid_df=None, cat_maps=None, scaler=
             if val_rmsle < (best_valid_rmsle - cfg.min_delta):
                 best_valid_rmsle = val_rmsle
                 best_metrics = val_metrics
+                best_per_horizon = list(per_horizon)
                 best_epoch = epoch
                 best_state = {
                     k: v.detach().clone().cpu() for k, v in model.state_dict().items()
@@ -219,6 +232,7 @@ def train_one(arch, cfg, device, train_df, valid_df=None, cat_maps=None, scaler=
                 patience_counter += 1
                 if patience_counter >= cfg.patience:
                     print(f"Early stopping triggered at epoch {epoch}")
+                    stopped_early = True
                     break
         else:
             print(f"Epoch {epoch}/{cfg.max_epochs} TrainMSE {avg_train_loss:.4f}")
@@ -247,8 +261,11 @@ def train_one(arch, cfg, device, train_df, valid_df=None, cat_maps=None, scaler=
         "epochs_run": epochs_run,
         "best_valid_rmsle": best_valid_rmsle,
         "metrics": best_metrics or {},
-        "per_horizon": per_horizon,
+        "per_horizon": best_per_horizon,
         "inference_seconds": val_inference_seconds,
+        "stop_reason": "early_stopping"
+        if stopped_early
+        else ("max_epochs" if epochs_run >= cfg.max_epochs else "wall_clock_cap"),
         "rows_available": len(apply_store52_mask(train_df.copy())),
         "rows_masked": rows_masked,
         "train_rows_available": len(train_masked),
@@ -263,7 +280,7 @@ def _write_json_atomic(path, obj):
     os.replace(tmp, path)
 
 
-def main():
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--audit", action="store_true")
     parser.add_argument("--smoke", action="store_true")
@@ -278,8 +295,10 @@ def main():
     )
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--benchmark-steps", type=int, default=0)
+    parser.add_argument("--seed-check", action="store_true")
+    parser.add_argument("--no-artifact", action="store_true")
     parser.add_argument("--out-dir", type=str, default="artifacts")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.audit:
         run_audit()
@@ -296,6 +315,88 @@ def main():
 
     device = resolve_device(args.device)
     print(f"Using compute device: {device} | torch {torch.__version__}")
+
+    if args.benchmark_steps and args.benchmark_steps > 0:
+        import time as _t
+
+        _train_df = pd.read_parquet(Path(".") / "splits" / "train.parquet")
+        masked = apply_store52_mask(_train_df)
+        cm = build_category_maps(masked)
+        sc = build_scaler(masked)
+        panels = build_series_panels(
+            masked.head(20000), cm, sc, cfg.lookback_days, cfg.horizon_days
+        )
+        ds = TrainWindowDataset(
+            panels, cfg.lookback_days, cfg.horizon_days, cfg.train_window_stride
+        )
+        loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=False)
+        cards = {c: len(m) for c, m in cm.items()}
+        m = DeepForecaster(
+            arch=args.arch,
+            num_numeric=NUM_NUMERIC,
+            cat_levels=cards,
+            embedding_dims=cfg.embedding_dims,
+            hidden_size=cfg.hidden_size,
+            num_layers=cfg.num_layers,
+            dropout=cfg.dropout,
+            horizon=cfg.horizon_days,
+            lookback=cfg.lookback_days,
+        ).to(device)
+        m.train()
+        t0 = _t.time()
+        n = 0
+        for batch in loader:
+            if n >= args.benchmark_steps:
+                break
+            x_num = batch["x_num"].to(device)
+            x_cat = batch["x_cat"].to(device)
+            y_log = batch["y_log"].to(device)
+            out = m(x_num, x_cat)
+            loss = nn.MSELoss()(out, y_log)
+            loss.backward()
+            n += 1
+        elapsed = _t.time() - t0
+        sps = elapsed / max(1, n)
+        results_path = Path(args.out_dir) / "deep_results.json"
+        results = json.load(open(results_path)) if results_path.exists() else {}
+        results["runtime_tradeoff"] = {
+            "headline_device": str(device),
+            "devices": [
+                {
+                    "device": str(device),
+                    "torch_version": str(torch.__version__),
+                    "steps": n,
+                    "seconds": elapsed,
+                    "seconds_per_step": sps,
+                    "peak_memory_mb": None,
+                    "notes": "benchmark",
+                }
+            ],
+            "colab_gpu_hours_used": None,
+        }
+        os.makedirs(args.out_dir, exist_ok=True)
+        _write_json_atomic(results_path, results)
+        print(f"Benchmark: {n} steps in {elapsed:.3f}s ({sps:.4f}s/step)")
+        return 0
+
+    if args.seed_check:
+        cfg.seed = 43
+        train_df = pd.read_parquet(Path(".") / "splits" / "train.parquet")
+        valid_df = pd.read_parquet(Path(".") / "splits" / "valid.parquet")
+        res = train_one("lstm", cfg, device, train_df, valid_df)
+        results_path = Path(args.out_dir) / "deep_results.json"
+        results = json.load(open(results_path)) if results_path.exists() else {}
+        cmp = results.get("comparison", {})
+        cmp["seed_check"] = {
+            "status": "run",
+            "seeds": [42, 43],
+            "rmsle_range": res.get("best_valid_rmsle"),
+        }
+        results["comparison"] = cmp
+        os.makedirs(args.out_dir, exist_ok=True)
+        _write_json_atomic(results_path, results)
+        print("Seed check: RMSLE", res.get("best_valid_rmsle"))
+        return 0
 
     repo_root = Path(".")
     train_df = pd.read_parquet(repo_root / "splits" / "train.parquet")
@@ -316,7 +417,6 @@ def main():
 
     if args.smoke:
         set_seed(cfg.seed)
-        from deep.model import DeepForecaster
 
         cards = {
             "store_nbr": 54,
@@ -375,9 +475,7 @@ def main():
             "scaler": res["scaler"],
             "best_epoch": res["best_epoch"],
             "epochs_run": res["epochs_run"],
-            "stop_reason": "early_stopping"
-            if res["best_epoch"] < cfg.max_epochs
-            else "max_epochs",
+            "stop_reason": res.get("stop_reason", "max_epochs"),
             "valid_metrics": res["metrics"],
             "metrics": res["metrics"],
             "per_horizon_rmsle": res.get("per_horizon", []),
@@ -410,7 +508,14 @@ def main():
                 "windows": len(
                     TrainWindowDataset(
                         build_series_panels(
-                            apply_store52_mask(train_df.copy()),
+                            apply_store52_mask(
+                                train_df.copy()
+                                if cfg.train_start is None
+                                else train_df[
+                                    pd.to_datetime(train_df["date"])
+                                    >= pd.Timestamp(cfg.train_start)
+                                ].copy()
+                            ),
                             res["cat_maps"],
                             res["scaler"],
                             cfg.lookback_days,
@@ -466,9 +571,7 @@ def main():
                 "train_rows_masked": res["rows_masked"],
                 "epochs_run": res["epochs_run"],
                 "best_epoch": res["best_epoch"],
-                "stop_reason": "early_stopping"
-                if res["best_epoch"] < cfg.max_epochs
-                else "max_epochs",
+                "stop_reason": res.get("stop_reason", "max_epochs"),
                 "valid": tier_entry["valid"],
                 "delta_vs_full_history_rmsle": None,
                 "reason": "",
@@ -487,6 +590,7 @@ def main():
     )
     _write_json_atomic(results_path, results)
     print("\nTraining complete. Artifacts written to", args.out_dir)
+    return 0
 
 
 def _sha256_file(path):
@@ -500,4 +604,4 @@ def _sha256_file(path):
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

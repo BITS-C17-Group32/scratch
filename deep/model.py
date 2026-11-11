@@ -83,9 +83,6 @@ class DeepForecaster(nn.Module):
         )
         cat_emb = cat_emb.unsqueeze(1).expand(-1, seq, -1)
         x = torch.cat([x_num, cat_emb], dim=-1)
-        if self.arch == "lstm":
-            out, _ = self.rnn(x)
-        else:
-            out, _ = self.rnn(x)
+        out, _ = self.rnn(x)
         last = out[:, -1, :]
         return self.head(last)

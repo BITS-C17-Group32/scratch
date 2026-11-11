@@ -142,7 +142,7 @@ def _fold_metrics_for_checkpoint(ckpt_path, train_df, valid_df):
 
 def compare_with_hgb(
     deep_results_path="artifacts/deep_results.json", artifacts_dir="artifacts"
-):
+) -> dict:
     deep_path = Path(deep_results_path)
     art_dir = Path(artifacts_dir)
     hgb_path = art_dir / "classical_results.json"
@@ -164,8 +164,11 @@ def compare_with_hgb(
             ckpt_path, train_df, valid_df
         )
         t["fold_metrics"] = fold_list
-        # store pooled rmsle for comparison (not in schema but useful)
         t["_pooled_rmsle"] = pooled["rmsle"]
+
+    best_deep = min(tiers, key=lambda x: x.get("_pooled_rmsle", 1e9))
+    deep_pooled = best_deep.get("_pooled_rmsle", 0.0)
+    n_rows_pooled = sum(f["n_rows"] for f in best_deep.get("fold_metrics", []))
 
     if not hgb_path.exists():
         deep_res["comparison"] = {
@@ -200,7 +203,7 @@ def compare_with_hgb(
             t.pop("_pooled_rmsle", None)
         _write_json(deep_path, deep_res)
         print("Comparison pending S3 artifact.")
-        return
+        return deep_res.get("comparison", {})
 
     hgb_res = json.load(open(hgb_path))
     # key tier by literal name hgb case-insensitive
@@ -217,17 +220,41 @@ def compare_with_hgb(
     # pooled rmsle from hgb
     hgb_pooled = None
     if hgb_tier is not None:
-        # try pooled metrics
         hgb_pooled = hgb_tier.get("pooled", {}).get("rmsle")
         if hgb_pooled is None:
             hgb_pooled = hgb_tier.get("metrics", {}).get("rmsle")
     if hgb_pooled is None:
-        hgb_pooled = hgb_res.get("hgb", {}).get("pooled", {}).get("rmsle", 0.0)
+        # schema mismatch
+        deep_res["comparison"] = {
+            "status": "schema_mismatch",
+            "source_artifact": str(hgb_path),
+            "source_sha256": _sha256_file(hgb_path),
+            "protocol": "three_tail_folds",
+            "protocol_match": False,
+            "baseline_tier": "hgb",
+            "baseline_full_grid_rmsle": None,
+            "best_deep_tier": best_deep["tier"],
+            "best_deep_full_grid_rmsle": deep_pooled,
+            "delta_rmsle": None,
+            "beats_hgb": False,
+            "rows_match": bool(n_rows_pooled == 85536),
+            "active_comparison": "unavailable",
+            "seed_check": {"status": "not_run", "seeds": [], "rmsle_range": None},
+            "training_cost": {
+                "hgb_seconds": None,
+                "deep_seconds": None,
+                "hgb_params": None,
+                "deep_params": best_deep.get("params"),
+            },
+            "reason": "HGB artifact schema mismatch or missing pooled RMSLE",
+        }
+        for t in tiers:
+            t.pop("_pooled_rmsle", None)
+        _write_json(deep_path, deep_res)
+        print("Schema mismatch with S3 artifact.")
+        return deep_res["comparison"]
 
-    best_deep = min(tiers, key=lambda x: x.get("_pooled_rmsle", 1e9))
-    deep_pooled = best_deep.get("_pooled_rmsle", 0.0)
     delta = deep_pooled - hgb_pooled
-    n_rows_pooled = sum(f["n_rows"] for f in best_deep.get("fold_metrics", []))
 
     deep_res["comparison"] = {
         "status": "ok",
@@ -243,7 +270,7 @@ def compare_with_hgb(
         "beats_hgb": bool(delta < 0),
         "rows_match": bool(n_rows_pooled == 85536),
         "active_comparison": "ok",
-        "seed_check": {"status": "ok", "seeds": [42], "rmsle_range": 0.0},
+        "seed_check": {"status": "not_run", "seeds": [42], "rmsle_range": None},
         "training_cost": {
             "hgb_seconds": None,
             "deep_seconds": best_deep.get("train", {}).get("seconds"),
@@ -260,6 +287,7 @@ def compare_with_hgb(
     print(f"HGB pooled RMSLE: {hgb_pooled:.5f}")
     print(f"Best deep tier ({best_deep['tier']}) RMSLE: {deep_pooled:.5f}")
     print(f"Delta (Deep - HGB): {delta:+.5f}")
+    return deep_res.get("comparison", {})
 
 
 def _write_json(path, obj):

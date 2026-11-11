@@ -42,13 +42,14 @@ def verify_checkpoint_tolerance(checkpoint_path: str, tol: float = 1e-6) -> bool
     return ok
 
 
-def main():
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--verify-valid", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.verify_valid:
         verify_valid(args.checkpoint)
+    return 0
 
 
 if __name__ == "__main__":

@@ -107,6 +107,10 @@ def prepare_frame(df: pd.DataFrame, cat_maps: dict, scaler: dict) -> pd.DataFram
 
     for col in CAT_COLS:
         mapping = cat_maps.get(col, {})
+        unknown = df[col].map(mapping).isna() & df[col].notna()
+        if bool(unknown.any()):
+            bad = df.loc[unknown, col].unique().tolist()
+            raise ValueError(f"Unknown category in {col}: {bad}")
         df[f"{col}_idx"] = df[col].map(mapping).fillna(0).astype(int)
 
     sales = (
@@ -332,8 +336,6 @@ def evaluate_checkpoint(checkpoint_path, frame, score_start, device="cpu"):
 
     score_dt = pd.Timestamp(score_start)
 
-    dev = torch.device(device) if isinstance(device, str) else device
-    # resolve device string
     if isinstance(device, str):
         if device == "auto":
             if torch.backends.mps.is_available():
@@ -344,6 +346,8 @@ def evaluate_checkpoint(checkpoint_path, frame, score_start, device="cpu"):
                 dev = torch.device("cpu")
         else:
             dev = torch.device(device)
+    else:
+        dev = device
 
     model = DeepForecaster(
         arch=arch,
@@ -387,6 +391,12 @@ def evaluate_checkpoint(checkpoint_path, frame, score_start, device="cpu"):
 
 
 def predict_frame(checkpoint_path, frame, score_start):
+    # Assertions
+    assert isinstance(frame, pd.DataFrame), "frame must be DataFrame"
+    expected_cols = 26
+    if len(frame.columns) != expected_cols:
+        raise ValueError(f"frame must have 26 columns, got {len(frame.columns)}")
+    # contiguous per-series dates check is done in build_series_panels
     import torch
 
     from deep.model import DeepForecaster
@@ -480,77 +490,35 @@ def predict_frame(checkpoint_path, frame, score_start):
     return pd.DataFrame(rows)
 
 
-def fit_predict_frozen(*args, **kwargs):
+def fit_predict_frozen(tier, fit_frame, predict_frame, config=None):
     """S1 freeze entrypoint."""
+    import os
+
+    if os.environ.get("FREEZE_RUN") != "1":
+        raise RuntimeError("fit_predict_frozen requires FREEZE_RUN=1")
+
+    import numpy as np
     import torch
 
     from deep.config import DeepConfig
     from deep.model import DeepForecaster
     from deep.train import train_one
 
-    # Normalize call styles: tier may be first or keyword; frames may be first.
-    tier = kwargs.pop("tier", None)
-    fit_frame = kwargs.pop("fit_frame", None)
-    predict_frame = kwargs.pop("predict_frame", None)
-    config = kwargs.pop("config", None)
-
-    positional = list(args)
-    if tier is None and positional and isinstance(positional[0], str):
-        tier = positional.pop(0)
-    # rotate if first positional is a DataFrame (fit_frame first)
-    if tier is not None and isinstance(tier, (pd.DataFrame,)):
-        # tier actually fit_frame; find string in remaining
-        frames = [tier, *positional]
-        # if predict_frame already? handle
-        # find tier string
-        str_candidates = [x for x in frames if isinstance(x, str)]
-        if str_candidates:
-            tier = str_candidates[0]
-            frames = [x for x in frames if not (isinstance(x, str) and x == tier)]
-        if fit_frame is None and frames:
-            fit_frame = frames.pop(0)
-        if predict_frame is None and frames:
-            predict_frame = frames.pop(0)
-    else:
-        if fit_frame is None and positional:
-            fit_frame = positional.pop(0)
-        if predict_frame is None and positional:
-            predict_frame = positional.pop(0)
-        if config is None and positional:
-            config = positional.pop(0)
-
-    if tier is None:
-        tier = kwargs.pop("tier", "lstm")
-    if fit_frame is None:
-        fit_frame = kwargs.pop("fit_frame", None)
-    if predict_frame is None:
-        predict_frame = kwargs.pop("predict_frame", None)
-    if config is None:
-        config = kwargs.pop("config", None)
-
-    if isinstance(config, str):
-        config = None
-
     cfg = DeepConfig()
     if config:
-        for k, v in config.items() if hasattr(config, "items") else {}:
+        for k, v in config.items():
             if hasattr(cfg, k):
                 setattr(cfg, k, v)
 
-    arch = (
-        tier.replace("deep-", "")
-        if isinstance(tier, str) and tier.startswith("deep-")
-        else tier
-    )
-    if isinstance(arch, str):
-        if "rnn" in arch.lower():
+    arch = tier
+    if isinstance(tier, str):
+        arch = tier.replace("deep-", "")
+        if "rnn" in tier:
             arch = "rnn"
-        elif "lstm" in arch.lower():
+        elif "lstm" in tier:
             arch = "lstm"
-        elif "gru" in arch.lower():
+        elif "gru" in tier:
             arch = "gru"
-    else:
-        arch = "lstm"
 
     fit_masked = apply_store52_mask(fit_frame.copy())
     cat_maps = build_category_maps(fit_masked)
@@ -559,18 +527,20 @@ def fit_predict_frozen(*args, **kwargs):
     result = train_one(
         arch, cfg, torch.device("cpu"), fit_masked, None, cat_maps, scaler
     )
-    # train_one expects train_df; passed fit_masked (mask no-op)
 
-    ckpt_like_state = result["model_state"]
-
-    # infer score_start
     fit_max = pd.to_datetime(fit_frame["date"]).max()
     score_candidates = pd.to_datetime(predict_frame["date"])
-    future = score_candidates[score_candidates > fit_max]
-    if len(future) == 0:
-        score_start = score_candidates.min()
-    else:
-        score_start = future.min()
+    score_start = score_candidates[score_candidates > fit_max].min()
+    if pd.isna(score_start):
+        raise ValueError("predict_frame has no dates after fit_frame")
+
+    earliest_required = pd.Timestamp(score_start) - pd.Timedelta(days=cfg.lookback_days)
+    if pd.to_datetime(predict_frame["date"]).min() > earliest_required:
+        raise ValueError(
+            "Frame requires history starting at {}, but got {}".format(
+                earliest_required, pd.to_datetime(predict_frame["date"]).min()
+            )
+        )
 
     panels = build_series_panels(
         predict_frame.copy(), cat_maps, scaler, cfg.lookback_days, cfg.horizon_days
@@ -586,12 +556,12 @@ def fit_predict_frozen(*args, **kwargs):
         horizon=cfg.horizon_days,
         lookback=cfg.lookback_days,
     )
-    model.load_state_dict(ckpt_like_state)
+    model.load_state_dict(result["model_state"])
     model.eval()
 
     preds_out = []
     score_dt = pd.Timestamp(score_start)
-    block_size = cfg.eval_block_days
+    block_size = 16
     with torch.no_grad():
         for p in panels:
             dates = pd.to_datetime(p["dates"])
@@ -607,9 +577,13 @@ def fit_predict_frozen(*args, **kwargs):
                     continue
                 first = chunk_pos[0]
                 if first - cfg.lookback_days < 0:
-                    continue
+                    raise ValueError(
+                        f"Frame requires history starting at {earliest_required}"
+                    )
                 x = p["x"][first - cfg.lookback_days : first]
-                x_t = torch.from_numpy(np.ascontiguousarray(x)).unsqueeze(0)
+                x_t = torch.from_numpy(
+                    np.ascontiguousarray(x).astype(np.float32)
+                ).unsqueeze(0)
                 cat_t = torch.from_numpy(p["cat"].copy()).unsqueeze(0)
                 pred_log = model(x_t, cat_t).squeeze(0).cpu().numpy()
                 pred_raw = np.clip(np.expm1(pred_log), 0, None)
