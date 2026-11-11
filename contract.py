@@ -28,8 +28,9 @@ Specifications:
   oldest first, exactly one record may ever carry freeze_run = true,
   and one record per day-2+ --check invocation is appended and verified.
 - Freeze refusal gates run before anything else: FREEZE_RUN=1, no prior
-  freeze_run = true record, full registry present, per-artifact schema.
-  No gate opens a split; local_test loads only on the Day-5 body.
+  freeze_run = true record, no freeze_results.json (a stranded artifact is
+  refused with an actionable lead), full registry present, per-artifact
+  schema. No gate opens a split; local_test loads only on the Day-5 body.
 - artifacts/freeze_results.json carries the pinned Day-5 field set
   (frozen_at, git_sha, headline_model, data_snapshot, contract_counts,
   fold_phase, freeze_phase, notes). It is written once, atomically, by
@@ -59,6 +60,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import warnings
 from collections.abc import Callable, Generator, Iterator, Sequence
@@ -194,7 +196,9 @@ MANIFEST_LOCK_WAIT_SECONDS = 2.0
 ARTIFACTS_DIR = REPO_ROOT / "artifacts"
 # Control files the contract itself owns under artifacts/; neither is a
 # model artifact, so neither registers nor trips the stray-file rule.
-# freeze_results.json registers only when the canonical freeze body lands.
+# freeze_results.json is the freeze output: the canonical freeze body
+# writes it once, and the whitelist keeps the registry scan from treating
+# it as a stray.
 CONTRACT_ARTIFACT_FILENAMES = ("run_manifest.json", "freeze_results.json")
 SCORE_KEYS = (
     "rmsle",
@@ -1282,16 +1286,71 @@ def _atomic_write_bytes(path: Path, data: bytes, *, exclusive: bool = False) -> 
         # a crash cannot publish a half-written file or lose the rename.
         _fsync_path(tmp)
         if exclusive:
+            published = False
             try:
                 os.link(tmp, path)
+                published = True
             except FileExistsError as error:
                 raise ContractError(
                     f"{path.name} already exists; it is written once, by the "
                     "freeze run, and never overwritten"
                 ) from error
             except OSError as error:
-                raise ContractError(f"{path.name} write failed: {error}") from error
-            tmp.unlink()
+                link_errno = getattr(error, "errno", None)
+                if link_errno in (errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP):
+                    try:
+                        out_fd = os.open(
+                            str(path),
+                            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                            0o644,
+                        )
+                    except FileExistsError as exists_error:
+                        raise ContractError(
+                            f"{path.name} already exists; it is written once, by the "
+                            "freeze run, and never overwritten"
+                        ) from exists_error
+                    except OSError as fallback_error:
+                        raise ContractError(
+                            f"{path.name}: the destination filesystem does not "
+                            "support hard links, so the exclusive publish cannot "
+                            "use os.link. This is a filesystem limitation, not a "
+                            "data problem. The fallback is to create the file "
+                            "exclusively (O_CREAT|O_EXCL) and write it in place, "
+                            "which preserves the write-once property, but that "
+                            f"fallback also failed: {fallback_error}"
+                        ) from fallback_error
+                    try:
+                        os.fchmod(out_fd, 0o644)
+                        os.write(out_fd, data)
+                        os.fsync(out_fd)
+                    except OSError as fallback_error:
+                        try:
+                            os.close(out_fd)
+                        except OSError:
+                            pass
+                        try:
+                            path.unlink()
+                        except OSError:
+                            pass
+                        raise ContractError(
+                            f"{path.name}: the destination filesystem does not "
+                            "support hard links, so the exclusive publish cannot "
+                            "use os.link. This is a filesystem limitation, not a "
+                            "data problem. The fallback is to create the file "
+                            "exclusively (O_CREAT|O_EXCL) and write it in place, "
+                            "which preserves the write-once property, but that "
+                            f"fallback also failed: {fallback_error}"
+                        ) from fallback_error
+                    else:
+                        os.close(out_fd)
+                        published = True
+                else:
+                    raise ContractError(f"{path.name} write failed: {error}") from error
+            if published:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
         else:
             try:
                 os.replace(tmp, path)
@@ -1306,17 +1365,25 @@ def _atomic_write_bytes(path: Path, data: bytes, *, exclusive: bool = False) -> 
             pass
 
 
-_MANIFEST_LOCK_HELD: list[int] = []
+# Held manifest locks, keyed by (resolved directory, thread id) so a nested
+# acquisition reuses the fd only for the same directory in the same thread.
+# A nested acquisition for a different directory, or an acquisition from a
+# different thread in the same process, takes its own lock. Each entry is
+# (directory_key, thread_id, fd); reentrant entries append the same tuple.
+_MANIFEST_LOCK_HELD: list[tuple[str, int, int]] = []
 
 
 @contextlib.contextmanager
 def _manifest_lock(directory: Path) -> Iterator[None]:
     """Hold the manifest's advisory lock for the duration of the block.
 
-    The lock is reentrant: a nested acquisition (the freeze path holds it
-    across the pre-flight gate, the artifact write and the manifest stamp,
-    and each of those writes a manifest record) reuses the held lock
-    instead of deadlocking against itself.
+    The lock is reentrant within the same thread for the same resolved
+    directory: a nested acquisition (the freeze path holds it across the
+    pre-flight gate, the artifact write and the manifest stamp, and each of
+    those writes a manifest record) reuses the held lock instead of
+    deadlocking against itself. A nested acquisition for a different
+    directory, or an acquisition from a different thread in the same
+    process, takes and holds its own lock.
 
     The marker file records the owner's PID. It is written AFTER the lock
     is taken, so a waiter that sees a PID is looking at a live holder;
@@ -1324,11 +1391,13 @@ def _manifest_lock(directory: Path) -> Iterator[None]:
     holds the lock, and the refusal says so rather than blaming it.
     """
     lock_path = directory / "run_manifest.json.lock"
+    key = (str(directory.resolve()), threading.get_ident())
     held = _MANIFEST_LOCK_HELD
-    if held:
-        # Already held by this process: the flock is per open file
-        # description, so re-locking here would block on ourselves.
-        held.append(held[-1])
+    current = [entry for entry in held if (entry[0], entry[1]) == key]
+    if current:
+        # Already held by this thread for this directory: the flock is per
+        # open file description, so re-locking here would block on ourselves.
+        held.append(current[-1])
         try:
             yield
         finally:
@@ -1361,6 +1430,12 @@ def _manifest_lock(directory: Path) -> Iterator[None]:
                     if holder.isdigit():
                         try:
                             os.kill(int(holder), 0)
+                        except PermissionError:
+                            stale = (
+                                " (that process is alive but not owned by this user)"
+                            )
+                        except ProcessLookupError:
+                            stale = " (that process is gone; the marker is stale)"
                         except OSError:
                             stale = " (that process is gone; the marker is stale)"
                     raise ContractError(
@@ -1372,10 +1447,11 @@ def _manifest_lock(directory: Path) -> Iterator[None]:
     except BaseException:
         os.close(lock_fd)
         raise
+    entry = (key[0], key[1], lock_fd)
     try:
         os.ftruncate(lock_fd, 0)
         os.write(lock_fd, str(os.getpid()).encode("ascii"))
-        held.append(lock_fd)
+        held.append(entry)
         try:
             yield
         finally:
@@ -1493,6 +1569,30 @@ def write_run_manifest(
 def _freeze_stamp() -> str:
     """The freeze run's manifest timestamp, captured once and reused."""
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _quarantine_stranded_freeze_results(directory: Path, stamp: str) -> Path:
+    """Move a stranded freeze_results.json aside under the manifest lock.
+
+    The stamp failed after the artifact was published, so the canonical
+    name is freed for the sanctioned re-run by renaming the stranded file
+    under the same lock that guarded the publish. The quarantined name
+    does not end with .json, so it never collides with the artifact
+    registry's JSON scan.
+    """
+    source = directory / FREEZE_RESULTS_FILENAME
+    suffix = stamp.replace(":", "").replace("-", "")
+    failed = directory / f"freeze_results.failed-{suffix}"
+    if failed.exists():
+        failed = directory / f"freeze_results.failed-{suffix}-{os.getpid()}"
+    try:
+        os.replace(source, failed)
+    except OSError as error:
+        raise ContractError(
+            f"freeze: the manifest stamp failed and {FREEZE_RESULTS_FILENAME} "
+            f"could not be moved aside for a re-run: {error}"
+        ) from error
+    return failed
 
 
 def _write_manifest_record(
@@ -2173,9 +2273,12 @@ def _freeze_preflight(
     """Every freeze refusal gate, in order; opens no split.
 
     Gate order: FREEZE_RUN=1 -> exactly-one-freeze (a freeze_run = true
-    record refuses any repeat) -> the registry scan (unknown file, zero
-    registered artifacts, partial registry) -> per-artifact schema.
-    Every refusal is a friendly ContractError, never a traceback.
+    record refuses any repeat, and that refusal already covers a committed
+    freeze) -> the artifact-existence gate (a freeze_results.json with no
+    freeze_run = true record is a stranded artifact, refused with an
+    actionable lead) -> the registry scan (unknown file, zero registered
+    artifacts, partial registry) -> per-artifact schema. Every refusal is a
+    friendly ContractError, never a traceback.
     """
     if os.environ.get("FREEZE_RUN") != "1":
         raise ContractError(
@@ -2184,7 +2287,8 @@ def _freeze_preflight(
         )
     manifest_path = artifacts_dir / "run_manifest.json"
     records = list(read_run_manifest(manifest_path)) if manifest_path.exists() else []
-    if any(record["freeze_run"] is True for record in records):
+    frozen = any(record["freeze_run"] is True for record in records)
+    if frozen:
         raise ContractError(
             "freeze refused: run_manifest.json already carries "
             "freeze_run = true; redoing a freeze takes a chat-noted "
@@ -2192,10 +2296,17 @@ def _freeze_preflight(
         )
     freeze_results = artifacts_dir / FREEZE_RESULTS_FILENAME
     if freeze_results.exists():
+        # The exactly-one-freeze gate above has already refused a committed
+        # freeze, so reaching here means the artifact is stranded: the stamp
+        # failed after the artifact was published and no freeze_run = true
+        # record was written.
         raise ContractError(
-            f"freeze refused: {FREEZE_RESULTS_FILENAME} already exists; the "
-            "freeze output is written once and never overwritten, so a "
-            "second freeze needs a chat-noted decision, never silence"
+            f"freeze refused: {FREEZE_RESULTS_FILENAME} already exists but the "
+            "manifest carries no freeze_run = true record (a stranded "
+            f"artifact). Remove or rename {FREEZE_RESULTS_FILENAME} in "
+            f"{artifacts_dir} (for example, move it aside as "
+            f"{FREEZE_RESULTS_FILENAME}.stranded) after noting the failed "
+            "attempt in chat, then re-run the freeze"
         )
     registered = _scan_registered_artifacts(artifacts_dir)
     if not registered:
@@ -2319,48 +2430,125 @@ def _row_keys(frame: pd.DataFrame) -> list[tuple[int, str, int]]:
     return list(zip(stores.tolist(), families.tolist(), dates.tolist(), strict=True))
 
 
+def _prediction_side_keys(
+    model_name: str, index: pd.Index
+) -> list[tuple[int, str, int]]:
+    """Read (store_nbr, family, date) keys from a prediction Series index.
+
+    The key comes from the prediction side (the Series index), never from the
+    contract frame, so a keyed return can be reconciled to local_test by that
+    key instead of by position.
+    """
+    if isinstance(index, pd.MultiIndex):
+        if index.nlevels != 3:
+            raise ContractError(
+                f"freeze: model {model_name!r} returned a keyed Series whose "
+                f"index has {index.nlevels} levels; expected 3 levels "
+                "(store_nbr, family, date)"
+            )
+        stores = index.get_level_values(0).to_numpy(dtype=np.int64)
+        families = index.get_level_values(1).astype(str).to_numpy()
+        date_level = index.get_level_values(2)
+        if not pd.api.types.is_datetime64_any_dtype(date_level):
+            raise ContractError(
+                f"freeze: model {model_name!r} returned a keyed Series whose "
+                "date level is not a datetime; the keyed return must carry "
+                "real dates, not an integer day number, so the key is "
+                "unambiguous"
+            )
+        dates = (
+            pd.to_datetime(date_level).to_numpy(dtype="datetime64[D]").astype(np.int64)
+        )
+    else:
+        stores_list: list[int] = []
+        families_list: list[str] = []
+        dates_list: list[int] = []
+        for item in index:
+            if not isinstance(item, tuple) or len(item) != 3:
+                raise ContractError(
+                    f"freeze: model {model_name!r} returned a keyed Series whose "
+                    "index entries are not (store_nbr, family, date) tuples"
+                )
+            store, family, date = item
+            stores_list.append(int(store))
+            families_list.append(str(family))
+            dates_list.append(
+                int(np.datetime64(pd.Timestamp(date), "D").astype(np.int64))
+            )
+        stores = np.asarray(stores_list, dtype=np.int64)
+        families = np.asarray(families_list, dtype=object)
+        dates = np.asarray(dates_list, dtype=np.int64)
+    return list(zip(stores.tolist(), families.tolist(), dates.tolist(), strict=True))
+
+
 def _align_local_test_predictions(
     model_name: str,
     raw: Any,
     predict_frame: pd.DataFrame,
     local_test: pd.DataFrame,
 ) -> np.ndarray:
-    """Align a fit_predict_frozen return to the local_test rows, BY KEY.
+    """Align a fit_predict_frozen return to the local_test rows.
 
-    The sanctioned entrypoints are pinned to one of two shapes: aligned to
-    the predict_frame row order (S3) or to the local_test rows only (S4).
-    Both are accepted; anything else is refused with both counts named.
+    Two return shapes are accepted. A 1-D array-like aligned to the
+    predict_frame row order (S3) or to the local_test rows only (S4) is
+    accepted; the two shapes are distinguished by length, and anything else
+    is refused with both counts named. An ndarray/list carries no
+    prediction-side key, so it is taken as the entrypoint returned rows in
+    that frame's own row order.
 
-    The pairing is by the (store_nbr, family, date) key, never by
-    position: the prediction for a row is looked up by that key, so a
-    track that returns its rows in a different order still scores the
-    right pairs against the right labels. A returned order that cannot be
-    reconciled by key is refused, never silently scored.
+    A pandas Series whose index carries (store_nbr, family, date) keys is
+    aligned by looking those prediction-side keys up against local_test, so
+    a keyed Series may be returned in a different row order and still score
+    the right pairs. A keyed return that cannot be reconciled to every
+    local_test row is refused.
     """
-    try:
-        predictions = np.asarray(raw, dtype=np.float64)
-    except (TypeError, ValueError) as error:
-        raise ContractError(
-            f"freeze: model {model_name!r} returned a non-numeric prediction "
-            f"array: {error}"
-        ) from error
-    if predictions.ndim != 1:
-        raise ContractError(
-            f"freeze: model {model_name!r} returned a {predictions.ndim}-D "
-            "prediction array; predictions must be 1-D"
-        )
     predict_frame_rows = len(predict_frame)
     local_test_rows = len(local_test)
-    if predictions.size == local_test_rows:
-        source_keys = _row_keys(local_test)
-    elif predictions.size == predict_frame_rows:
-        source_keys = _row_keys(predict_frame)
+    wanted = _row_keys(local_test)
+
+    if isinstance(raw, pd.Series):
+        try:
+            predictions = np.asarray(raw.to_numpy(), dtype=np.float64)
+        except (TypeError, ValueError) as error:
+            raise ContractError(
+                f"freeze: model {model_name!r} returned a non-numeric prediction "
+                f"array: {error}"
+            ) from error
+        if predictions.ndim != 1:
+            raise ContractError(
+                f"freeze: model {model_name!r} returned a {predictions.ndim}-D "
+                "prediction array; predictions must be 1-D"
+            )
+        source_keys = _prediction_side_keys(model_name, raw.index)
     else:
+        try:
+            predictions = np.asarray(raw, dtype=np.float64)
+        except (TypeError, ValueError) as error:
+            raise ContractError(
+                f"freeze: model {model_name!r} returned a non-numeric prediction "
+                f"array: {error}"
+            ) from error
+        if predictions.ndim != 1:
+            raise ContractError(
+                f"freeze: model {model_name!r} returned a {predictions.ndim}-D "
+                "prediction array; predictions must be 1-D"
+            )
+        if predictions.size == local_test_rows:
+            source_keys = _row_keys(local_test)
+        elif predictions.size == predict_frame_rows:
+            source_keys = _row_keys(predict_frame)
+        else:
+            raise ContractError(
+                f"freeze: model {model_name!r} returned {predictions.size} "
+                f"predictions; expected {local_test_rows} (aligned to the "
+                f"local_test rows) or {predict_frame_rows} (aligned to the "
+                "predict_frame row order)"
+            )
+
+    if len(predictions) != len(source_keys):
         raise ContractError(
-            f"freeze: model {model_name!r} returned {predictions.size} "
-            f"predictions; expected {local_test_rows} (aligned to the "
-            f"local_test rows) or {predict_frame_rows} (aligned to the "
-            "predict_frame row order)"
+            f"freeze: model {model_name!r} returned {len(predictions)} "
+            f"predictions for {len(source_keys)} keyed row(s); the counts must match"
         )
     if len(set(source_keys)) != len(source_keys):
         raise ContractError(
@@ -2368,7 +2556,6 @@ def _align_local_test_predictions(
             "repeat a (store_nbr, family, date) key; the alignment is by key"
         )
     index_by_key = {key: position for position, key in enumerate(source_keys)}
-    wanted = _row_keys(local_test)
     missing = [key for key in wanted if key not in index_by_key]
     if missing:
         raise ContractError(
@@ -2443,7 +2630,6 @@ def _freeze_model_specs(payloads: dict[str, dict[str, Any]]) -> list[dict[str, A
                     "name": str(entry[spec["tier_name_key"]]),
                     "track": spec["track"],
                     "artifact": artifact_name,
-                    "module": KIND_BY_ARTIFACT[artifact_name],
                     "config": config,
                 }
             )
@@ -2820,6 +3006,12 @@ def _validate_contract_counts(counts: Any) -> None:
                 f"{block['rows']} of {block['of_rows']} != the pinned "
                 f"{pinned[0]} of {pinned[1]}"
             )
+        expected_share = round(block["rows"] / block["of_rows"], 6)
+        if share != expected_share:
+            raise ContractError(
+                f"freeze_results.json: contract_counts {key} share {share} "
+                f"!= the pinned {expected_share}"
+            )
     holdout = counts["preopening_holdout_rows"]
     if not isinstance(holdout, dict) or sorted(holdout) != [
         "local_test",
@@ -2938,8 +3130,21 @@ def _validate_fold_phase(block: Any) -> list[dict[str, Any]]:
     return models
 
 
-def _validate_freeze_phase(block: Any) -> list[dict[str, Any]]:
-    """The freeze_phase block: one record per registered model."""
+def _validate_freeze_phase(
+    block: Any,
+    *,
+    expected_rows: int = PINNED_SPLIT_ROWS["local_test"],
+    expected_bounds: tuple[str, str] = (
+        SPLIT_FRAME_STARTS["local_test"],
+        SPLIT_FRAME_ENDS["local_test"],
+    ),
+) -> list[dict[str, Any]]:
+    """The freeze_phase block: the pinned local_test window, one record per model.
+
+    The defaults are the real local_test pins, so the production calls
+    and the committed-artifact path are pinned; a caller validating a
+    stand-in frame passes that frame's own rows and bounds.
+    """
     if not isinstance(block, dict) or sorted(block) != [
         "models",
         "n_rows",
@@ -2951,16 +3156,35 @@ def _validate_freeze_phase(block: Any) -> list[dict[str, Any]]:
             "window_end, n_rows and models"
         )
     _require_int(block["n_rows"], "freeze_results.json: freeze_phase n_rows")
+    if block["n_rows"] != expected_rows:
+        raise ContractError(
+            f"freeze_results.json: freeze_phase n_rows {block['n_rows']} "
+            f"!= the pinned {expected_rows}"
+        )
     for key in ("window_start", "window_end"):
         if not isinstance(block[key], str) or not block[key]:
             raise ContractError(
                 f"freeze_results.json: freeze_phase {key} must be a non-empty string"
+            )
+        pinned_edge = expected_bounds[0 if key == "window_start" else 1]
+        if block[key] != pinned_edge:
+            raise ContractError(
+                f"freeze_results.json: freeze_phase {key} {block[key]!r} "
+                f"!= the pinned {pinned_edge!r}"
             )
     models = block["models"]
     if not isinstance(models, list) or not models:
         raise ContractError(
             "freeze_results.json: freeze_phase must carry at least one model"
         )
+    # The registry pins each model's track and artifact: a fabricated
+    # name has no registry entry, and a registry name carries exactly
+    # the track and artifact the registry records for it.
+    registered = {
+        name: (spec["track"], artifact_name)
+        for artifact_name, spec in ARTIFACT_REGISTRY.items()
+        for name in spec["model_names"]
+    }
     for index, model in enumerate(models):
         label = f"freeze_results.json: freeze_phase models[{index}]"
         expected = [
@@ -2976,7 +3200,35 @@ def _validate_freeze_phase(block: Any) -> list[dict[str, Any]]:
             raise ContractError(f"{label} must carry exactly {expected}")
         if not isinstance(model["name"], str) or not model["name"]:
             raise ContractError(f"{label} name must be a non-empty string")
+        identity = registered.get(model["name"])
+        if identity is None:
+            raise ContractError(
+                f"{label} name {model['name']!r} is not a registered model name"
+            )
+        pinned_track, pinned_artifact = identity
+        if model["track"] != pinned_track:
+            raise ContractError(
+                f"{label} track {model['track']!r} != the registry "
+                f"{pinned_track!r} for {model['name']!r}"
+            )
+        if model["artifact"] != pinned_artifact:
+            raise ContractError(
+                f"{label} artifact {model['artifact']!r} != the registry "
+                f"{pinned_artifact!r} for {model['name']!r}"
+            )
         _require_int(model["n_rows"], f"{label} n_rows")
+        if model["n_rows"] != expected_rows:
+            raise ContractError(
+                f"{label} n_rows {model['n_rows']} != the pinned {expected_rows}"
+            )
+        for key in ("window_start", "window_end"):
+            if not isinstance(model[key], str) or not model[key]:
+                raise ContractError(f"{label} {key} must be a non-empty string")
+            pinned_edge = expected_bounds[0 if key == "window_start" else 1]
+            if model[key] != pinned_edge:
+                raise ContractError(
+                    f"{label} {key} {model[key]!r} != the pinned {pinned_edge!r}"
+                )
         slices = model["slices"]
         if not isinstance(slices, dict) or sorted(slices) != sorted(FREEZE_SLICE_NAMES):
             raise ContractError(
@@ -2988,7 +3240,14 @@ def _validate_freeze_phase(block: Any) -> list[dict[str, Any]]:
 
 
 def _validate_freeze_results(
-    payload: Any, *, expected_models: int | None = None
+    payload: Any,
+    *,
+    expected_models: int | None = None,
+    expected_rows: int = PINNED_SPLIT_ROWS["local_test"],
+    expected_bounds: tuple[str, str] = (
+        SPLIT_FRAME_STARTS["local_test"],
+        SPLIT_FRAME_ENDS["local_test"],
+    ),
 ) -> None:
     """The pinned freeze_results.json schema; any drift is a loud refusal."""
     if not isinstance(payload, dict):
@@ -3037,7 +3296,11 @@ def _validate_freeze_results(
     _validate_data_snapshot(payload["data_snapshot"])
     _validate_contract_counts(payload["contract_counts"])
     fold_models = _validate_fold_phase(payload["fold_phase"])
-    freeze_models = _validate_freeze_phase(payload["freeze_phase"])
+    freeze_models = _validate_freeze_phase(
+        payload["freeze_phase"],
+        expected_rows=expected_rows,
+        expected_bounds=expected_bounds,
+    )
     names = [str(model["name"]) for model in freeze_models]
     if headline not in names:
         raise ContractError(
@@ -3060,14 +3323,27 @@ def _validate_freeze_results(
             f"freeze_results.json: the fold phase models {fold_names} != the "
             f"freeze phase models {sorted(names)}"
         )
+    # The payload's model names must be the registry's pinned names: a
+    # fabricated name is refused even when the fold and the freeze phase
+    # agree with each other, and even when the count happens to match.
+    registered_models = sorted(
+        name for spec in ARTIFACT_REGISTRY.values() for name in spec["model_names"]
+    )
+    unregistered = sorted((set(names) | set(fold_names)) - set(registered_models))
+    if unregistered:
+        raise ContractError(
+            f"freeze_results.json: model names {unregistered} are not "
+            f"registered model names {registered_models}"
+        )
 
 
 def _write_freeze_results(path: Path, payload: dict[str, Any]) -> None:
     """Write freeze_results.json atomically, then re-open and re-parse it.
 
-    Same-dir temp file and a rename (a crash mid-write never leaves a
-    half-written file behind), then the file is reopened, its size
-    asserted and its content compared with the payload.
+    Same-dir temp file published with an exclusive link (a crash mid-write
+    never leaves a half-written file behind and never overwrites an
+    existing artifact), then the file is reopened, its size asserted and
+    its content compared with the payload.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
@@ -3154,7 +3430,7 @@ def _load_sanctioned_entrypoints() -> dict[str, dict[str, Any]]:
                 f"sanctioned entrypoint {module_name} for {artifact_name} "
                 "missing symbol fit_predict_frozen"
             )
-        entrypoints[artifact_name] = {"module": module_name, "call": symbol}
+        entrypoints[artifact_name] = {"call": symbol}
     return entrypoints
 
 
@@ -3230,11 +3506,16 @@ def _run_canonical_sequence(
     notes: list[str],
     frozen_at: str,
     git_sha: str,
+    write: bool = True,
 ) -> dict[str, Any]:
-    """Steps 3-5: score every model, assemble the payload, write it.
+    """Steps 3-5: score every model, assemble and validate the payload.
 
-    Nothing is written until every registered model scored: a failing
-    phase leaves the artifacts directory without a freeze_results.json.
+    With write=True the payload is published to freeze_results.json
+    atomically, which is how the self-audit and fixture flows use it.
+    With write=False nothing is written; the canonical freeze computes
+    outside the manifest lock and publishes inside the locked section, so
+    a failing phase leaves the artifacts directory without a
+    freeze_results.json.
     """
     records = _freeze_phase_records(models, local_test, predict_frame, predict)
     freeze_phase = {
@@ -3254,8 +3535,21 @@ def _run_canonical_sequence(
         "freeze_phase": freeze_phase,
         "notes": list(notes),
     }
-    _validate_freeze_results(payload, expected_models=len(models))
-    _write_freeze_results(directory / FREEZE_RESULTS_FILENAME, payload)
+    _validate_freeze_results(
+        payload,
+        expected_models=len(models),
+        # The freeze window is scored from THIS local_test frame, so the
+        # validator pins the payload to the frame's own rows and bounds;
+        # on the real path that frame is the pinned split, and on the
+        # battery's stand-ins it is the fixture frame.
+        expected_rows=len(local_test),
+        expected_bounds=(
+            local_test["date"].min().date().isoformat(),
+            local_test["date"].max().date().isoformat(),
+        ),
+    )
+    if write:
+        _write_freeze_results(directory / FREEZE_RESULTS_FILENAME, payload)
     return payload
 
 
@@ -3265,9 +3559,10 @@ def _freeze_day5(
     """The canonical Day-5 sequence, steps 1 to 5 of sheet §5.
 
     Step 1: the registered artifacts are re-read (the pre-flight gate
-    owns the schema check). Step 2: FREEZE_RUN=1 is set and
-    splits/local_test.parquet is loaded exactly once through the guarded
-    load_split. Step 3: every registered model is called through its
+    owns the schema check). Step 2: splits/local_test.parquet is loaded
+    exactly once through the guarded load_split; the pre-flight gate has
+    already required FREEZE_RUN=1 and this path only reads the flag.
+    Step 3: every registered model is called through its
     sanctioned fit_predict_frozen with fit_frame = concat(train, valid)
     masked by fit_rows and predict_frame = valid's 60-day tail followed
     by local_test. Step 4: the pinned score schema runs on the full grid,
@@ -3353,6 +3648,7 @@ def _freeze_day5(
         notes=_freeze_notes(),
         frozen_at=frozen_at,
         git_sha=sha,
+        write=False,
     )
 
 
@@ -3362,17 +3658,14 @@ def freeze(artifacts_dir: Path | None = None) -> int:
     Gates (all friendly refusals): FREEZE_RUN=1; no prior freeze_run =
     true record; the full registry present and schema-clean; sanctioned
     per-track entrypoints importable on the merged tree. The gates
-    themselves open no split and never touch local_test. On Day 5
-    morning the canonical sequence runs here: re-verified artifacts,
-    FREEZE_RUN=1 set and the guarded load_split("local_test") called
-    once, fit_frame = load_frame() masked by fit_rows, predict_frame =
-    valid's 60-day tail followed by local_test, per-tier
-    fit_predict_frozen, the pinned score schema on full-grid,
-    active-slice and the Christmas-2016 slice (1,782 rows),
-    artifacts/freeze_results.json written atomically, then one manifest
-    record stamped freeze_run = true. Any failing phase prints FAIL
-    with the phase named and records the attempt (freeze_run stays
-    false on failures), returning 1.
+    themselves open no split and never touch local_test. The model run
+    happens outside the manifest lock; the pre-flight gate, the artifact
+    write and the manifest stamp run inside one locked section so the
+    committed artifact and the manifest agree. On stamp failure the
+    artifact is renamed aside under the same lock, leaving the canonical
+    name free for the sanctioned re-run. Any failing phase prints FAIL
+    with the phase named and records the attempt when that is possible;
+    freeze_run stays false on failures, returning 1.
     """
     started = time.perf_counter()
     directory = Path(artifacts_dir) if artifacts_dir is not None else ARTIFACTS_DIR
@@ -3397,84 +3690,122 @@ def freeze(artifacts_dir: Path | None = None) -> int:
             return
 
     try:
-        # One critical section: the pre-flight gate, the artifact write and
-        # the manifest stamp are a single locked unit, so a concurrent
-        # --freeze cannot interleave between them and a concurrent --check
-        # append cannot make this freeze report a failure.
-        with _manifest_lock(directory):
-            try:
-                _freeze_preflight(directory)
-            except ContractError as error:
-                phase = "pre-flight gates"
-                reasons = [str(error)]
-                print(f"FAIL freeze, {phase}: {error}")
-                _record_attempt(phase, reasons)
-                return 1
+        try:
+            _freeze_preflight(directory)
+        except ContractError as error:
+            phase = "pre-flight gates"
+            reasons = [str(error)]
+            print(f"FAIL freeze, {phase}: {error}")
+            _record_attempt(phase, reasons)
+            return 1
 
-            phase = "sanctioned entrypoints"
-            try:
-                entrypoints = _load_sanctioned_entrypoints()
-            except ContractError as error:
-                reasons = [f"not merged yet - {error}"]
-                print(f"FAIL freeze, {phase}: {'; '.join(reasons)}")
-                _record_attempt(phase, reasons)
-                return 1
+        phase = "sanctioned entrypoints"
+        try:
+            entrypoints = _load_sanctioned_entrypoints()
+        except ContractError as error:
+            reasons = [f"not merged yet - {error}"]
+            print(f"FAIL freeze, {phase}: {'; '.join(reasons)}")
+            _record_attempt(phase, reasons)
+            return 1
 
-            phase = "canonical sequence"
-            try:
-                payload = _freeze_day5(directory, entrypoints)
-            except ContractError as error:
-                print(f"FAIL freeze, {phase}: {error}")
-                _record_attempt(phase, [str(error)])
-                return 1
+        phase = "canonical sequence"
+        try:
+            payload = _freeze_day5(directory, entrypoints)
+        except ContractError as error:
+            print(f"FAIL freeze, {phase}: {error}")
+            _record_attempt(phase, [str(error)])
+            return 1
 
-            elapsed = round(time.perf_counter() - started, 3)
-            stamp = _freeze_stamp()
-            try:
-                _write_manifest_record(
-                    directory,
-                    "contract.py --freeze",
-                    exit_status=0,
-                    elapsed_seconds=elapsed,
-                    arguments={"freeze": "1"},
-                    freeze_run=True,
-                    notes=[
-                        *_dirty_notes(),
-                        f"freeze_results.json written; headline model "
-                        f"{payload['headline_model']}",
-                    ],
-                    path=directory / "run_manifest.json",
-                    git_sha=payload["git_sha"],
-                    created=stamp,
-                )
-            except Exception as error:
+        # Publish and stamp inside one locked section. The pre-flight
+        # gate is re-validated here, so the write-once refusal and the
+        # registry/manifest checks cannot race the model run.
+        try:
+            with _manifest_lock(directory):
+                try:
+                    _freeze_preflight(directory)
+                except ContractError as error:
+                    phase = "pre-flight gates"
+                    reasons = [str(error)]
+                    print(f"FAIL freeze, {phase}: {error}")
+                    _record_attempt(phase, reasons)
+                    return 1
+
+                _write_freeze_results(directory / FREEZE_RESULTS_FILENAME, payload)
+
+                elapsed = round(time.perf_counter() - started, 3)
+                stamp = _freeze_stamp()
+                try:
+                    _write_manifest_record(
+                        directory,
+                        "contract.py --freeze",
+                        exit_status=0,
+                        elapsed_seconds=elapsed,
+                        arguments={"freeze": "1"},
+                        freeze_run=True,
+                        notes=[
+                            *_dirty_notes(),
+                            "freeze_results.json written; headline model "
+                            f"{payload['headline_model']}",
+                        ],
+                        path=directory / "run_manifest.json",
+                        git_sha=payload["git_sha"],
+                        created=stamp,
+                    )
+                except Exception as error:
+                    failed_path = _quarantine_stranded_freeze_results(directory, stamp)
+                    print(
+                        f"FAIL freeze, manifest record: {error}; "
+                        f"{FREEZE_RESULTS_FILENAME} was moved aside to "
+                        f"{failed_path.name} so the freeze can be re-run"
+                    )
+                    _record_attempt("manifest record", [repr(error)])
+                    return 1
+
+                # Under the lock no concurrent writer can interleave, so the
+                # appended record is records[-1]. The stamp is a secondary
+                # assertion that this is the record we just wrote.
+                records = read_run_manifest(directory / "run_manifest.json")
+                record = records[-1] if records else {}
+                if record.get("created") != stamp:
+                    print(
+                        "FAIL freeze, manifest record: the appended record was "
+                        f"not found at the end of the manifest (expected stamp "
+                        f"{stamp}, found {record.get('created')!r})"
+                    )
+                    _record_attempt(
+                        "manifest record",
+                        [
+                            "the appended record was not found at the end of "
+                            f"the manifest (expected stamp {stamp})"
+                        ],
+                    )
+                    return 1
+                if (
+                    record.get("freeze_run") is not True
+                    or record.get("git_sha") != payload["git_sha"]
+                ):
+                    print(
+                        "FAIL freeze, manifest record: the appended record does "
+                        "not carry freeze_run = true with the freeze's git sha"
+                    )
+                    _record_attempt(
+                        "manifest record",
+                        [
+                            "the appended record does not carry freeze_run = true "
+                            "with the freeze's git sha"
+                        ],
+                    )
+                    return 1
+        except ContractError as error:
+            if "another writer holds the lock" in str(error):
                 print(
-                    f"FAIL freeze, manifest record: {error}; freeze_results.json is "
-                    "already written and the manifest must be repaired by hand"
-                )
-                _record_attempt("manifest record", [repr(error)])
-                return 1
-            # Verify the record THIS run appended, found by its stamp, not by
-            # position: a concurrent writer may have appended after us.
-            records = read_run_manifest(directory / "run_manifest.json")
-            appended = [r for r in records if r.get("created") == stamp]
-            if len(appended) != 1:
-                print(
-                    "FAIL freeze, manifest record: the appended record was not "
-                    f"found by its stamp {stamp}; the manifest holds "
-                    f"{len(appended)} matching records"
+                    f"FAIL freeze, manifest lock: {error}; the attempted run "
+                    "could not be recorded in the manifest because another "
+                    "writer holds the lock"
                 )
                 return 1
-            record = appended[0]
-            if (
-                record.get("freeze_run") is not True
-                or record.get("git_sha") != payload["git_sha"]
-            ):
-                print(
-                    "FAIL freeze, manifest record: the appended record does not "
-                    "carry freeze_run = true with the freeze's git sha"
-                )
-                return 1
+            raise
+
         print(
             f"PASS freeze: {len(payload['freeze_phase']['models'])} models "
             f"scored on the frozen holdout; headline {payload['headline_model']}; "
@@ -3484,23 +3815,11 @@ def freeze(artifacts_dir: Path | None = None) -> int:
     except SystemExit:
         raise
     except Exception as error:
-        elapsed = round(time.perf_counter() - started, 3)
         phase = "freeze"
         reasons = [f"unexpected failure: {error!r}"]
         print(f"FAIL freeze, {phase}: {'; '.join(reasons)}")
         try:
-            write_run_manifest(
-                "contract.py --freeze",
-                exit_status=1,
-                elapsed_seconds=elapsed,
-                arguments={"freeze": "1"},
-                notes=[
-                    *_dirty_notes(),
-                    f"failed phase: {phase}",
-                    *reasons,
-                ],
-                artifacts_dir=directory,
-            )
+            _record_attempt(phase, reasons)
         except Exception as audit_error:
             print(f"FAIL {audit_error!r}")
         return 1
@@ -4104,6 +4423,22 @@ def _check_scorer() -> None:
     print(f"PASS score: all {len(cases)} guard cases refuse with a friendly error")
 
 
+def _fold_table_pin(fold: int, label: str) -> tuple[int, str, str, str]:
+    """The pinned fold row for a fold number, with the fold bounded.
+
+    The fold number must sit inside 1..len(FOLD_TABLE_PINS): fold 0 would
+    silently validate against the last fold's window and a fold past the
+    end would raise a raw IndexError, so both are refused with a
+    friendly ContractError naming the valid range.
+    """
+    if not 1 <= fold <= len(FOLD_TABLE_PINS):
+        raise ContractError(
+            f"{label}: fold {fold} is outside the pinned fold range "
+            f"1..{len(FOLD_TABLE_PINS)}"
+        )
+    return FOLD_TABLE_PINS[fold - 1]
+
+
 def _check_folds() -> None:
     """Day-2 block: the pinned rolling-origin table and its pooling."""
     table = folds_table()
@@ -4136,6 +4471,23 @@ def _check_folds() -> None:
         raise ContractError(
             "make_folds is not folds_table; the alias must be the same callable"
         )
+    # The fold index is bounded: fold 0 and a fold past the end are
+    # refused with a friendly error, never a raw IndexError and never a
+    # silent validation against another fold's window.
+    for bad_fold in (0, len(FOLD_TABLE_PINS) + 1):
+        try:
+            _fold_table_pin(bad_fold, "folds_table")
+        except ContractError as error:
+            if "outside the pinned fold range" not in str(error):
+                raise ContractError(
+                    f"the fold index {bad_fold} refused with the wrong lead: {error}"
+                ) from error
+        except IndexError as error:
+            raise ContractError(
+                f"the fold index {bad_fold} escaped as a raw IndexError: {error}"
+            ) from error
+        else:
+            raise ContractError(f"the fold index {bad_fold} was accepted")
     valid = load_split("valid")
     valid_start = valid["date"].min()
     valid_end = valid["date"].max()
@@ -4166,6 +4518,10 @@ def _check_folds() -> None:
     print(
         f"PASS folds: pooled {POOLED_FOLD_ROWS:,} rows; "
         "make_folds aliases folds_table (one implementation)"
+    )
+    print(
+        f"PASS folds: a fold number outside the pinned range 1..{len(FOLD_TABLE_PINS)} "
+        "is refused with a friendly error, never a raw IndexError"
     )
 
 
@@ -4230,6 +4586,91 @@ def _check_manifest_writer() -> None:
                 "furniture in place"
             )
         lock_inode = lock_path.stat().st_ino
+        with _manifest_lock(tmp_dir):
+            if not _manifest_lock_held(tmp_dir):
+                raise ContractError(
+                    "a held manifest lock was not reported as held for its directory"
+                )
+            nested_dir = tmp_dir / "nested"
+            nested_dir.mkdir()
+            with _manifest_lock(nested_dir):
+                if not _manifest_lock_held(nested_dir):
+                    raise ContractError(
+                        "a nested lock for a different directory did not hold that "
+                        "directory's lock"
+                    )
+                if not _manifest_lock_held(tmp_dir):
+                    raise ContractError(
+                        "holding a nested lock for a different directory dropped "
+                        "the original directory's lock"
+                    )
+            if not _manifest_lock_held(tmp_dir):
+                raise ContractError(
+                    "releasing a nested different-directory lock dropped the "
+                    "original directory's lock"
+                )
+        # The held-state bookkeeping is keyed by (directory, thread): a
+        # nested acquisition for a different directory keeps its OWN entry,
+        # and every entry is released when its block exits.
+        with _manifest_lock(tmp_dir):
+            if len(_MANIFEST_LOCK_HELD) != 1:
+                raise ContractError(
+                    "the held-state bookkeeping did not keep exactly one entry "
+                    f"for the held lock: {_MANIFEST_LOCK_HELD}"
+                )
+            with _manifest_lock(nested_dir):
+                if len(_MANIFEST_LOCK_HELD) != 2:
+                    raise ContractError(
+                        "a nested lock for a different directory did not keep its "
+                        "own held-state entry: "
+                        f"{_MANIFEST_LOCK_HELD}"
+                    )
+            if len(_MANIFEST_LOCK_HELD) != 1:
+                raise ContractError(
+                    "releasing a nested different-directory lock did not drop "
+                    f"only its own entry: {_MANIFEST_LOCK_HELD}"
+                )
+        if _MANIFEST_LOCK_HELD:
+            raise ContractError(
+                f"the held-state bookkeeping leaked entries: {_MANIFEST_LOCK_HELD}"
+            )
+
+        # A different thread in the same process must take its OWN lock: it
+        # must go through the flock path and CONTEND, not silently reuse the
+        # fd the current thread holds. (flock is visible process-wide, so the
+        # other thread sees the lock as held and is refused after the pinned
+        # wait - that refusal IS the proof it did not reuse the fd.)
+        other_thread: list[str] = []
+
+        def _probe_from_other_thread() -> None:
+            try:
+                with _manifest_lock(tmp_dir):
+                    other_thread.append("granted")
+            except ContractError as error:
+                other_thread.append(str(error))
+
+        with _manifest_lock(tmp_dir):
+            probe_thread = threading.Thread(target=_probe_from_other_thread)
+            probe_thread.start()
+            probe_thread.join()
+        if len(other_thread) != 1:
+            raise ContractError(
+                f"the other thread's lock attempt produced no verdict: {other_thread}"
+            )
+        if other_thread[0] == "granted":
+            raise ContractError(
+                "a different thread reused the current thread's manifest lock "
+                "instead of taking its own"
+            )
+        if "another writer holds the lock" not in other_thread[0]:
+            raise ContractError(
+                "the other thread's contention refused with the wrong lead: "
+                f"{other_thread[0]}"
+            )
+        print(
+            "PASS manifest: a nested same-thread lock for a different directory "
+            "holds its own lock, and a different thread must take its own lock"
+        )
         garbage = "   not a pid at all "
         lock_path.write_text(garbage, encoding="utf-8")
         write_run_manifest("contract.py --check", artifacts_dir=tmp_dir)
@@ -4276,6 +4717,36 @@ def _check_manifest_writer() -> None:
                     ) from error
             else:
                 raise ContractError("stale-lock writer accepted a held lock")
+
+            # A live holder owned by another user looks alive (EPERM),
+            # not stale; the refusal must not claim the process is gone.
+            lock_path.write_text("1", encoding="utf-8")
+            real_kill = os.kill
+
+            def _eperm_kill(pid: int, sig: int) -> None:
+                if pid == 1 and sig == 0:
+                    raise PermissionError(errno.EPERM, "Operation not permitted")
+                return real_kill(pid, sig)
+
+            with mock.patch.object(os, "kill", new=_eperm_kill):
+                try:
+                    write_run_manifest("contract.py --check", artifacts_dir=tmp_dir)
+                except ContractError as error:
+                    message = str(error)
+                    if "the marker is stale" in message or "gone" in message:
+                        raise ContractError(
+                            f"a live foreign holder was misclassified as gone: {error}"
+                        ) from error
+                    if "another writer holds the lock" not in message:
+                        raise ContractError(
+                            f"live foreign holder refused with the wrong lead: {error}"
+                        ) from error
+                else:
+                    raise ContractError("live foreign holder accepted a held lock")
+            print(
+                "PASS manifest: a live foreign holder (EPERM) is not misclassified "
+                "as a stale marker"
+            )
         finally:
             try:
                 fcntl.flock(busy_fd, fcntl.LOCK_UN)
@@ -4531,9 +5002,10 @@ def _synthetic_manifest_record() -> dict[str, Any]:
 def _check_freeze_gates() -> None:
     """Day-2 block: the refusal gates, against throwaway dirs.
 
-    Seven friendly refusals - unset FREEZE_RUN flag, a second freeze on a
-    freeze_run = true manifest, one unregistered artifact file, a nested
-    copy of a registered name, zero registered artifacts, a partial
+    Eight friendly refusals - unset FREEZE_RUN flag, a second freeze on a
+    freeze_run = true manifest, a stranded freeze_results.json with no
+    freeze_run = true manifest record, one unregistered artifact file, a
+    nested copy of a registered name, zero registered artifacts, a partial
     registry, a naive manifest timestamp - exercised in temp dirs so the
     real artifacts directory stays untouched. No gate opens a split;
     local_test is never read here.
@@ -4616,6 +5088,17 @@ def _check_freeze_gates() -> None:
                 lambda: _freeze_preflight(furnished),
                 "already carries",
                 "second-freeze",
+            )
+            stranded = base / "stranded"
+            stranded.mkdir()
+            (stranded / "run_manifest.json").write_text(
+                json.dumps([_synthetic_manifest_record()]), encoding="utf-8"
+            )
+            (stranded / FREEZE_RESULTS_FILENAME).write_text("{}", encoding="utf-8")
+            refuses(
+                lambda: _freeze_preflight(stranded),
+                "stranded artifact",
+                "artifact-exists-clean-manifest",
             )
             dir_furnished_clean = base / "furnished_clean"
             dir_furnished_clean.mkdir()
@@ -4764,8 +5247,8 @@ def _check_freeze_gates() -> None:
         else:
             os.environ["FREEZE_RUN"] = saved_flag
     print(
-        "PASS freeze: flag / registry-zero / registry-unknown / "
-        "registry-nested / registry-partial / second-freeze / "
+        "PASS freeze: flag / second-freeze / artifact-exists-clean-manifest / "
+        "registry-unknown / registry-nested / registry-zero / registry-partial / "
         "manifest-naive gates all refuse with friendly leads"
     )
     print("PASS freeze: gates open no split and never read local_test")
@@ -5032,12 +5515,14 @@ def _synthetic_data_snapshot() -> dict[str, Any]:
 
 
 def _check_freeze_registry_refusals() -> None:
-    """Day-5 block: the four refusals the freeze body must not soften.
+    """Day-5 block: the refusals the freeze body must not soften.
 
     A deep artifact whose status is not "complete", a model dropped from
     BOTH phases, an artifact that drifts between the write and the
-    re-read, and a registry whose model count no longer matches the
-    freeze's own model list: each is refused by the production path,
+    re-read, a registry whose model count no longer matches the
+    freeze's own model list, and a committed freeze_results.json whose
+    model count or model names disagree with the registry on the
+    real-file audit path: each is refused by the production path,
     loudly and with a friendly lead. The cases drive the real gates, not
     copies of them, so a softened gate fails the audit.
     """
@@ -5108,10 +5593,17 @@ def _check_freeze_registry_refusals() -> None:
     )
 
     # 2. A model dropped from BOTH phases still trips the registered-count
-    #    guard: the freeze phase is not allowed to shrink quietly.
+    #    guard: the freeze phase is not allowed to shrink quietly. The
+    #    payload is the fixture frame's, so the validator is handed the
+    #    fixture's own window rather than the pinned real-file one.
     fixtures = _synthetic_freeze_fixtures()
     models = fixtures["models"]
     rows = fixtures["rows"]
+    fixture_local_test = fixtures["local_test"]
+    fixture_bounds = (
+        fixture_local_test["date"].min().date().isoformat(),
+        fixture_local_test["date"].max().date().isoformat(),
+    )
 
     def _fake_predict(spec: dict[str, Any]) -> Any:
         value = 1.0 + models.index(spec) * 0.5
@@ -5144,7 +5636,12 @@ def _check_freeze_registry_refusals() -> None:
         },
     }
     refuses(
-        lambda: _validate_freeze_results(dropped, expected_models=len(models)),
+        lambda: _validate_freeze_results(
+            dropped,
+            expected_models=len(models),
+            expected_rows=rows,
+            expected_bounds=fixture_bounds,
+        ),
         "!= the registered count",
         "registered-model-count",
     )
@@ -5217,6 +5714,126 @@ def _check_freeze_registry_refusals() -> None:
     print(
         "PASS freeze refusal: a registry whose model count disagrees with the "
         "freeze's model list is refused before any split is opened"
+    )
+
+    # 5. The real-file audit path carries the registered count and the
+    #    registered names: a committed freeze_results.json with the wrong
+    #    model count, or with a fabricated model name carried by BOTH the
+    #    fold and the freeze phase, is refused instead of waved through.
+    import io
+
+    registered_models = [
+        name for spec in ARTIFACT_REGISTRY.values() for name in spec["model_names"]
+    ]
+    pinned_rows = PINNED_SPLIT_ROWS["local_test"]
+    pinned_start = SPLIT_FRAME_STARTS["local_test"]
+    pinned_end = SPLIT_FRAME_ENDS["local_test"]
+
+    def _onto_pinned_window(block_payload: dict[str, Any]) -> dict[str, Any]:
+        """The fixture payload reshaped onto the pinned local_test window."""
+        freeze_block = block_payload["freeze_phase"]
+        return {
+            **block_payload,
+            "freeze_phase": {
+                **freeze_block,
+                "n_rows": pinned_rows,
+                "window_start": pinned_start,
+                "window_end": pinned_end,
+                "models": [
+                    {
+                        **model,
+                        "n_rows": pinned_rows,
+                        "window_start": pinned_start,
+                        "window_end": pinned_end,
+                    }
+                    for model in freeze_block["models"]
+                ],
+            },
+        }
+
+    def _audit_real_file(directory: Path) -> None:
+        """Drive the real-file audit path against artifacts/ in directory."""
+        with (
+            mock.patch.object(sys.modules[__name__], "ARTIFACTS_DIR", directory),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            _check_registry()
+
+    # The wrong count: one model record where the registry registers
+    # eight, on an otherwise valid pinned payload.
+    count_payload = _onto_pinned_window(dropped)
+    with tempfile.TemporaryDirectory() as tmp_name:
+        count_dir = Path(tmp_name)
+        (count_dir / FREEZE_RESULTS_FILENAME).write_text(
+            json.dumps(count_payload), encoding="utf-8"
+        )
+        refuses(
+            lambda: _audit_real_file(count_dir),
+            "!= the registered count",
+            "real-file-count",
+        )
+
+    # The fabricated name: eight records so the registered count is
+    # satisfied, with one name the registry does not know carried by
+    # BOTH phases, so only the name comparison can refuse it.
+    identity = {
+        name: (spec["track"], artifact_name)
+        for artifact_name, spec in ARTIFACT_REGISTRY.items()
+        for name in spec["model_names"]
+    }
+    fabricated = "fabricated-model"
+    names = [*registered_models[:-1], fabricated]
+    freeze_template = payload["freeze_phase"]["models"][0]
+    fold_template = payload["fold_phase"]["models"][0]
+
+    def _named_freeze_record(name: str) -> dict[str, Any]:
+        track, artifact = identity.get(
+            name, (freeze_template["track"], freeze_template["artifact"])
+        )
+        return {
+            **freeze_template,
+            "name": name,
+            "track": track,
+            "artifact": artifact,
+            "n_rows": pinned_rows,
+            "window_start": pinned_start,
+            "window_end": pinned_end,
+        }
+
+    def _named_fold_record(name: str) -> dict[str, Any]:
+        track, artifact = identity.get(
+            name, (fold_template["track"], fold_template["artifact"])
+        )
+        return {**fold_template, "name": name, "track": track, "artifact": artifact}
+
+    name_payload = {
+        **payload,
+        "fold_phase": {
+            **payload["fold_phase"],
+            "models": [_named_fold_record(name) for name in names],
+        },
+        "freeze_phase": {
+            **payload["freeze_phase"],
+            "n_rows": pinned_rows,
+            "window_start": pinned_start,
+            "window_end": pinned_end,
+            "models": [_named_freeze_record(name) for name in names],
+        },
+    }
+    with tempfile.TemporaryDirectory() as tmp_name:
+        names_dir = Path(tmp_name)
+        (names_dir / FREEZE_RESULTS_FILENAME).write_text(
+            json.dumps(name_payload), encoding="utf-8"
+        )
+        refuses(
+            lambda: _audit_real_file(names_dir),
+            "registered model name",
+            "real-file-names",
+        )
+    print(
+        "PASS freeze refusal: the real-file audit path refuses a committed "
+        "freeze_results.json with the wrong registered count and one whose "
+        "fold and freeze phases both carry a fabricated model name"
     )
 
 
@@ -5328,6 +5945,15 @@ def _check_freeze_body() -> None:
             raise ContractError(
                 "the full-grid slice did not cover the whole scored frame"
             )
+        # The headline is read from the file inside the block that owns
+        # it: the temp directory is gone once the block exits, so the
+        # payload is checked here and never read from outside.
+        expected_headline = _pick_headline_model(freeze_models)
+        if stored["headline_model"] != expected_headline:
+            raise ContractError(
+                f"the freeze headline {stored['headline_model']!r} is not the "
+                f"model with the lowest full-grid RMSLE ({expected_headline!r})"
+            )
     print(
         "PASS freeze body: freeze_results.json carries the pinned field set, is "
         "written atomically (no temp residue) and re-parses to the payload"
@@ -5385,7 +6011,18 @@ def _check_freeze_body() -> None:
     ]
     for label, broken, needle in malformed:
         try:
-            _validate_freeze_results(broken, expected_models=len(models))
+            _validate_freeze_results(
+                broken,
+                expected_models=len(models),
+                # The malformed payload is the fixture frame's, so the
+                # validator gets the fixture's own window, not the
+                # pinned real-file one.
+                expected_rows=len(local_test),
+                expected_bounds=(
+                    local_test["date"].min().date().isoformat(),
+                    local_test["date"].max().date().isoformat(),
+                ),
+            )
         except ContractError as error:
             if needle not in str(error):
                 raise ContractError(
@@ -5495,11 +6132,6 @@ def _check_freeze_body() -> None:
     if _pick_headline_model(headline_records) != "ridge":
         raise ContractError(
             "the headline was not the model with the lowest full-grid RMSLE"
-        )
-    if stored["headline_model"] != "deep-lstm":
-        raise ContractError(
-            f"the freeze headline {stored['headline_model']!r} is not the model "
-            "with the lowest full-grid RMSLE"
         )
     print(
         "PASS freeze body: headline_model is the registered model with the "
@@ -6017,18 +6649,31 @@ def _synthetic_freeze_run(
     *,
     convention: str,
     christmas_intact: bool = True,
-    real_splits: bool = False,
+    real_splits: bool = True,
 ) -> tuple[int, str, dict[str, Any] | None, dict[str, int]]:
     """Drive freeze() end to end on synthetic fixtures; return diagnostics.
 
     Patches the split loaders and stubs the sanctioned per-track modules,
-    so nothing real is read or written; artifacts land in tmp_dir. Returns
+    so nothing real is written; artifacts land in tmp_dir. Returns
     (rc, stdout, payload-or-None, fixture stats).
+
+    real_splits defaults to True: the freeze body runs the REAL
+    _contract_counts, which refuses the small synthetic frames (their
+    closure rows are not the pinned counts), so the small-frame mode can
+    only fail. It is therefore refused loudly here, at the call site,
+    instead of returning rc=1 with no payload.
     """
     import contextlib
     import io
     from unittest import mock
 
+    if not real_splits:
+        raise ContractError(
+            "_synthetic_freeze_run: real_splits=False is refused; the real "
+            "_contract_counts rejects the small synthetic frames (their "
+            "closure rows are not the pinned counts), so the run would fail "
+            "with rc=1 and no payload"
+        )
     splits = _synthetic_splits(
         christmas_intact=christmas_intact, real_splits=real_splits
     )
@@ -6096,6 +6741,45 @@ def _synthetic_freeze_run(
         except (json.JSONDecodeError, UnicodeDecodeError):
             payload = None
     return rc, stdout, payload, stats
+
+
+def _check_synthetic_freeze_run_defaults() -> None:
+    """The synthetic freeze run defaults to the configuration that works.
+
+    The freeze body runs the real _contract_counts, which refuses the
+    small synthetic frames, so the small-frame mode is refused loudly at
+    the call site and the default is the supported one. A caller that
+    forgets the argument must never get rc=1 with no payload.
+    """
+    import inspect
+
+    default = inspect.signature(_synthetic_freeze_run).parameters["real_splits"].default
+    if default is not True:
+        raise ContractError(
+            f"_synthetic_freeze_run's real_splits default is {default!r}, not "
+            "True; the small synthetic frames are refused by the real "
+            "_contract_counts, so the default must be the supported mode"
+        )
+    with tempfile.TemporaryDirectory() as tmp_name:
+        try:
+            _synthetic_freeze_run(
+                Path(tmp_name), convention="frame-order", real_splits=False
+            )
+        except ContractError as error:
+            if "real_splits=False is refused" not in str(error):
+                raise ContractError(
+                    f"the small-frame mode refused with the wrong lead: {error}"
+                ) from error
+        else:
+            raise ContractError(
+                "the small-frame mode was accepted; it returns rc=1 with no "
+                "payload instead of failing loudly"
+            )
+    print(
+        "PASS freeze-run defaults: the synthetic run defaults to the real "
+        "splits, and the small-frame mode is refused loudly instead of "
+        "returning rc=1 with no payload"
+    )
 
 
 def _has_bound_date(strings: set[str], bound: str, start: str, end: str) -> bool:
@@ -6330,21 +7014,15 @@ def _check_freeze_results_writer() -> None:
             )
     print(
         "PASS freeze-results: freeze_results.json written atomically (temp "
-        "file then rename; no *.tmp residue; re-parses); sheet Section-10 "
-        "field set with the pinned types; headline_model is the lowest-RMSLE "
-        "registered model; model count equals the registered count"
+        "file then an exclusive link; no *.tmp residue; re-parses); sheet "
+        "Section-10 field set with the pinned types; headline_model is the "
+        "lowest-RMSLE registered model; model count equals the registered count"
     )
 
 
 def _check_freeze_results_validation() -> None:
     """Field validation battery; refuses with friendly ContractErrors."""
-    validator = globals().get("_validate_freeze_results")
-    if not callable(validator):
-        print(
-            "INFO freeze-results: _validate_freeze_results seam not exposed "
-            "by the freeze body; field-validation battery skipped"
-        )
-        return
+    validator = _validate_freeze_results
     with tempfile.TemporaryDirectory() as tmp_name:
         tmp_dir = Path(tmp_name)
         rc, out, payload, _stats = _synthetic_freeze_run(
@@ -6569,6 +7247,88 @@ def _check_prediction_alignment() -> None:
         "(modulo frozen_at)"
     )
 
+    # The alignment cases run on the synthetic fixture frames: the frozen
+    # local_test is NEVER opened here, and the fixture carries the same
+    # series-major shape (unique (store_nbr, family, date) keys) the
+    # alignment is keyed on.
+    alignment_fixtures = _synthetic_freeze_fixtures()
+    local_test = alignment_fixtures["local_test"]
+    predict_frame = alignment_fixtures["predict_frame"]
+    local_test_rows = len(local_test)
+    predict_frame_rows = len(predict_frame)
+
+    neither = np.zeros(local_test_rows - 1, dtype=np.float64)
+    try:
+        _align_local_test_predictions("stub", neither, predict_frame, local_test)
+    except ContractError as error:
+        message = str(error)
+        if (
+            str(neither.size) not in message
+            or str(local_test_rows) not in message
+            or str(predict_frame_rows) not in message
+        ):
+            raise ContractError(
+                f"a prediction array matching neither legal shape refused with "
+                f"the wrong lead: {error}"
+            ) from error
+    else:
+        raise ContractError(
+            "a prediction array matching neither legal shape was accepted; "
+            "the two legal shapes must be distinguished by length"
+        )
+
+    local_marker = np.arange(local_test_rows, dtype=np.float64)
+    aligned_local = _align_local_test_predictions(
+        "stub", local_marker, predict_frame, local_test
+    )
+    if not np.array_equal(aligned_local, local_marker):
+        raise ContractError(
+            "a local_test-rows-only prediction was not aligned to local_test "
+            "in order; the local_test-length shape was not distinguished"
+        )
+
+    wanted = _row_keys(local_test)
+    frame_index = {key: idx for idx, key in enumerate(_row_keys(predict_frame))}
+    frame_marker = np.full(predict_frame_rows, -1.0, dtype=np.float64)
+    for idx, key in enumerate(wanted):
+        frame_marker[frame_index[key]] = float(idx)
+    aligned_frame = _align_local_test_predictions(
+        "stub", frame_marker, predict_frame, local_test
+    )
+    if not np.array_equal(aligned_frame, local_marker):
+        raise ContractError(
+            "a predict_frame-order prediction was not gathered onto local_test "
+            "by frame position; the frame-length shape was not distinguished"
+        )
+
+    keyed_frame = pd.Series(
+        frame_marker.copy(),
+        index=pd.MultiIndex.from_arrays(
+            [
+                predict_frame["store_nbr"].to_numpy(),
+                predict_frame["family"].astype(str).to_numpy(),
+                predict_frame["date"].to_numpy(),
+            ],
+            names=["store_nbr", "family", "date"],
+        ),
+    )
+    keyed_frame = keyed_frame.sample(frac=1.0, random_state=7)
+    aligned_keyed = _align_local_test_predictions(
+        "stub", keyed_frame, predict_frame, local_test
+    )
+    if not np.array_equal(aligned_keyed, local_marker):
+        raise ContractError(
+            "a keyed Series prediction was not reconciled to local_test by its "
+            "prediction-side keys"
+        )
+
+    print(
+        "PASS prediction-alignment: a length matching neither legal shape is "
+        "refused with a friendly lead, local_test-length and predict_frame-length "
+        "arrays are distinguished by length, and a keyed Series is reconciled by "
+        "its prediction-side keys"
+    )
+
 
 def _payload_differences(
     left: Any, right: Any, path: str = "$"
@@ -6597,9 +7357,15 @@ def _payload_differences(
         yield f"{path}: {left!r} vs {right!r}"
 
 
-def _check_registry() -> None:
-    """Day-2 block: registered homes; strays fail loud, files validate."""
-    directory = ARTIFACTS_DIR
+def _check_registry(directory: Path | None = None) -> None:
+    """Day-2 block: registered homes; strays fail loud, files validate.
+
+    A registry that is entirely absent is a "not merged yet" notice and
+    stays green; a registry that is half-landed (some registered
+    artifacts present, others missing) is a real finding and refuses
+    loudly, because a half-merge is a problem, not a notice.
+    """
+    directory = ARTIFACTS_DIR if directory is None else directory
     if not directory.exists():
         print(
             "INFO registry: artifacts/ absent; 2 registered homes pending the "
@@ -6616,7 +7382,18 @@ def _check_registry() -> None:
             raise ContractError(
                 f"registry: artifacts/{FREEZE_RESULTS_FILENAME} does not parse: {error}"
             ) from error
-        _validate_freeze_results(payload)
+        registered_models = [
+            name for spec in ARTIFACT_REGISTRY.values() for name in spec["model_names"]
+        ]
+        _validate_freeze_results(
+            payload,
+            expected_models=len(registered_models),
+            expected_rows=PINNED_SPLIT_ROWS["local_test"],
+            expected_bounds=(
+                SPLIT_FRAME_STARTS["local_test"],
+                SPLIT_FRAME_ENDS["local_test"],
+            ),
+        )
         print(
             f"PASS registry: artifacts/{FREEZE_RESULTS_FILENAME} is present "
             "and carries the pinned Section-10 schema"
@@ -6630,13 +7407,70 @@ def _check_registry() -> None:
         )
         return
     missing = sorted(set(ARTIFACT_REGISTRY) - set(registered))
+    # The artifacts that ARE there are validated first, so a corrupt one
+    # is reported as corrupt; the half-landed registry is then refused.
+    blurbs: list[tuple[str, str]] = []
     for name, path in sorted(registered.items()):
         (blurb, _payload) = _check_registered_artifact(name, path)
-        print(f"PASS registry: {name} schema-clean ({blurb})")
+        blurbs.append((name, blurb))
     if missing:
-        print(f"INFO registry: missing registered file(s) {missing}")
-        return
+        raise ContractError(
+            f"registry: half-landed registry; {sorted(registered)} present but "
+            f"{missing} missing; the registry is merged whole or not at all"
+        )
+    for name, blurb in blurbs:
+        print(f"PASS registry: {name} schema-clean ({blurb})")
     print("PASS registry: all registered artifacts validated")
+
+
+def _check_registry_presence() -> None:
+    """A half-landed registry refuses loudly; an absent one stays an INFO.
+
+    Both cases run against throwaway directories, so the registry
+    block's decision never depends on the real artifacts directory.
+    """
+    import io
+
+    with tempfile.TemporaryDirectory() as tmp_name:
+        base = Path(tmp_name)
+        empty = base / "empty"
+        empty.mkdir()
+        # Nothing merged yet: an INFO notice, never a refusal.
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            _check_registry(empty)
+        if "INFO registry" not in buffer.getvalue():
+            raise ContractError(
+                "an absent registry did not print the INFO notice: "
+                f"{buffer.getvalue()!r}"
+            )
+        # One artifact landed: a loud refusal, never an INFO notice.
+        half = base / "half"
+        half.mkdir()
+        (half / "classical_results.json").write_text(
+            json.dumps(_registry_fixture_classical()), encoding="utf-8"
+        )
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                _check_registry(half)
+        except ContractError as error:
+            if "half-landed registry" not in str(error):
+                raise ContractError(
+                    f"the half-landed registry refused with the wrong lead: {error}"
+                ) from error
+        except IndexError as error:
+            raise ContractError(
+                f"the half-landed registry escaped as a raw IndexError: {error}"
+            ) from error
+        else:
+            raise ContractError(
+                "a half-landed registry was accepted; a half-merge must be a "
+                "loud finding, not an INFO notice"
+            )
+    print(
+        "PASS registry: a half-landed registry refuses loudly, while a registry "
+        "with none of its artifacts merged yet stays an INFO notice"
+    )
 
 
 def _check_freeze_safety() -> None:
@@ -6756,11 +7590,79 @@ def _check_freeze_safety() -> None:
                 f"the overwrite refusal did not leave the existing "
                 f"{FREEZE_RESULTS_FILENAME} untouched"
             )
+
+        # A10: a temp-file unlink failure after the artifact is published
+        # must not escape to the operator; the artifact is valid and the
+        # write must still be reported as a success.
+        unlink_dir = directory / "unlink-ok"
+        unlink_dir.mkdir()
+        unlink_target = unlink_dir / FREEZE_RESULTS_FILENAME
+        unlink_payload = {"ok": "published-before-unlink"}
+        real_path_unlink = Path.unlink
+
+        def _unlink_boom(self: Path, *args: Any, **kwargs: Any) -> None:
+            if self == unlink_target:
+                return real_path_unlink(self, *args, **kwargs)
+            if self.name.endswith(".tmp") and self.parent == unlink_dir:
+                raise OSError(errno.EPERM, "injected unlink failure")
+            return real_path_unlink(self, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", new=_unlink_boom):
+            _write_freeze_results(unlink_target, unlink_payload)
+        if not unlink_target.is_file():
+            raise ContractError(
+                "the atomic write did not publish the artifact when the temp "
+                "unlink failed after publish"
+            )
+        if json.loads(unlink_target.read_text(encoding="utf-8")) != unlink_payload:
+            raise ContractError(
+                "the artifact drifted after a temp-unlink failure on a published write"
+            )
+
+        # A11: a filesystem that does not support hard links must take the
+        # exclusive-create fallback, not a generic write failure.
+        for link_errno, label in (
+            (errno.EPERM, "EPERM"),
+            (errno.ENOTSUP, "ENOTSUP"),
+            (errno.EOPNOTSUPP, "EOPNOTSUPP"),
+        ):
+            nohard_dir = directory / f"nohard-{label.lower()}"
+            nohard_dir.mkdir()
+            nohard_target = nohard_dir / FREEZE_RESULTS_FILENAME
+            nohard_payload = {"ok": label}
+
+            def _link_unsupported(
+                src: Any,
+                dst: Any,
+                *args: Any,
+                _errno: int = link_errno,
+                **kwargs: Any,
+            ) -> None:
+                raise OSError(_errno, "injected hard-link unsupported")
+
+            with mock.patch.object(os, "link", new=_link_unsupported):
+                _write_freeze_results(nohard_target, nohard_payload)
+            if not nohard_target.is_file():
+                raise ContractError(
+                    f"the atomic write did not publish the artifact on {label} "
+                    "hard-link failure"
+                )
+            if json.loads(nohard_target.read_text(encoding="utf-8")) != nohard_payload:
+                raise ContractError(
+                    f"the artifact drifted on the {label} hard-link fallback path"
+                )
+            leftovers = sorted(nohard_dir.glob(f"{FREEZE_RESULTS_FILENAME}.*.tmp"))
+            if leftovers:
+                raise ContractError(
+                    f"the {label} hard-link fallback left temp file(s) "
+                    f"behind: {leftovers}"
+                )
     print(
         "PASS freeze safety: the freeze output is written through a same-dir "
         "temp and an exclusive link, re-reads to the same payload, leaves no "
-        "temp file, never overwrites an existing artifact, and leaves no "
-        "partial or touched artifact on failure"
+        "temp file, never overwrites an existing artifact, leaves no "
+        "partial or touched artifact on failure, survives a temp-unlink "
+        "failure after publish, and falls back when hard links are unsupported"
     )
 
 
@@ -6813,7 +7715,7 @@ def _check_fold_phase() -> None:
         fold = record.get("fold")
         if isinstance(fold, bool) or not isinstance(fold, int):
             raise ContractError(f"{label}: fold must be an int")
-        pinned = FOLD_TABLE_PINS[fold - 1]
+        pinned = _fold_table_pin(fold, label)
         for key, want in (
             ("origin", pinned[1]),
             ("window_start", pinned[2]),
@@ -7103,8 +8005,16 @@ def _check_freeze_pins() -> None:
     )
 
     # The schema pins: a valid payload with ONE drifted field must be
-    # refused by the ONE production validator.
+    # refused by the ONE production validator. The payload is the
+    # fixture frame's, so the validator is handed the fixture's own
+    # window; the pinned defaults stay enforced on the real-file path.
     payload = _synthetic_freeze_payload()
+    fixture_local_test = _synthetic_freeze_fixtures()["local_test"]
+    fixture_rows = len(fixture_local_test)
+    fixture_bounds = (
+        fixture_local_test["date"].min().date().isoformat(),
+        fixture_local_test["date"].max().date().isoformat(),
+    )
 
     def _broken(mutate: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
         broken = copy.deepcopy(payload)
@@ -7121,7 +8031,12 @@ def _check_freeze_pins() -> None:
         broken["contract_counts"]["closure_rows"]["train"] = 1
 
     def _set_zero_share(broken: dict[str, Any]) -> None:
-        broken["contract_counts"]["zero_share_raw"]["rows"] = 1
+        # Drift the counts AND keep the share consistent with them, so the
+        # pinned-counts check is the ONLY thing that can catch this: a share
+        # check alone would accept the payload.
+        block = broken["contract_counts"]["zero_share_raw"]
+        block["rows"] = 1
+        block["share"] = round(block["rows"] / block["of_rows"], 6)
 
     def _set_holdout(broken: dict[str, Any]) -> None:
         broken["contract_counts"]["preopening_holdout_rows"]["total"] = 1
@@ -7132,6 +8047,33 @@ def _check_freeze_pins() -> None:
     def _set_fold_rows(broken: dict[str, Any]) -> None:
         broken["fold_phase"]["models"][0]["folds"][0]["n_rows"] = 1
 
+    def _set_freeze_rows(broken: dict[str, Any]) -> None:
+        broken["freeze_phase"]["n_rows"] = 1
+
+    def _set_freeze_start(broken: dict[str, Any]) -> None:
+        broken["freeze_phase"]["window_start"] = "x"
+
+    def _set_freeze_end(broken: dict[str, Any]) -> None:
+        broken["freeze_phase"]["window_end"] = "x"
+
+    def _set_model_rows(broken: dict[str, Any]) -> None:
+        broken["freeze_phase"]["models"][0]["n_rows"] = 1
+
+    def _set_model_start(broken: dict[str, Any]) -> None:
+        broken["freeze_phase"]["models"][0]["window_start"] = "1999-01-01"
+
+    def _set_model_track(broken: dict[str, Any]) -> None:
+        broken["freeze_phase"]["models"][0]["track"] = "S9"
+
+    def _set_model_artifact(broken: dict[str, Any]) -> None:
+        broken["freeze_phase"]["models"][0]["artifact"] = "bogus.json"
+
+    def _set_raw_share_value(broken: dict[str, Any]) -> None:
+        broken["contract_counts"]["zero_share_raw"]["share"] = 99.0
+
+    def _set_trainable_share_value(broken: dict[str, Any]) -> None:
+        broken["contract_counts"]["zero_share_trainable"]["share"] = 99.0
+
     for mutate, needle, label in (
         (_set_split_rows, "data_snapshot train rows", "split-rows"),
         (_set_split_bounds, "data_snapshot train bounds", "split-bounds"),
@@ -7140,16 +8082,39 @@ def _check_freeze_pins() -> None:
         (_set_holdout, "preopening_holdout_rows", "contract-holdout-rows"),
         (_set_fold_name, "fold phase models", "fold-freeze-parity"),
         (_set_fold_rows, "n_rows", "fold-n-rows"),
+        (_set_freeze_rows, "freeze_phase n_rows", "freeze-n-rows"),
+        (_set_freeze_start, "freeze_phase window_start", "freeze-window-start"),
+        (_set_freeze_end, "freeze_phase window_end", "freeze-window-end"),
+        (_set_model_rows, "freeze_phase models[0] n_rows", "freeze-model-n-rows"),
+        (
+            _set_model_start,
+            "freeze_phase models[0] window_start",
+            "freeze-model-window",
+        ),
+        (_set_model_track, "models[0] track", "freeze-model-track"),
+        (_set_model_artifact, "models[0] artifact", "freeze-model-artifact"),
+        (_set_raw_share_value, "zero_share_raw share", "contract-zero-share-value"),
+        (
+            _set_trainable_share_value,
+            "zero_share_trainable share",
+            "contract-trainable-share-value",
+        ),
     ):
         refuses(
-            lambda mutate=mutate: _validate_freeze_results(_broken(mutate)),
+            lambda mutate=mutate: _validate_freeze_results(
+                _broken(mutate),
+                expected_rows=fixture_rows,
+                expected_bounds=fixture_bounds,
+            ),
             needle,
             label,
         )
     print(
         "PASS freeze pins: the production validator refuses a drifted split row "
-        "count, split bound, closure count, zero share, holdout count, "
-        "fold/freeze model set and fold row count"
+        "count, split bound, closure count, zero share value, holdout count, "
+        "fold/freeze model set, fold row count, freeze-phase rows, "
+        "freeze-phase window bounds, model rows, model window, model track, "
+        "model artifact and zero-share values"
     )
 
     # The fold phase re-validates the bytes it consumes: a registered
@@ -7305,46 +8270,26 @@ def _check_freeze_critical_section() -> None:
     )
 
     # 2. The manifest lock is HELD across the critical section, and the
-    #    freeze finds its OWN record by stamp when a concurrent writer
-    #    appends another one right after it.
+    #    freeze identifies its own stamped record as the one it appended
+    #    (records[-1] under the lock, with the stamp as a secondary
+    #    assertion) even when other records are present.
     with tempfile.TemporaryDirectory() as tmp_name:
         directory = Path(tmp_name)
+        prior = _synthetic_manifest_record()
+        prior["created"] = "2000-01-01T00:00:00Z"
+        prior["notes"] = ["a prior writer"]
+        (directory / "run_manifest.json").write_text(
+            json.dumps([prior], indent=2) + "\n", encoding="utf-8"
+        )
         lock_probe: list[bool] = []
         real_write_results = _write_freeze_results
-        real_manifest_record = _write_manifest_record
 
         def _probing_write(path: Path, body: dict[str, Any]) -> None:
             lock_probe.append(_manifest_lock_held(directory))
             real_write_results(path, body)
 
-        def _racing_record(
-            artifacts: Path,
-            command: str,
-            **kwargs: Any,
-        ) -> None:
-            real_manifest_record(artifacts, command, **kwargs)
-            # A concurrent writer appends AFTER our record: the freeze must
-            # still find ITS OWN record, by stamp, not by position.
-            real_manifest_record(
-                artifacts,
-                "contract.py --check",
-                exit_status=0,
-                elapsed_seconds=0.0,
-                arguments={},
-                freeze_run=False,
-                notes=["a concurrent writer"],
-                path=kwargs["path"],
-                git_sha=kwargs.get("git_sha"),
-                created="2099-01-01T00:00:00Z",
-            )
-
-        with (
-            mock.patch.object(
-                sys.modules[__name__], "_write_freeze_results", _probing_write
-            ),
-            mock.patch.object(
-                sys.modules[__name__], "_write_manifest_record", _racing_record
-            ),
+        with mock.patch.object(
+            sys.modules[__name__], "_write_freeze_results", _probing_write
         ):
             rc, out, _written, _stats = _synthetic_freeze_run(
                 directory, convention="frame-order", real_splits=True
@@ -7352,8 +8297,8 @@ def _check_freeze_critical_section() -> None:
         if rc != 0:
             tail = out.strip().splitlines()[-3:]
             raise ContractError(
-                f"the synthetic freeze exited {rc} while a concurrent writer "
-                f"appended to the manifest; last lines: {' | '.join(tail)}"
+                f"the synthetic freeze exited {rc} with a prior manifest record "
+                f"present; last lines: {' | '.join(tail)}"
             )
         if lock_probe != [True]:
             raise ContractError(
@@ -7361,15 +8306,115 @@ def _check_freeze_critical_section() -> None:
                 f"(probe saw {lock_probe})"
             )
         records = list(read_run_manifest(directory / "run_manifest.json"))
-        if len(records) != 2:
+        if len(records) != 2 or records[-1].get("freeze_run") is not True:
             raise ContractError(
-                f"the concurrent writer did not append its record: the manifest "
-                f"holds {len(records)} record(s)"
+                "the freeze did not append its own freeze_run record last "
+                f"under the lock: {records!r}"
             )
     print(
         "PASS freeze section: the manifest lock is held across the critical "
-        "section, and the freeze finds its own record by stamp when a "
-        "concurrent writer appends after it"
+        "section, and the freeze identifies its own stamped record under the "
+        "lock when other records are present"
+    )
+
+    # 2b. A same-second collision: a pre-existing record already carries the
+    #     freeze's exact second-resolution stamp, so a stamp-only lookup
+    #     would see two matches and falsely fail. The freeze still succeeds.
+    with tempfile.TemporaryDirectory() as tmp_name:
+        directory = Path(tmp_name)
+        same_stamp = "2099-01-01T00:00:00Z"
+        collision = _synthetic_manifest_record()
+        collision["created"] = same_stamp
+        collision["notes"] = ["pre-existing same-second record"]
+        (directory / "run_manifest.json").write_text(
+            json.dumps([collision], indent=2) + "\n", encoding="utf-8"
+        )
+        with mock.patch.object(
+            sys.modules[__name__], "_freeze_stamp", lambda: same_stamp
+        ):
+            rc, out, _written, _stats = _synthetic_freeze_run(
+                directory, convention="frame-order", real_splits=True
+            )
+        if rc != 0:
+            tail = out.strip().splitlines()[-3:]
+            raise ContractError(
+                "the freeze failed on a same-second manifest stamp collision; "
+                f"last lines: {' | '.join(tail)}"
+            )
+        records = list(read_run_manifest(directory / "run_manifest.json"))
+        matching = [r for r in records if r.get("created") == same_stamp]
+        freeze_records = [r for r in matching if r.get("freeze_run") is True]
+        if len(matching) != 2 or len(freeze_records) != 1:
+            raise ContractError(
+                "the same-second collision case did not leave one pre-existing "
+                "record and the freeze's own freeze_run record at the shared "
+                f"stamp (matching {len(matching)}, freeze_run {len(freeze_records)})"
+            )
+    print(
+        "PASS freeze: the freeze succeeds when another manifest record shares "
+        "its exact second-resolution stamp"
+    )
+
+    # 3. A manifest-stamp failure after the artifact is published must be
+    #    recoverable: the stranded artifact is renamed aside under the same
+    #    lock and the sanctioned re-run succeeds.
+    with tempfile.TemporaryDirectory() as tmp_name:
+        directory = Path(tmp_name)
+        real_manifest_record = _write_manifest_record
+
+        def _fail_freeze_stamp(artifacts: Path, command: str, **kwargs: Any) -> None:
+            if kwargs.get("freeze_run") is True and kwargs.get("exit_status") == 0:
+                raise ContractError("synthetic stamp failure")
+            return real_manifest_record(artifacts, command, **kwargs)
+
+        with mock.patch.object(
+            sys.modules[__name__], "_write_manifest_record", _fail_freeze_stamp
+        ):
+            rc, out, _written, _stats = _synthetic_freeze_run(
+                directory, convention="frame-order", real_splits=True
+            )
+        if rc != 1:
+            raise ContractError(
+                f"the freeze returned {rc}, not 1, on a synthetic stamp failure"
+            )
+        if "moved aside" not in out or "re-run" not in out:
+            raise ContractError(
+                f"the stamp-failure refusal did not name the recovery: {out!r}"
+            )
+        if (directory / FREEZE_RESULTS_FILENAME).exists():
+            raise ContractError(
+                "the stranded freeze_results.json was not moved aside after the "
+                "stamp failure"
+            )
+        quarantined = sorted(directory.glob("freeze_results.failed-*"))
+        quarantined = [
+            path for path in quarantined if path.name != FREEZE_RESULTS_FILENAME
+        ]
+        if len(quarantined) != 1:
+            raise ContractError(
+                f"expected 1 quarantined artifact, found {quarantined!r}"
+            )
+        records = list(read_run_manifest(directory / "run_manifest.json"))
+        if not records or records[-1].get("freeze_run") is not False:
+            raise ContractError(
+                "the stamp-failure attempt was not recorded as freeze_run=false"
+            )
+        rc2, out2, written2, _stats2 = _synthetic_freeze_run(
+            directory, convention="frame-order", real_splits=True
+        )
+        if rc2 != 0:
+            tail = out2.strip().splitlines()[-3:]
+            raise ContractError(
+                "the sanctioned re-run after a stamp failure did not succeed; "
+                f"last lines: {' | '.join(tail)}"
+            )
+        if not (directory / FREEZE_RESULTS_FILENAME).exists() or written2 is None:
+            raise ContractError(
+                "the sanctioned re-run did not publish freeze_results.json"
+            )
+    print(
+        "PASS freeze: a stamp failure quarantines the stranded artifact under "
+        "the lock and the sanctioned re-run succeeds"
     )
 
 
@@ -7385,6 +8430,7 @@ def run_check() -> None:
     _check_freeze_pins()
     _check_freeze_critical_section()
     _check_freeze_run_invariants()
+    _check_synthetic_freeze_run_defaults()
     _check_christmas_slice_selection()
     _check_freeze_results_writer()
     _check_freeze_results_validation()
@@ -7392,6 +8438,7 @@ def run_check() -> None:
     _check_freeze_safety()
     _check_fold_phase()
     _check_contract_counts_pins()
+    _check_registry_presence()
     _check_registry()
     _check_scorer()
     _check_manifest_writer()
