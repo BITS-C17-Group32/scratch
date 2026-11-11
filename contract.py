@@ -46,7 +46,16 @@ from __future__ import annotations
 import argparse
 import copy
 import errno
-import fcntl
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    import types
+
+    fcntl = types.SimpleNamespace()
+    fcntl.flock = lambda *a, **k: None
+    fcntl.LOCK_EX = 0
+    fcntl.LOCK_NB = 0
+    fcntl.LOCK_UN = 0
 import importlib
 import json
 import math
