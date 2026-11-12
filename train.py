@@ -5,6 +5,31 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parent
 
+# Stores that opened after the data starts: train.csv carries zero-sales
+# rows for them before their real opening date. Those rows are recording
+# artifacts, not demand, so training drops them. valid/local_test keep
+# every row: the zero history is the lookback context for these stores'
+# real post-opening dates (store 52's first sale is 2017-04-20).
+DELAYS_OPEN_UNTIL = {
+    20: pd.Timestamp("2015-02-13"),
+    21: pd.Timestamp("2015-07-24"),
+    22: pd.Timestamp("2015-10-09"),
+    29: pd.Timestamp("2015-03-20"),
+    36: pd.Timestamp("2013-05-09"),
+    42: pd.Timestamp("2015-08-21"),
+    52: pd.Timestamp("2017-04-20"),
+    53: pd.Timestamp("2014-05-29"),
+}
+
+
+def preopening_mask(df: pd.DataFrame) -> pd.Series:
+    """Rows to drop from training: late-opening stores before their open date."""
+    date = pd.to_datetime(df["date"])
+    mask = pd.Series(False, index=df.index)
+    for store, open_date in DELAYS_OPEN_UNTIL.items():
+        mask |= (df["store_nbr"] == store) & (date < open_date) & (df["id"].notna())
+    return mask
+
 
 def clean_train_data():
 

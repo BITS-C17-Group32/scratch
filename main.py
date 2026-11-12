@@ -4,6 +4,7 @@ from pathlib import Path
 import pandas as pd
 
 from features import build_features
+from train import preopening_mask
 
 ROOT = Path(__file__).resolve().parent
 
@@ -105,10 +106,14 @@ def main() -> None:
     valid_mask = (df["date"] > TRAIN_END) & (df["date"] <= VALID_END)
     local_test_mask = df["date"] > VALID_END
 
+    # Exclude late-opening stores' pre-opening zero rows from the TRAIN
+    # block only; valid and local_test are unchanged.
+    train_fit_mask = train_mask & ~preopening_mask(df)
+
     # Iterate over each split mask to report row counts, dataset percentage
     # shares, and date ranges.
     for name, mask in [
-        ("train", train_mask),
+        ("train", train_fit_mask),
         ("valid", valid_mask),
         ("local_test", local_test_mask),
     ]:
@@ -126,12 +131,16 @@ def main() -> None:
             block["date"].max().date(),
         )
 
-    # Each row must belong to exactly one split. Boolean masks become 0/1, so their
-    # row-wise sum must be 1 (no overlap and no omitted rows).
-    assert (
-        (train_mask.astype(int) + valid_mask.astype(int) + local_test_mask.astype(int))
-        .eq(1)
-        .all()
+    # Each row must belong to exactly one split, except the excluded
+    # pre-opening training rows, which belong to none on purpose.
+    covered = (
+        train_fit_mask.astype(int)
+        + valid_mask.astype(int)
+        + local_test_mask.astype(int)
+    )
+    assert covered.le(1).all()
+    assert covered.eq(0).equals(preopening_mask(df) & train_mask), (
+        "rows outside every split are not the excluded pre-opening rows"
     )
 
     # Ensure the output directory for serialized partitions exists.
@@ -160,7 +169,7 @@ def main() -> None:
 
     # Organize individual split DataFrames into a dictionary for batch serialization.
     blocks = {
-        "train": df.loc[train_mask],
+        "train": df.loc[train_fit_mask],
         "valid": df.loc[valid_mask],
         "local_test": df.loc[local_test_mask],
     }
