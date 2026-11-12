@@ -1,0 +1,397 @@
+{
+  "schema_version": 1,
+  "git_sha": "ab961e4903021f46ddd224da30cc07952b8612e7",
+  "python_version": "3.13.18",
+  "sklearn_version": "1.9.1",
+  "split_bounds": {
+    "train": "2013-01-01..2016-03-27",
+    "valid": "2016-03-28..2016-09-11"
+  },
+  "training_mask": "contract.training_mask (fit_rows): drops pre-opening rows across delayed-open stores {20, 21, 22, 29, 36, 42, 52, 53} while preserving all id=NaN closure fills (drops 207,801 train rows and 5,544 valid rows on training path only)",
+  "feature_columns": [
+    "store_nbr",
+    "family",
+    "onpromotion",
+    "city",
+    "state",
+    "store_type",
+    "cluster",
+    "is_event",
+    "is_national_holiday",
+    "is_regional_holiday",
+    "is_local_holiday",
+    "is_holiday",
+    "is_national_holiday_tomorrow",
+    "is_national_holiday_in_2days",
+    "is_regional_holiday_tomorrow",
+    "is_regional_holiday_in_2days",
+    "is_local_holiday_tomorrow",
+    "is_local_holiday_in_2days",
+    "is_holiday_tomorrow",
+    "is_holiday_in_2days",
+    "is_event_tomorrow",
+    "is_event_in_2days",
+    "earthquake_decay"
+  ],
+  "target": "log1p(sales)",
+  "prediction_clip": "y_pred >= 0 on raw-scale predictions after single expm1",
+  "folds": [
+    {
+      "fold": 1,
+      "origin": "2016-07-25",
+      "window_start": "2016-07-26",
+      "window_end": "2016-08-10",
+      "n_rows": 28512
+    },
+    {
+      "fold": 2,
+      "origin": "2016-08-10",
+      "window_start": "2016-08-11",
+      "window_end": "2016-08-26",
+      "n_rows": 28512
+    },
+    {
+      "fold": 3,
+      "origin": "2016-08-26",
+      "window_start": "2016-08-27",
+      "window_end": "2016-09-11",
+      "n_rows": 28512
+    }
+  ],
+  "models": [
+    {
+      "name": "naive",
+      "kind": "baseline",
+      "target": "raw_sales",
+      "hyperparameters": {
+        "strategy": "last_observed_at_origin"
+      },
+      "fold_metrics": [
+        {
+          "fold": 1,
+          "rmsle": 0.5792239191850429,
+          "mae": 97.19267355678258,
+          "rmse": 337.87830345248386,
+          "rmsle_active": 0.6011017790400447,
+          "mae_active": 118.7385043500065,
+          "rmse_active": 373.5861619215359,
+          "n_rows": 28512,
+          "n_rows_active": 23322
+        },
+        {
+          "fold": 2,
+          "rmsle": 0.7959768976339106,
+          "mae": 88.76740406561062,
+          "rmse": 307.35690100868425,
+          "rmsle_active": 0.6038224560574671,
+          "mae_active": 103.707160751944,
+          "rmse_active": 330.17384871854495,
+          "n_rows": 28512,
+          "n_rows_active": 23173
+        },
+        {
+          "fold": 3,
+          "rmsle": 0.6034693382149003,
+          "mae": 132.39954065394355,
+          "rmse": 495.4475101092345,
+          "rmsle_active": 0.6347897634942391,
+          "mae_active": 164.40839932604356,
+          "rmse_active": 552.2940307772125,
+          "n_rows": 28512,
+          "n_rows_active": 22944
+        }
+      ],
+      "pooled": {
+        "rmsle": 0.6666470361164434,
+        "mae": 106.11987275877891,
+        "rmse": 389.0579424777372,
+        "rmsle_active": 0.6133304652357224,
+        "mae_active": 128.81250808180408,
+        "rmse_active": 429.0021384512998,
+        "n_rows": 85536,
+        "n_rows_active": 69439
+      },
+      "seeds": {
+        "random_state": 0
+      },
+      "tuning": "none (deterministic baseline)",
+      "christmas_2016": {
+        "status": "freeze-time"
+      }
+    },
+    {
+      "name": "seasonal_naive",
+      "kind": "baseline",
+      "target": "raw_sales",
+      "hyperparameters": {
+        "period": 7,
+        "recursive": true
+      },
+      "fold_metrics": [
+        {
+          "fold": 1,
+          "rmsle": 0.5471787134975096,
+          "mae": 65.33557989485938,
+          "rmse": 249.20807624905297,
+          "rmsle_active": 0.5603372997374373,
+          "mae_active": 79.78522656557031,
+          "rmse_active": 275.54453381846787,
+          "n_rows": 28512,
+          "n_rows_active": 23322
+        },
+        {
+          "fold": 2,
+          "rmsle": 0.7732495239854381,
+          "mae": 61.63393683859077,
+          "rmse": 209.6788012698523,
+          "rmsle_active": 0.5423506339878156,
+          "mae_active": 69.64322361189171,
+          "rmse_active": 212.00732454687693,
+          "n_rows": 28512,
+          "n_rows_active": 23173
+        },
+        {
+          "fold": 3,
+          "rmsle": 0.6257079342302063,
+          "mae": 78.84471433974309,
+          "rmse": 286.3426377378023,
+          "rmsle_active": 0.5446429000047529,
+          "mae_active": 96.01519509336315,
+          "rmse_active": 315.813644635228,
+          "n_rows": 28512,
+          "n_rows_active": 22944
+        }
+      ],
+      "pooled": {
+        "rmsle": 0.6554463593122701,
+        "mae": 68.60474369106441,
+        "rmse": 250.3743671360671,
+        "rmsle_active": 0.549207529945518,
+        "mae_active": 81.76336224517522,
+        "rmse_active": 271.02662830099285,
+        "n_rows": 85536,
+        "n_rows_active": 69439
+      },
+      "seeds": {
+        "random_state": 0
+      },
+      "tuning": "none (fixed period=7)",
+      "christmas_2016": {
+        "status": "freeze-time"
+      }
+    },
+    {
+      "name": "moving_average",
+      "kind": "baseline",
+      "target": "raw_sales",
+      "hyperparameters": {
+        "window": 28
+      },
+      "fold_metrics": [
+        {
+          "fold": 1,
+          "rmsle": 0.4828245858607245,
+          "mae": 89.62880971909978,
+          "rmse": 298.0143507306027,
+          "rmsle_active": 0.4676486515345313,
+          "mae_active": 109.45452731771861,
+          "rmse_active": 329.5090429029099,
+          "n_rows": 28512,
+          "n_rows_active": 23322
+        },
+        {
+          "fold": 2,
+          "rmsle": 0.7409400350174631,
+          "mae": 77.5182496549701,
+          "rmse": 256.0595064881834,
+          "rmsle_active": 0.47239942066380264,
+          "mae_active": 88.81061283099073,
+          "rmse_active": 266.2617555314655,
+          "n_rows": 28512,
+          "n_rows_active": 23173
+        },
+        {
+          "fold": 3,
+          "rmsle": 0.8753442072603956,
+          "mae": 106.71155440986051,
+          "rmse": 390.5053909250547,
+          "rmsle_active": 0.47607764482373005,
+          "mae_active": 123.78732805644889,
+          "rmse_active": 424.5051299793737,
+          "n_rows": 28512,
+          "n_rows_active": 22944
+        }
+      ],
+      "pooled": {
+        "rmsle": 0.7184100958337538,
+        "mae": 91.28620459464348,
+        "rmse": 319.82989460330543,
+        "rmsle_active": 0.4720317812178945,
+        "mae_active": 107.30113152786684,
+        "rmse_active": 345.9318751979333,
+        "n_rows": 85536,
+        "n_rows_active": 69439
+      },
+      "seeds": {
+        "random_state": 0
+      },
+      "tuning": "none (fixed window=28)",
+      "christmas_2016": {
+        "status": "freeze-time"
+      }
+    },
+    {
+      "name": "ridge",
+      "kind": "classical_ml",
+      "target": "log1p(sales)",
+      "hyperparameters": {
+        "model_family": "ARIMAX",
+        "order": [
+          3,
+          1,
+          1
+        ],
+        "alpha": 10.0,
+        "history_days": 180
+      },
+      "fold_metrics": [
+        {
+          "fold": 1,
+          "rmsle": 0.5786014549815482,
+          "mae": 124.25189308915557,
+          "rmse": 414.2983990504534,
+          "rmsle_active": 0.5510287017556503,
+          "mae_active": 151.71222095964072,
+          "rmse_active": 458.0824236061056,
+          "n_rows": 28512,
+          "n_rows_active": 23322
+        },
+        {
+          "fold": 2,
+          "rmsle": 0.7713119444547062,
+          "mae": 106.2473362210862,
+          "rmse": 373.45425777893655,
+          "rmsle_active": 0.5308193266333647,
+          "mae_active": 125.18041367216338,
+          "rmse_active": 406.25453515344714,
+          "n_rows": 28512,
+          "n_rows_active": 23173
+        },
+        {
+          "fold": 3,
+          "rmsle": 0.692652910439329,
+          "mae": 127.33423266136374,
+          "rmse": 471.36310306425116,
+          "rmsle_active": 0.5761078007785103,
+          "mae_active": 157.48189125758103,
+          "rmse_active": 525.4104228669008,
+          "n_rows": 28512,
+          "n_rows_active": 22944
+        }
+      ],
+      "pooled": {
+        "rmsle": 0.6854365552223726,
+        "mae": 119.27782065720183,
+        "rmse": 421.621639640466,
+        "rmsle_active": 0.5528802451941718,
+        "mae_active": 144.76450778755054,
+        "rmse_active": 465.5849099812157,
+        "n_rows": 85536,
+        "n_rows_active": 69439
+      },
+      "seeds": {
+        "random_state": 0
+      },
+      "tuning": "Grid over ARIMAX orders selected by pooled RMSLE across 3 folds (order=(1, 0, 1),alpha=1.0:rmsle=0.734731; order=(2, 0, 1),alpha=10.0:rmsle=0.703321; order=(3, 1, 1),alpha=10.0:rmsle=0.685437); same three folds tune and report.",
+      "christmas_2016": {
+        "status": "freeze-time"
+      }
+    },
+    {
+      "name": "hgb",
+      "kind": "classical_ml",
+      "target": "log1p(sales)",
+      "hyperparameters": {
+        "model_family": "SARIMAX",
+        "order": [
+          2,
+          1,
+          1
+        ],
+        "seasonal_order": [
+          2,
+          0,
+          1,
+          7
+        ],
+        "alpha": 10.0,
+        "history_days": 180
+      },
+      "fold_metrics": [
+        {
+          "fold": 1,
+          "rmsle": 0.4327379810894679,
+          "mae": 58.05825805285845,
+          "rmse": 202.60965990873646,
+          "rmsle_active": 0.4316783379851392,
+          "mae_active": 70.89415409256127,
+          "rmse_active": 224.02179594295256,
+          "n_rows": 28512,
+          "n_rows_active": 23322
+        },
+        {
+          "fold": 2,
+          "rmsle": 0.7151941394374056,
+          "mae": 53.25706653526595,
+          "rmse": 184.68851195209567,
+          "rmsle_active": 0.4596479152710938,
+          "mae_active": 59.61236781447013,
+          "rmse_active": 184.04817068714553,
+          "n_rows": 28512,
+          "n_rows_active": 23173
+        },
+        {
+          "fold": 3,
+          "rmsle": 0.6359854576012377,
+          "mae": 92.36144634809862,
+          "rmse": 359.64374720347274,
+          "rmsle_active": 0.4747591799263942,
+          "mae_active": 113.75632258949017,
+          "rmse_active": 400.7209584823345,
+          "n_rows": 28512,
+          "n_rows_active": 22944
+        }
+      ],
+      "pooled": {
+        "rmsle": 0.6064218332819864,
+        "mae": 67.89225697874102,
+        "rmse": 261.090115756973,
+        "rmsle_active": 0.4555970581755454,
+        "mae_active": 81.29172261416052,
+        "rmse_active": 284.98713535464384,
+        "n_rows": 85536,
+        "n_rows_active": 69439
+      },
+      "seeds": {
+        "random_state": 0
+      },
+      "tuning": "Grid over SARIMAX orders selected by pooled RMSLE across 3 folds (order=(1, 0, 1),seasonal=(1, 0, 1, 7),alpha=1.0:rmsle=0.618019; order=(2, 0, 1),seasonal=(2, 0, 1, 7),alpha=10.0:rmsle=0.606422; order=(2, 1, 1),seasonal=(2, 0, 1, 7),alpha=10.0:rmsle=0.606422); same three folds tune and report.",
+      "christmas_2016": {
+        "status": "freeze-time"
+      }
+    }
+  ],
+  "notes": [
+    "naive: per (store_nbr, family) constant equal to last observed sales <= origin across 16-day horizon.",
+    "seasonal_naive: per series y_hat(t) = y(t-7) if t-7 <= origin else recursive prediction for t-7 (period=7).",
+    "moving_average: per series mean of sales over (origin-27 .. origin) applied across 16-day horizon.",
+    "arimax (registered under tier key 'ridge'): Hannan-Rissanen two-stage ARIMAX(p,d,q) with exogenous holiday/promo/earthquake predictors on log1p(sales).",
+    "sarimax (registered under tier key 'hgb'): Hannan-Rissanen two-stage SARIMAX(p,d,q)(P,D,Q,7) with weekly seasonal AR/MA lags and exogenous predictors on log1p(sales).",
+    "Pre-opening mask (DELAYS_OPEN_UNTIL): drops 207,801 train rows and 5,544 valid rows (Store 52 opened 2017-04-20; 39,006 train grid rows, 51,678 raw rows, 12,804 holdout zeros = 5,544 valid + 7,260 holdout scored as-is).",
+    "Christmas closures: 2013-12-25, 2014-12-25, 2015-12-25 in train (5,346 rows) and 2016-12-25 in holdout (1,782 rows); 7,128 total synthetic zero rows (id=NaN) retained everywhere as true-zero labels.",
+    "Earthquake 2016-04-16 sits inside valid (30-day decay window 2016-04-16..2016-05-15); contamination is in training history only, with zero quake rows in the three fold windows (2016-07-26..2016-09-11).",
+    "Zero-sales share is ~31.5% full-grid, 35.2% train+valid (28.9% trainable after masking), 18.1% valid (~329k in 2013, ~243k in 2014, ~192k in 2015, ~83k in 2016 partial); active-slice filters sales > 0 at scoring time only.",
+    "Oil and transactions merges are deliberately deferred this week; 23 frozen predictors used; same three folds tune and report.",
+    "Determinism: fixed random_state=0 everywhere; two consecutive runs on a fixed HEAD produce byte-identical JSONs with git_sha as the sole version marker."
+  ]
+}
