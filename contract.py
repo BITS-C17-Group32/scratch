@@ -52,7 +52,6 @@ import argparse
 import contextlib
 import copy
 import errno
-import fcntl
 import importlib
 import json
 import math
@@ -76,6 +75,64 @@ from sklearn.metrics import (  # pyright: ignore[reportMissingTypeStubs]
     root_mean_squared_error,
     root_mean_squared_log_error,
 )
+
+# The manifest lock is fcntl.flock on POSIX. Windows has no fcntl, so the
+# same call shape is served by msvcrt.locking: a mandatory byte-range lock
+# that must name the same offset to lock and unlock. It is a real lock,
+# not a no-op; a no-op would let two freeze writers into the same critical
+# section while both believe they hold it.
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    import msvcrt
+
+    class _WindowsFcntl:
+        """The fcntl.flock subset the manifest lock needs, on Windows.
+
+        msvcrt.locking takes a mandatory byte-range lock starting at the
+        file's current position, so every call pins the region at a fixed
+        offset and restores the caller's position. Contention raises
+        BlockingIOError with EAGAIN, the errno _manifest_lock retries on.
+        """
+
+        LOCK_EX = 0x2
+        LOCK_NB = 0x4
+        LOCK_UN = 0x8
+
+        # One byte past the PID marker, not over it: msvcrt locks are
+        # mandatory, so a lock on the marker would hide the holder's PID
+        # from a waiter and block --check's rewrite of it under a busy lock.
+        _LOCK_OFFSET = 4096
+        _REGION = 1
+
+        @classmethod
+        def flock(cls, fd: int, operation: int) -> None:
+            if operation & cls.LOCK_UN:
+                mode = msvcrt.LK_UNLCK
+            elif operation & cls.LOCK_NB:
+                mode = msvcrt.LK_NBLCK
+            elif operation & cls.LOCK_EX:
+                mode = msvcrt.LK_LOCK
+            else:
+                raise ValueError(f"unsupported flock operation: {operation}")
+            position = os.lseek(fd, 0, os.SEEK_CUR)
+            try:
+                os.lseek(fd, cls._LOCK_OFFSET, os.SEEK_SET)
+                try:
+                    msvcrt.locking(fd, mode, cls._REGION)
+                except OSError as error:
+                    if mode == msvcrt.LK_NBLCK and error.errno in (
+                        errno.EACCES,
+                        errno.EDEADLK,
+                    ):
+                        raise BlockingIOError(
+                            errno.EAGAIN, "the manifest lock is held"
+                        ) from error
+                    raise
+            finally:
+                os.lseek(fd, position, os.SEEK_SET)
+
+    fcntl = _WindowsFcntl
 
 __all__ = [
     "PINNED_DTYPES",
@@ -1365,6 +1422,10 @@ def _atomic_write_bytes(path: Path, data: bytes, *, exclusive: bool = False) -> 
             pass
 
 
+# Windows opens files in text mode unless O_BINARY is set; the lock file
+# is raw bytes locked past the PID marker, so pin binary mode where it exists.
+_O_BINARY = getattr(os, "O_BINARY", 0)
+
 # Held manifest locks, keyed by (resolved directory, thread id) so a nested
 # acquisition reuses the fd only for the same directory in the same thread.
 # A nested acquisition for a different directory, or an acquisition from a
@@ -1404,7 +1465,7 @@ def _manifest_lock(directory: Path) -> Iterator[None]:
             held.pop()
         return
     directory.mkdir(parents=True, exist_ok=True)
-    lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT | _O_BINARY, 0o644)
     try:
         waited = 0.0
         while True:
@@ -1475,7 +1536,7 @@ def _manifest_lock_held(directory: Path) -> bool:
     lock_path = directory / "run_manifest.json.lock"
     if not lock_path.is_file():
         return False
-    fd = os.open(str(lock_path), os.O_RDWR)
+    fd = os.open(str(lock_path), os.O_RDWR | _O_BINARY)
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -4681,7 +4742,7 @@ def _check_manifest_writer() -> None:
             raise ContractError(
                 "write_run_manifest left foreign content in run_manifest.json.lock"
             )
-        busy_fd = os.open(str(lock_path), os.O_RDWR)
+        busy_fd = os.open(str(lock_path), os.O_RDWR | _O_BINARY)
         try:
             fcntl.flock(busy_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             busy_started = time.monotonic()
