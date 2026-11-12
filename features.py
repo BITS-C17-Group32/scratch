@@ -7,7 +7,6 @@ from train import clean_train_data
 
 REPO_ROOT = Path(__file__).resolve().parent
 RAW = REPO_ROOT / "data" / "raw"
-EARTHQUAKE_DATE = pd.to_datetime("2016-04-16")
 
 
 def load_stores() -> pd.DataFrame:
@@ -75,13 +74,11 @@ def build_features() -> pd.DataFrame:
     # or this
     # holidays = holidays[holidays["transferred"].eq(False)].copy()
 
-    # Earthquake rows never reach is_event; their effect lives in
-    # earthquake_decay. The remaining Event rows are real demand spikes,
-    # mostly holidays or seasonal events: Black Friday, Cyber Monday,
-    # Mother's Day, World Cup matches. One of them is 2016-05-08, Dia de la
-    # Madre, which is also day 22 of the quake window. is_event and
-    # earthquake_decay are two deliberate signals on that date: retail
-    # lift vs quake disruption.
+    # Terremoto Manabi rows are kept out of is_event: a one-off nationwide
+    # demand shock, not a recurring calendar signal. The remaining Event
+    # rows are repeatable demand spikes: Black Friday, Cyber Monday,
+    # Mother's Day, World Cup matches. 2016-05-08 stays an event through
+    # its Dia de la Madre row; only its Terremoto Manabi+22 row drops.
     terremoto_in_desc = holidays["description"].str.contains(
         "Terremoto Manabi", case=False
     )
@@ -206,26 +203,6 @@ def build_features() -> pd.DataFrame:
     df["is_event_tomorrow"] = tomorrow.isin(events_dates).astype(np.int8)
     df["is_event_in_2days"] = in_2days.isin(events_dates).astype(np.int8)
 
-    # EARTHQUAKE FEATURE
-
-    earthquake_date = EARTHQUAKE_DATE
-
-    # Post-quake relief-window decay.
-    # Day 0 = 2016-04-16 (M 7.8, 27 km SSE of Muisne, Ecuador).
-    # Linear from 1.0 on day 0 to 0.0 on day 30 (2016-05-16); identically 0 elsewhere.
-    # Captures the "several weeks of elevated supermarket sales" after the quake
-    # (Corporacion Favorita dataset description). Global across all stores, the
-    # relief spike was a nationwide demand shock; a Manabi/Esmeraldas interaction
-    # was considered and deferred.
-    # This is an a-priori shape from the published post-disaster response
-    # (Figueroa 2020 ICEDEG; Abe 2014 DP14-1), not an empirically fitted decay.
-    # The competing binary window was a nested threshold of this one and was removed.
-    # This feature is zero for the whole August 2017 forecast horizon by construction.
-    days_since_eq = (df["date"] - earthquake_date).dt.days
-    df["earthquake_decay"] = np.where(
-        (days_since_eq >= 0) & (days_since_eq <= 30), 1 - (days_since_eq / 30), 0
-    ).astype(np.float32)
-
     for col in [
         "is_national_holiday",
         "is_national_holiday_tomorrow",
@@ -324,24 +301,10 @@ def build_features() -> pd.DataFrame:
         df.loc[missing, "sales"].eq(0).all()
         and df.loc[missing, "onpromotion"].eq(0).all()
     ), "id=NA rows must be the sales/onpromotion fills"
-    assert df["earthquake_decay"].max() == 1.0
-    assert df["earthquake_decay"].min() == 0.0
-    assert df["earthquake_decay"].between(0, 1).all()
-    assert df.loc[df["date"] < EARTHQUAKE_DATE, "earthquake_decay"].eq(0).all()
-    assert (
-        df.loc[df["date"] > EARTHQUAKE_DATE + pd.Timedelta(days=30), "earthquake_decay"]
-        .eq(0)
-        .all()
-    )
-    assert df.loc[df["date"].eq(EARTHQUAKE_DATE), "earthquake_decay"].eq(1.0).all()
-    assert set(df.loc[df["earthquake_decay"].gt(0), "date"].unique()) == {
-        EARTHQUAKE_DATE + pd.Timedelta(days=i) for i in range(30)
-    }, "earthquake_decay violates the day 0..29 positive design"
 
-    # Dtype contract: category, uint16, float32. Regression guards.
+    # Dtype contract: category, uint16. Regression guards.
     assert isinstance(df["city"].dtype, pd.CategoricalDtype), "city is not category"
     assert isinstance(df["state"].dtype, pd.CategoricalDtype), "state is not category"
-    assert df["earthquake_decay"].dtype == np.float32, "decay is not float32"
     assert df["onpromotion"].dtype == np.uint16, "onpromotion is not uint16"
 
     return df
@@ -352,7 +315,7 @@ def main() -> None:
     # partitions and the manifest. This entry only build-validates, so
     # `python3 features.py` stays a cheap smoke check against the data.
     df = build_features()
-    feature_cols = [c for c in df.columns if c.startswith(("is_", "earthquake_"))]
+    feature_cols = [c for c in df.columns if c.startswith("is_")]
     print(f"validated frame: {len(df)} rows x {len(df.columns)} columns")
     print("positive counts:", {c: int(df[c].sum()) for c in feature_cols})
     print("next: python3 main.py  (writes frame_full.parquet + splits + manifest)")
