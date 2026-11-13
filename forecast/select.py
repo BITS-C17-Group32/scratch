@@ -1,11 +1,14 @@
-"""Interactive store and family selection for app.py."""
+"""Interactive store, family, and forecast-window selection for app.py."""
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 
+import pandas as pd
+
 from forecast.cleaning import available_series
+from forecast.windows import MAX_HORIZON
 
 
 def match_family(user_input: str, families: list[str]) -> str | None:
@@ -79,3 +82,61 @@ def choose_series(data_dir: Path) -> tuple[int, str]:
     store = choose_store(stores)
     family = choose_family(families)
     return store, family
+
+
+def _prompt_optional(text: str) -> str:
+    """Read one line, returning empty on end-of-input so piped runs can skip."""
+    try:
+        return input(text).strip()
+    except EOFError:
+        return ""
+
+
+def _parse_date(text: str) -> pd.Timestamp:
+    """Parse a strict YYYY-MM-DD date, rejecting times and time zones."""
+    try:
+        parsed = pd.to_datetime(text, format="%Y-%m-%d", errors="raise")
+    except ValueError:
+        raise ValueError(f"'{text}' is not a valid date (use YYYY-MM-DD)") from None
+    if pd.isna(parsed):
+        raise ValueError(f"'{text}' is not a valid date (use YYYY-MM-DD)")
+    return pd.Timestamp(parsed)
+
+
+def choose_future_dates(
+    last_date: pd.Timestamp,
+) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+    """Prompt for an optional future forecast window, or None to skip.
+
+    A non-empty start requires an end date on the next prompt. The start
+    must sit after the last recorded date, and the rollout from the day
+    after the last recorded date through the end date may not exceed
+    MAX_HORIZON days, because the models still forecast the gap days.
+    """
+    start_text = _prompt_optional(
+        f"\nFuture forecast start date (YYYY-MM-DD, after {last_date:%Y-%m-%d}), "
+        "or Enter to skip: "
+    )
+    if not start_text:
+        return None
+    end_text = _prompt_optional("Future forecast end date (YYYY-MM-DD): ")
+    if not end_text:
+        raise ValueError("a start date needs an end date on the next prompt")
+    start = _parse_date(start_text)
+    end = _parse_date(end_text)
+    if start <= last_date:
+        raise ValueError(
+            f"start date {start:%Y-%m-%d} must be after the last recorded day "
+            f"{last_date:%Y-%m-%d}"
+        )
+    if end < start:
+        raise ValueError(
+            f"end date {end:%Y-%m-%d} is before the start date {start:%Y-%m-%d}"
+        )
+    span = (end - last_date).days
+    if span > MAX_HORIZON:
+        raise ValueError(
+            f"the forecast ends {span} days after the last recorded day, "
+            f"and the maximum is {MAX_HORIZON}"
+        )
+    return start, end

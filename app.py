@@ -4,7 +4,10 @@ Run with 'uv run app.py'. The prompt takes a store number, then a family by
 name, unique prefix, or list number. The app streams only that pair's rows
 from train.csv, trains five forecasters (RNN, GRU, LSTM, HGB, SARIMAX) on an
 80/20 chronological split, prints the error table, and opens two chart
-windows with the test-period predictions and errors.
+windows with the test-period predictions and errors. Optionally, two future
+dates retrain the models on the full series and extend the predictions
+chart through the requested end date, including forecasted days before
+the start.
 """
 
 from __future__ import annotations
@@ -14,12 +17,14 @@ import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 
 from forecast.cleaning import load_series
 from forecast.evaluate import evaluate, plot_errors, plot_predictions, print_summary
+from forecast.future import forecast_future, print_future_table
 from forecast.models import invert_sales, train_all
-from forecast.select import choose_series
+from forecast.select import choose_future_dates, choose_series
 from forecast.windows import make_dataset
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -41,6 +46,7 @@ def main() -> None:
             f"\nLoaded {len(series):,} days for store {store} / {family} "
             f"({series['date'].min():%Y-%m-%d} to {series['date'].max():%Y-%m-%d})."
         )
+        future_dates = choose_future_dates(series["date"].max())
         dataset = make_dataset(series)
     except ValueError as err:
         sys.exit(f"error: {err}")
@@ -67,7 +73,21 @@ def main() -> None:
     }
     print_summary(metrics)
 
-    plot_predictions(dataset["test_dates"], actual_sales, predictions, store, family)
+    future: tuple[np.ndarray, dict[str, np.ndarray]] | None = None
+    if future_dates is not None:
+        rollout_days, rollout_preds, first_requested = forecast_future(
+            series, dataset, device, DATA_DIR, store, *future_dates
+        )
+        reported_days = rollout_days[first_requested:]
+        reported_preds = {
+            name: pred[first_requested:] for name, pred in rollout_preds.items()
+        }
+        print_future_table(reported_days, reported_preds)
+        future = rollout_days, rollout_preds
+
+    plot_predictions(
+        dataset["test_dates"], actual_sales, predictions, store, family, future=future
+    )
     plot_errors(metrics, store, family)
 
     # plot_predictions and plot_errors save each PNG before plt.show, so a
