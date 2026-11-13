@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from forecast.cleaning import store_calendars
+from forecast.cleaning import flags_frame, store_calendars
 from forecast.models import (
     WindowPredictor,
     build_gru,
@@ -34,7 +34,12 @@ from forecast.models import (
     keras_window_predictor,
     rnn_window_predictor,
 )
-from forecast.windows import Dataset, scaled_channels
+from forecast.windows import (
+    BASE_FLAG_COLS,
+    FULL15_FLAG_COLS,
+    Dataset,
+    scaled_channels,
+)
 
 
 def _full_series_dataset(data: Dataset) -> Dataset:
@@ -56,6 +61,7 @@ def _full_series_dataset(data: Dataset) -> Dataset:
         "raw_sales": data["raw_sales"],
         "first_test_index": len(data["raw_sales"]),
         "test_dates": data["test_dates"][:0],
+        "use_full15": data["use_full15"],
     }
 
 
@@ -74,6 +80,8 @@ def forecast_future(
     newest recorded days are trained on too. The rollout runs from the day
     after the last recorded date through end, so a later start is still
     covered, and each window model rolls its own predictions forward.
+    The calendar channels match the training arm, which the dataset records.
+    series must carry the calendar flag columns, which load_series attaches.
     Returns the rollout dates, one raw-unit prediction array per model, and
     the index of the first requested date so the caller can slice the
     requested span out of the full rollout.
@@ -101,7 +109,8 @@ def forecast_future(
     }
 
     future_dates = pd.date_range(last_date + pd.Timedelta(days=1), end, freq="D")
-    holidays, events = store_calendars(data_dir, store)
+    national, regional, local, events = store_calendars(data_dir, store)
+    holidays = national | regional | local
     for flag, flagged in (
         ("store-locale holiday", holidays),
         ("global event", events),
@@ -111,6 +120,10 @@ def forecast_future(
             print(
                 f"note: {flag} flags after {known_until:%Y-%m-%d} are treated as none."
             )
+    # The calendar block matches the training arm, which the dataset records,
+    # so the rollout consumes the channel layout the fits were built on.
+    flag_cols = FULL15_FLAG_COLS if data["use_full15"] else BASE_FLAG_COLS
+    future_flags = flags_frame(national, regional, local, events, future_dates)
     # The zero sales column exists for scaled_channels, which always builds
     # the history matrix. The rollout only consumes the known-today rows.
     future_frame = pd.DataFrame(
@@ -118,23 +131,18 @@ def forecast_future(
             "date": future_dates,
             "sales": np.zeros(len(future_dates), dtype=np.float32),
             "onpromotion": np.zeros(len(future_dates), dtype=np.float32),
-            "is_holiday": np.array(
-                [day in holidays for day in future_dates], dtype=np.float32
-            ),
-            "is_event": np.array(
-                [day in events for day in future_dates], dtype=np.float32
-            ),
+            **{col: future_flags[col].to_numpy() for col in flag_cols},
         }
     )
 
     # The scalers come from make_dataset's fit on the recorded series, so the
     # rollout transforms predictions with the exact scaling training used.
     _, future_today, _, _ = scaled_channels(
-        future_frame, data["sales_scaler"], data["promo_scaler"]
+        future_frame, data["sales_scaler"], data["promo_scaler"], flag_cols
     )
-    hist_channels = scaled_channels(series, data["sales_scaler"], data["promo_scaler"])[
-        0
-    ]
+    hist_channels = scaled_channels(
+        series, data["sales_scaler"], data["promo_scaler"], flag_cols
+    )[0]
     # The seed window width must match what the fitted models expect, so it
     # derives from the windows they trained on rather than the default.
     seed_window = hist_channels[-lookback:]
