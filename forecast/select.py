@@ -1,4 +1,4 @@
-"""Interactive store/family selection, shared by fork_forecast.py and app.py."""
+"""Interactive store/family selection for app.py."""
 
 from __future__ import annotations
 

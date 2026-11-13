@@ -1,5 +1,5 @@
 # Generated output: run charts and Python/tool caches. Nothing here is
-# source; charts regenerate when app.py or fork_forecast.py runs.
+# source; charts regenerate when app.py runs.
 *.png
 __pycache__/
 *.pyc
