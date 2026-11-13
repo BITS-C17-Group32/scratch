@@ -19,12 +19,9 @@ COLORS = {
 }
 
 
-def evaluate(name, predictions, actuals):
+def evaluate(predictions, actuals):
     mae = np.mean(np.abs(predictions - actuals))
     rmse = np.sqrt(np.mean((predictions - actuals) ** 2))
-    print(f"\n--- {name} Results ---")
-    print(f"Test MAE:  {mae:.2f}")
-    print(f"Test RMSE: {rmse:.2f}")
     return float(mae), float(rmse)
 
 

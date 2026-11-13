@@ -13,8 +13,8 @@ from sklearn.preprocessing import MinMaxScaler
 LOOKBACK = 28
 
 # Below ~120 train windows the models stop reliably beating a naive
-# weekly (t-7) baseline (measured with history_ab.py), so shorter
-# series are refused rather than forecast on.
+# weekly (t-7) baseline (measured in A/B tests), so shorter series are
+# refused rather than forecast on.
 MIN_TRAIN = 120
 
 

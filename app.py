@@ -53,7 +53,7 @@ def main() -> None:
     preds = train_all(data, device)
     actuals = invert_sales(data["y_test"], data["sales_scaler"])
 
-    metrics = {name: evaluate(name, pred, actuals) for name, pred in preds.items()}
+    metrics = {name: evaluate(pred, actuals) for name, pred in preds.items()}
     print_summary(metrics)
 
     plot_predictions(data["test_dates"], actuals, preds, store, family)

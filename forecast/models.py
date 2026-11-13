@@ -35,13 +35,13 @@ SEED = 42
 
 
 class DemandRNN(nn.Module):
-    def __init__(self, hist_size, hidden_layer_size=HIDDEN, today_size=5, num_layers=1):
+    def __init__(self, hist_size, today_size, hidden_layer_size=HIDDEN):
         super().__init__()
         self.hidden_layer_size = hidden_layer_size
         self.rnn = nn.RNN(
             hist_size,
             hidden_layer_size,
-            num_layers,
+            1,
             batch_first=True,
             nonlinearity="tanh",
         )
