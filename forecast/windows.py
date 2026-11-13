@@ -51,6 +51,21 @@ def make_dataset(series: pd.DataFrame, lookback: int = LOOKBACK) -> Dataset:
     is_holiday = series["is_holiday"].to_numpy(dtype=np.float32)
     is_event = series["is_event"].to_numpy(dtype=np.float32)
 
+    total_days = len(sales)
+    if total_days <= lookback:
+        raise ValueError(
+            f"series has {total_days} days, fewer than the {lookback}-day lookback"
+        )
+
+    # Split by raw-series length so train/test days match across all models.
+    first_test = int(total_days * 0.8)
+    split_index = first_test - lookback
+    if split_index < MIN_TRAIN:
+        raise ValueError(
+            f"too little history to forecast: {total_days} days give only "
+            f"{split_index} train windows (minimum {MIN_TRAIN})"
+        )
+
     weekday = series["date"].dt.weekday.to_numpy()
     dow_sin = np.sin(2 * np.pi * weekday / 7).astype(np.float32)
     dow_cos = np.cos(2 * np.pi * weekday / 7).astype(np.float32)
@@ -59,45 +74,43 @@ def make_dataset(series: pd.DataFrame, lookback: int = LOOKBACK) -> Dataset:
     # in an A/B test. Promotion counts have a huge skewed tail, so
     # log-compress them before scaling (their scale also shifts in 2017).
     sales_scaler = MinMaxScaler(feature_range=(0, 1)).fit(sales.reshape(-1, 1))
-    s = sales_scaler.transform(sales.reshape(-1, 1)).astype(np.float32).flatten()
+    scaled_sales = (
+        sales_scaler.transform(sales.reshape(-1, 1)).astype(np.float32).flatten()
+    )
+
     log_promo = np.log1p(promo).reshape(-1, 1)
     promo_scaler = MinMaxScaler(feature_range=(0, 1)).fit(log_promo)
-    p = promo_scaler.transform(log_promo).astype(np.float32).flatten()
+    scaled_promo = promo_scaler.transform(log_promo).astype(np.float32).flatten()
 
-    hist_channels = np.stack([s, p, is_holiday, is_event, dow_sin, dow_cos], axis=1)
-    today_channels = np.stack([p, is_holiday, is_event, dow_sin, dow_cos], axis=1)
+    hist_channels = np.stack(
+        [scaled_sales, scaled_promo, is_holiday, is_event, dow_sin, dow_cos], axis=1
+    )
+    today_channels = np.stack(
+        [scaled_promo, is_holiday, is_event, dow_sin, dow_cos], axis=1
+    )
 
     X_seq, X_today, y = [], [], []
-    for i in range(lookback, len(s)):
+    for i in range(lookback, total_days):
         X_seq.append(hist_channels[i - lookback : i])
         X_today.append(today_channels[i])
-        y.append(s[i])
-    X_seq, X_today, y = np.array(X_seq), np.array(X_today), np.array(y)
+        y.append(scaled_sales[i])
+    seq_windows = np.array(X_seq)
+    today_windows = np.array(X_today)
+    targets = np.array(y)
 
-    # Split by raw-series length so train/test days match across all models.
-    first_test = int(len(s) * 0.8)
-    split_index = first_test - lookback
-    if len(s) <= lookback:
-        raise ValueError(
-            f"series has {len(s)} days, fewer than the {lookback}-day lookback"
-        )
-    if split_index < MIN_TRAIN:
-        raise ValueError(
-            f"too little history to forecast: {len(s)} days give only "
-            f"{split_index} train windows (minimum {MIN_TRAIN})"
-        )
     print(
         f"Data loaded successfully! Inputs: {hist_channels.shape[1]} history "
         f"channels x {lookback} days + {today_channels.shape[1]} known-today "
-        f"features. Train samples: {split_index}, Test samples: {len(y) - split_index}"
+        f"features. Train samples: {split_index}, "
+        f"Test samples: {len(targets) - split_index}"
     )
     return {
-        "X_seq_train": X_seq[:split_index],
-        "X_today_train": X_today[:split_index],
-        "y_train": y[:split_index],
-        "X_seq_test": X_seq[split_index:],
-        "X_today_test": X_today[split_index:],
-        "y_test": y[split_index:],
+        "X_seq_train": seq_windows[:split_index],
+        "X_today_train": today_windows[:split_index],
+        "y_train": targets[:split_index],
+        "X_seq_test": seq_windows[split_index:],
+        "X_today_test": today_windows[split_index:],
+        "y_test": targets[split_index:],
         "sales_scaler": sales_scaler,
         "raw_sales": sales,
         "first_test_index": first_test,

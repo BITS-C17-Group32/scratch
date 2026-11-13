@@ -35,6 +35,13 @@ def slugify(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_").lower()
 
 
+def _save_figure(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(path, dpi=300)
+    print(f"saved {path}")
+    return path
+
+
 def plot_predictions(
     test_dates: np.ndarray,
     actuals: np.ndarray,
@@ -43,7 +50,6 @@ def plot_predictions(
     family: str,
     out_dir: Path = FIGURES_DIR,
 ) -> Path:
-    out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"fork_actual_vs_predicted_s{store}_{slugify(family)}.png"
     plt.figure(figsize=(14, 6))
     plt.plot(
@@ -63,9 +69,7 @@ def plot_predictions(
     plt.ylabel("Sales Quantity")
     plt.legend()
     plt.grid(True, alpha=0.3)
-    plt.savefig(path, dpi=300)
-    print(f"saved {path}")
-    return path
+    return _save_figure(path)
 
 
 def plot_errors(
@@ -74,7 +78,6 @@ def plot_errors(
     family: str,
     out_dir: Path = FIGURES_DIR,
 ) -> Path:
-    out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"fork_error_comparison_s{store}_{slugify(family)}.png"
     models = list(metrics)
     mae_values = [metrics[m][0] for m in models]
@@ -91,6 +94,4 @@ def plot_errors(
     plt.xticks(x, models)
     plt.legend()
     plt.grid(axis="y", alpha=0.3)
-    plt.savefig(path, dpi=300)
-    print(f"saved {path}")
-    return path
+    return _save_figure(path)

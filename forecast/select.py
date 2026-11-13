@@ -8,25 +8,31 @@ from pathlib import Path
 from forecast.cleaning import available_series
 
 
-def match_family(text: str, families: list[str]) -> str | None:
-    """Exact name (case-insensitive), unique prefix, or 1-based list index."""
-    text = text.strip()
-    if text.isdigit():
-        idx = int(text) - 1
-        return families[idx] if 0 <= idx < len(families) else None
-    hits = [f for f in families if f.lower() == text.lower()]
-    if not hits:
-        hits = [f for f in families if f.lower().startswith(text.lower())]
-    if len(hits) == 1:
-        return hits[0]
-    if len(hits) > 1:
-        print(f"  ambiguous, matches: {', '.join(hits)}")
+def match_family(user_input: str, families: list[str]) -> str | None:
+    """Resolve exact name (case-insensitive), unique prefix, or 1-based index."""
+    query = user_input.strip()
+    if query.isdigit():
+        index = int(query) - 1
+        return families[index] if 0 <= index < len(families) else None
+
+    exact_matches = [f for f in families if f.lower() == query.lower()]
+    if len(exact_matches) > 1:
+        print(f"  ambiguous, matches: {', '.join(exact_matches)}")
+        return None
+    if exact_matches:
+        return exact_matches[0]
+
+    prefix_matches = [f for f in families if f.lower().startswith(query.lower())]
+    if len(prefix_matches) == 1:
+        return prefix_matches[0]
+    if len(prefix_matches) > 1:
+        print(f"  ambiguous, matches: {', '.join(prefix_matches)}")
     return None
 
 
-def prompt(raw_text: str, eof_hint: str = "") -> str:
+def prompt(prompt_text: str, eof_hint: str = "") -> str:
     try:
-        return input(raw_text).strip()
+        return input(prompt_text).strip()
     except EOFError:
         sys.exit(f"no interactive input available{eof_hint}")
 
@@ -39,27 +45,28 @@ def print_families(families: list[str]) -> None:
 def choose_store(stores: list[int]) -> int:
     """Prompt until the user enters a valid store number (or 'q')."""
     print(f"\nAvailable Stores ({len(stores)}): {', '.join(map(str, stores))}")
-    raw = prompt(f"Store number ({stores[0]}-{stores[-1]}), or 'q' to quit: ")
-    while not (raw.isdigit() and int(raw) in stores):
-        if raw.lower() == "q":
+    user_input = prompt(f"Store number ({stores[0]}-{stores[-1]}), or 'q' to quit: ")
+    while True:
+        if user_input.lower() == "q":
             sys.exit(0)
+        if user_input.isdigit() and int(user_input) in stores:
+            return int(user_input)
         print(f"  not a valid store; pick from {stores[0]}..{stores[-1]}")
-        raw = prompt("Store number: ")
-    return int(raw)
+        user_input = prompt("Store number: ")
 
 
 def choose_family(families: list[str]) -> str:
     """Prompt until the user enters a resolvable family (or 'q')."""
     print(f"\nAvailable Families ({len(families)}):")
     print_families(families)
-    raw = prompt("Family (name, unique prefix, or number), or 'q' to quit: ")
+    user_input = prompt("Family (name, unique prefix, or number), or 'q' to quit: ")
     while True:
-        if raw.lower() == "q":
+        if user_input.lower() == "q":
             sys.exit(0)
-        matched = match_family(raw, families)
+        matched = match_family(user_input, families)
         if matched is not None:
             return matched
-        raw = prompt("Family: ")
+        user_input = prompt("Family: ")
 
 
 def choose_series(data_dir: Path) -> tuple[int, str]:

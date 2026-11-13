@@ -25,8 +25,8 @@ from forecast.models import invert_sales, train_all
 from forecast.select import choose_series
 from forecast.windows import make_dataset
 
-HERE = Path(__file__).resolve().parent
-DATA_DIR = HERE / "data" / "raw"
+ROOT_DIR = Path(__file__).resolve().parent
+DATA_DIR = ROOT_DIR / "data" / "raw"
 
 
 def main() -> None:
@@ -44,22 +44,26 @@ def main() -> None:
             f"\nLoaded {len(series):,} days for store {store} / {family} "
             f"({series['date'].min():%Y-%m-%d} to {series['date'].max():%Y-%m-%d})."
         )
-        data = make_dataset(series)
+        dataset = make_dataset(series)
     except ValueError as err:
         sys.exit(f"error: {err}")
 
     print("\nTraining five models (RNN, GRU, LSTM, HGB, SARIMAX)...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    preds = train_all(data, device)
-    actuals = invert_sales(data["y_test"], data["sales_scaler"])
+    predictions = train_all(dataset, device)
+    actual_sales = invert_sales(dataset["y_test"], dataset["sales_scaler"])
 
-    metrics = {name: evaluate(pred, actuals) for name, pred in preds.items()}
+    metrics = {
+        model_name: evaluate(pred, actual_sales)
+        for model_name, pred in predictions.items()
+    }
     print_summary(metrics)
 
-    plot_predictions(data["test_dates"], actuals, preds, store, family)
+    plot_predictions(dataset["test_dates"], actual_sales, predictions, store, family)
     plot_errors(metrics, store, family)
 
-    if os.environ.get("MPLBACKEND", "").lower() in {"agg", "pdf", "svg", "ps"}:
+    backend = os.environ.get("MPLBACKEND", "").lower()
+    if backend in {"agg", "pdf", "svg", "ps"}:
         print(
             f"\nnote: MPLBACKEND={os.environ['MPLBACKEND']} cannot open chart "
             "windows; the plots are still saved as PNGs in figures/. "

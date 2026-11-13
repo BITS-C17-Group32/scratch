@@ -74,9 +74,18 @@ def train_rnn(data: Dataset, device: torch.device) -> np.ndarray:
     X_today = torch.tensor(data["X_today_train"], dtype=torch.float32).to(device)
     y = torch.tensor(data["y_train"], dtype=torch.float32).unsqueeze(-1).to(device)
 
-    nval = len(X_seq) - int(len(X_seq) * 0.85)
-    Xf_seq, Xf_today, yf = X_seq[:-nval], X_today[:-nval], y[:-nval]
-    Xv_seq, Xv_today, yv = X_seq[-nval:], X_today[-nval:], y[-nval:]
+    # Chronological validation split, mirroring train_keras's validation_split=0.15.
+    val_count = len(X_seq) - int(len(X_seq) * 0.85)
+    train_seq, train_today, train_y = (
+        X_seq[:-val_count],
+        X_today[:-val_count],
+        y[:-val_count],
+    )
+    val_seq, val_today, val_y = (
+        X_seq[-val_count:],
+        X_today[-val_count:],
+        y[-val_count:],
+    )
 
     model = DemandRNN(
         hist_size=X_seq.shape[-1],
@@ -89,27 +98,35 @@ def train_rnn(data: Dataset, device: torch.device) -> np.ndarray:
         optimizer, factor=0.5, patience=RLROP_PATIENCE, min_lr=1e-5
     )
 
-    patience_ctr, best_val, best_state = 0, float("inf"), None
+    patience_counter = 0
+    best_val_loss = float("inf")
+    best_state: dict[str, torch.Tensor] | None = None
+
     for epoch in range(EPOCHS):
         model.train()
-        for i in range(0, len(Xf_seq), BATCH):
+        for i in range(0, len(train_seq), BATCH):
             optimizer.zero_grad()
-            preds = model(Xf_seq[i : i + BATCH], Xf_today[i : i + BATCH])
-            criterion(preds, yf[i : i + BATCH]).backward()
+            batch_preds = model(train_seq[i : i + BATCH], train_today[i : i + BATCH])
+            loss = criterion(batch_preds, train_y[i : i + BATCH])
+            loss.backward()
             optimizer.step()
 
         model.eval()
         with torch.no_grad():
-            val_loss = criterion(model(Xv_seq, Xv_today), yv).item()
+            val_loss = criterion(model(val_seq, val_today), val_y).item()
         scheduler.step(val_loss)
 
-        if val_loss < best_val:
-            best_val, patience_ctr = val_loss, 0
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
             best_state = copy.deepcopy(model.state_dict())
         else:
-            patience_ctr += 1
-            if patience_ctr >= ES_PATIENCE:
-                print(f"Early stop at epoch {epoch + 1}, best val_loss {best_val:.5f}")
+            patience_counter += 1
+            if patience_counter >= ES_PATIENCE:
+                print(
+                    f"Early stop at epoch {epoch + 1}, "
+                    f"best val_loss {best_val_loss:.5f}"
+                )
                 break
 
     if best_state is not None:
@@ -117,42 +134,52 @@ def train_rnn(data: Dataset, device: torch.device) -> np.ndarray:
 
     model.eval()
     with torch.no_grad():
-        X_seq_te = torch.tensor(data["X_seq_test"], dtype=torch.float32).to(device)
-        X_today_te = torch.tensor(data["X_today_test"], dtype=torch.float32).to(device)
-        preds_scaled = model(X_seq_te, X_today_te).cpu().numpy()
+        test_seq = torch.tensor(data["X_seq_test"], dtype=torch.float32).to(device)
+        test_today = torch.tensor(data["X_today_test"], dtype=torch.float32).to(device)
+        preds_scaled = model(test_seq, test_today).cpu().numpy()
+
     print("=== RNN Training Complete ===")
     return invert_sales(preds_scaled, data["sales_scaler"])
 
 
-def build_gru(lookback: int, hist_size: int, today_size: int) -> keras.Model:
+def _build_keras_model(
+    lookback: int,
+    hist_size: int,
+    today_size: int,
+    encode_history: Callable[[layers.KerasTensor], layers.KerasTensor],
+) -> keras.Model:
     seq_in = layers.Input(shape=(lookback, hist_size), name="history")
     today_in = layers.Input(shape=(today_size,), name="known_today")
-    x = layers.GRU(HIDDEN)(seq_in)
-    x = layers.Concatenate()([x, today_in])
-    out = layers.Dense(1)(x)
+    history_features = encode_history(seq_in)
+    combined = layers.Concatenate()([history_features, today_in])
+    out = layers.Dense(1)(combined)
     return keras.Model([seq_in, today_in], out)
+
+
+def build_gru(lookback: int, hist_size: int, today_size: int) -> keras.Model:
+    return _build_keras_model(
+        lookback, hist_size, today_size, lambda seq: layers.GRU(HIDDEN)(seq)
+    )
 
 
 def build_lstm(lookback: int, hist_size: int, today_size: int) -> keras.Model:
-    seq_in = layers.Input(shape=(lookback, hist_size), name="history")
-    today_in = layers.Input(shape=(today_size,), name="known_today")
-    x = layers.LSTM(HIDDEN, return_sequences=True)(seq_in)
-    x = layers.Dropout(0.2)(x)
-    x = layers.LSTM(HIDDEN)(x)
-    x = layers.Dropout(0.2)(x)
-    x = layers.Concatenate()([x, today_in])
-    out = layers.Dense(1)(x)
-    return keras.Model([seq_in, today_in], out)
+    def _encode_lstm(seq_in: layers.KerasTensor) -> layers.KerasTensor:
+        x = layers.LSTM(HIDDEN, return_sequences=True)(seq_in)
+        x = layers.Dropout(0.2)(x)
+        x = layers.LSTM(HIDDEN)(x)
+        return layers.Dropout(0.2)(x)
+
+    return _build_keras_model(lookback, hist_size, today_size, _encode_lstm)
 
 
 def train_keras(
-    name: str, build_model: Callable[..., keras.Model], data: Dataset
+    name: str, build_model: Callable[[int, int, int], keras.Model], data: Dataset
 ) -> np.ndarray:
     keras.utils.set_random_seed(SEED)
     lookback = data["X_seq_train"].shape[1]
-    model = build_model(
-        lookback, data["X_seq_train"].shape[-1], data["X_today_train"].shape[-1]
-    )
+    hist_size = data["X_seq_train"].shape[-1]
+    today_size = data["X_today_train"].shape[-1]
+    model = build_model(lookback, hist_size, today_size)
     model.compile(optimizer="adam", loss="mse", metrics=["mae"])
 
     print(f"Training {name} model...")
@@ -181,24 +208,19 @@ def train_keras(
     return invert_sales(preds_scaled, data["sales_scaler"])
 
 
+def _flatten_features(seq: np.ndarray, today: np.ndarray) -> np.ndarray:
+    return np.concatenate([seq.reshape(len(seq), -1), today], axis=1)
+
+
 def train_hgb(data: Dataset) -> np.ndarray:
-    """Flatten the windows into a tabular row: lookback*channels + today."""
-    x_train = np.concatenate(
-        [
-            data["X_seq_train"].reshape(len(data["X_seq_train"]), -1),
-            data["X_today_train"],
-        ],
-        axis=1,
-    )
+    """Flatten the windows into tabular rows: lookback*channels + today features."""
+    x_train = _flatten_features(data["X_seq_train"], data["X_today_train"])
     model = HistGradientBoostingRegressor(
         max_iter=300, learning_rate=0.05, random_state=SEED
     )
     model.fit(x_train, data["y_train"])
 
-    x_test = np.concatenate(
-        [data["X_seq_test"].reshape(len(data["X_seq_test"]), -1), data["X_today_test"]],
-        axis=1,
-    )
+    x_test = _flatten_features(data["X_seq_test"], data["X_today_test"])
     print("=== HGB Training Complete ===")
     return invert_sales(model.predict(x_test), data["sales_scaler"])
 
@@ -211,16 +233,16 @@ def train_sarimax(data: Dataset) -> np.ndarray:
     first_test = data["first_test_index"]
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        res = SARIMAX(
+        fitted = SARIMAX(
             sales[:first_test], order=(1, 1, 1), seasonal_order=(1, 0, 1, 7)
         ).fit(disp=False)
-        preds = (
-            res.append(sales[first_test:], refit=False)
+        predictions = (
+            fitted.append(sales[first_test:], refit=False)
             .get_prediction(start=first_test, end=len(sales) - 1)
             .predicted_mean
         )
     print("=== SARIMAX Training Complete ===")
-    return np.asarray(preds, dtype=np.float64)
+    return np.asarray(predictions, dtype=np.float64)
 
 
 def train_all(data: Dataset, device: torch.device) -> dict[str, np.ndarray]:
