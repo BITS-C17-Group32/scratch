@@ -46,9 +46,16 @@ def main() -> None:
         sys.exit(f"error: {err}")
 
     print("\nTraining five models (RNN, GRU, LSTM, HGB, SARIMAX)...")
-    # Only the PyTorch RNN takes this device. The Keras models follow the
-    # TensorFlow backend, and HGB and SARIMAX stay on CPU.
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Only the PyTorch RNN takes this device. CUDA is preferred when a GPU is
+    # present, then Apple's MPS on Apple Silicon Macs, and CPU is the fallback.
+    # The Keras models follow the TensorFlow backend, and HGB and SARIMAX stay
+    # on CPU.
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     predictions = train_all(dataset, device)
     actual_sales = invert_sales(dataset["y_test"], dataset["sales_scaler"])
 
