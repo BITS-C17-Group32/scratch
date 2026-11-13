@@ -1,8 +1,8 @@
-"""Models: the five forecasters and their training loops.
+"""Five forecasting models and their training loops.
 
-Scope: model definitions and fitting only. Each trainer receives the
-dataset dict from windows.make_dataset and returns test predictions in
-raw unit demand.
+This module only defines and fits models. Data shaping lives in windows.py.
+Each trainer receives the dataset dictionary from windows.make_dataset and
+returns test predictions in raw unit demand.
 """
 
 from __future__ import annotations
@@ -12,7 +12,9 @@ import os
 import warnings
 from collections.abc import Callable
 
-# Quiet TensorFlow before it loads.
+# Set both variables before the keras and TensorFlow imports below. TensorFlow
+# reads TF_CPP_MIN_LOG_LEVEL on first load, and Keras reads KERAS_BACKEND at
+# import time.
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 os.environ.setdefault("KERAS_BACKEND", "tensorflow")
 
@@ -39,6 +41,10 @@ SEED = 42
 
 
 class DemandRNN(nn.Module):
+    """PyTorch RNN that concatenates its final hidden state with same-day features
+    into a linear prediction head.
+    """
+
     def __init__(
         self, hist_size: int, today_size: int, hidden_layer_size: int = HIDDEN
     ) -> None:
@@ -64,17 +70,22 @@ class DemandRNN(nn.Module):
 
 
 def invert_sales(preds_scaled: np.ndarray, sales_scaler: MinMaxScaler) -> np.ndarray:
-    """Undo MinMax: scaled sales back to unit demand."""
+    """Invert MinMax scaling to convert scaled sales back to unit demand."""
     return sales_scaler.inverse_transform(preds_scaled.reshape(-1, 1)).flatten()
 
 
 def train_rnn(data: Dataset, device: torch.device) -> np.ndarray:
+    """Train the PyTorch RNN model.
+
+    The training loop mirrors the Keras models by tracking validation loss
+    for early stopping and learning-rate reduction.
+    """
     torch.manual_seed(SEED)
     X_seq = torch.tensor(data["X_seq_train"], dtype=torch.float32).to(device)
     X_today = torch.tensor(data["X_today_train"], dtype=torch.float32).to(device)
     y = torch.tensor(data["y_train"], dtype=torch.float32).unsqueeze(-1).to(device)
 
-    # Chronological validation split, mirroring train_keras's validation_split=0.15.
+    # Chronological validation split to match train_keras validation_split=0.15.
     val_count = len(X_seq) - int(len(X_seq) * 0.85)
     train_seq, train_today, train_y = (
         X_seq[:-val_count],
@@ -148,6 +159,11 @@ def _build_keras_model(
     today_size: int,
     encode_history: Callable[[layers.KerasTensor], layers.KerasTensor],
 ) -> keras.Model:
+    """Wire the shared two-input graph that build_gru and build_lstm reuse.
+
+    encode_history turns the lookback window into one feature vector, which
+    joins the same-day features before the single dense output layer.
+    """
     seq_in = layers.Input(shape=(lookback, hist_size), name="history")
     today_in = layers.Input(shape=(today_size,), name="known_today")
     history_features = encode_history(seq_in)
@@ -157,12 +173,15 @@ def _build_keras_model(
 
 
 def build_gru(lookback: int, hist_size: int, today_size: int) -> keras.Model:
+    """Construct a model with a single GRU layer over the history sequence."""
     return _build_keras_model(
         lookback, hist_size, today_size, lambda seq: layers.GRU(HIDDEN)(seq)
     )
 
 
 def build_lstm(lookback: int, hist_size: int, today_size: int) -> keras.Model:
+    """Stack two LSTM layers with 0.2 dropout between and after them."""
+
     def _encode_lstm(seq_in: layers.KerasTensor) -> layers.KerasTensor:
         x = layers.LSTM(HIDDEN, return_sequences=True)(seq_in)
         x = layers.Dropout(0.2)(x)
@@ -183,6 +202,10 @@ def train_keras(
     model.compile(optimizer="adam", loss="mse", metrics=["mae"])
 
     print(f"Training {name} model...")
+    # validation_split takes the last 15% of the rows. make_dataset builds the
+    # arrays in date order and shuffle=False keeps them that way, so the
+    # holdout is the newest weeks and training never sees them.
+    # Ref: https://keras.io/api/models/model_training_apis/
     model.fit(
         [data["X_seq_train"], data["X_today_train"]],
         data["y_train"],
@@ -213,7 +236,12 @@ def _flatten_features(seq: np.ndarray, today: np.ndarray) -> np.ndarray:
 
 
 def train_hgb(data: Dataset) -> np.ndarray:
-    """Flatten the windows into tabular rows: lookback*channels + today features."""
+    """Train a histogram gradient boosting model on flattened tabular features.
+
+    Each row flattens the lookback window into one vector and appends the
+    known-today features.
+    Ref: https://scikit-learn.org/stable/modules/ensemble.html
+    """
     x_train = _flatten_features(data["X_seq_train"], data["X_today_train"])
     model = HistGradientBoostingRegressor(
         max_iter=300, learning_rate=0.05, random_state=SEED
@@ -226,9 +254,15 @@ def train_hgb(data: Dataset) -> np.ndarray:
 
 
 def train_sarimax(data: Dataset) -> np.ndarray:
-    """SARIMAX(1,1,1)(1,0,1,7) on raw sales; appending the test observations
-    keeps the Kalman filter state, so its one-step predictions use actual
-    history exactly like the other models."""
+    """Fit a SARIMAX(1,1,1)(1,0,1,7) model on raw sales.
+
+    The first tuple is the order (p, d, q), and the second is the seasonal
+    order (P, D, Q, s). Differencing with d=1 removes drift, and s=7 captures
+    the weekly cycle. Appending the test observations keeps the Kalman filter
+    state, so each one-step prediction uses the actual history, exactly like
+    the other models.
+    Ref: https://www.statsmodels.org/stable/statespace.html
+    """
     sales = data["raw_sales"].astype(np.float64)
     first_test = data["first_test_index"]
     with warnings.catch_warnings():

@@ -1,4 +1,4 @@
-"""Interactive store/family selection for app.py."""
+"""Interactive store and family selection for app.py."""
 
 from __future__ import annotations
 
@@ -9,7 +9,11 @@ from forecast.cleaning import available_series
 
 
 def match_family(user_input: str, families: list[str]) -> str | None:
-    """Resolve exact name (case-insensitive), unique prefix, or 1-based index."""
+    """Resolve a family by 1-based index, case-insensitive exact match, or
+    unique prefix.
+    """
+    # A number is always a list index, so "12" picks the 12th family and never
+    # a family whose name starts with a digit.
     query = user_input.strip()
     if query.isdigit():
         index = int(query) - 1
@@ -43,7 +47,7 @@ def print_families(families: list[str]) -> None:
 
 
 def choose_store(stores: list[int]) -> int:
-    """Prompt until the user enters a valid store number (or 'q')."""
+    """Prompt until the user enters a valid store number, or 'q' to quit."""
     print(f"\nAvailable Stores ({len(stores)}): {', '.join(map(str, stores))}")
     user_input = prompt(f"Store number ({stores[0]}-{stores[-1]}), or 'q' to quit: ")
     while True:
@@ -56,7 +60,7 @@ def choose_store(stores: list[int]) -> int:
 
 
 def choose_family(families: list[str]) -> str:
-    """Prompt until the user enters a resolvable family (or 'q')."""
+    """Prompt until the user enters a resolvable family name, or 'q' to quit."""
     print(f"\nAvailable Families ({len(families)}):")
     print_families(families)
     user_input = prompt("Family (name, unique prefix, or number), or 'q' to quit: ")
@@ -70,7 +74,7 @@ def choose_family(families: list[str]) -> str:
 
 
 def choose_series(data_dir: Path) -> tuple[int, str]:
-    """Interactive selection of one (store, family) pair."""
+    """Prompt for and return a store number and product family."""
     stores, families = available_series(data_dir)
     store = choose_store(stores)
     family = choose_family(families)

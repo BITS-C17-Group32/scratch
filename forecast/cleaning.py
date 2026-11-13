@@ -1,9 +1,9 @@
-"""Cleaning: raw favorita CSVs -> one clean daily series.
+"""Extract and clean raw Favorita CSV data into one daily series.
 
-Scope: locate the selected (store, family) rows in train.csv without ever
-building the full frame, trim the series to its first real sale,
-grid-fill the recorded closure days, and attach holiday/event flags.
-Valid menu choices come from a light 2-column scan.
+Locate the selected store and family rows in train.csv without building
+the full DataFrame, trim the series to its first real sale, fill recorded
+closure days, and attach holiday and event flags. Prompt setup reads only
+the store_nbr and family columns, so the scan never builds the full DataFrame.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import pandas as pd
 
 
 def available_series(data_dir: Path) -> tuple[list[int], list[str]]:
-    """Valid store numbers and families, from a 2-column scan of train.csv."""
+    """Return valid store numbers and families from a two-column scan of train.csv."""
     records = pd.read_csv(
         data_dir / "train.csv",
         usecols=["store_nbr", "family"],
@@ -29,13 +29,13 @@ def available_series(data_dir: Path) -> tuple[list[int], list[str]]:
 def _calendars(
     data_dir: Path, city: str, state: str
 ) -> tuple[set[pd.Timestamp], set[pd.Timestamp]]:
-    """Per-store flag dates: this store's holiday dates, plus event dates.
+    """Return the holiday and event dates a store observes.
 
-    Each file row is scoped — national (whole country), regional (one
-    state), local (one city) — so a store only observes the ones matching
-    its own location. Transferred rows are dropped (the holiday moved to
-    another date), Work Days are not holidays, and earthquake rows stay
-    out of the event flag.
+    The locale column scopes the holidays: National rows apply to every store,
+    Regional rows to the store's state, and Local rows to its city. Event rows
+    ignore locale, so every store sees the same events. This function drops
+    transferred rows because each holiday appears on its new date. Rows typed
+    Work Day are not holidays, and earthquake rows stay out of the event flag.
     """
     holidays_raw = pd.read_csv(data_dir / "holidays_events.csv", parse_dates=["date"])
     active_rows = holidays_raw[~holidays_raw["transferred"]]
@@ -65,17 +65,23 @@ def _calendars(
 
 
 def load_series(data_dir: Path, store: int, family: str) -> pd.DataFrame:
-    """Stream train.csv once, keeping only this (store, family) slice.
+    """Stream train.csv once and keep only the selected store and family slice.
 
-    The CSV is read in chunks and filtered per chunk, so peak memory is
-    one chunk plus the matching rows — never the full frame. Rows before
-    the series' first real sale are dropped as artifacts, then the span
-    is grid-filled: missing days are the recorded Christmas closures
-    (zero sales, no promos). Returns a contiguous daily frame with date,
-    sales, onpromotion, is_holiday, is_event.
+    Chunked reading caps peak memory at one chunk plus the matched rows, never
+    the full frame. Rows before the first real sale are recording artifacts.
+    Missing days are the recorded Christmas closures, so the grid-filled span
+    carries zero sales and zero promotions. Returns a contiguous daily frame
+    with date, sales, onpromotion, is_holiday, and is_event.
     """
+    # The explicit element type tells basedpyright what to verify. Without it,
+    # basedpyright infers an empty list as list[Unknown], so the checker cannot
+    # confirm what pd.concat receives. The annotation makes it verify every
+    # appended chunk is a DataFrame.
+    # Ref: https://docs.python.org/3/library/typing.html
     keep: list[pd.DataFrame] = []
     columns_to_load = ["date", "store_nbr", "family", "sales", "onpromotion"]
+    # chunksize makes read_csv yield 250,000-row chunks.
+    # Ref: https://pandas.pydata.org/docs/reference/api/pandas.read_csv.html
     for chunk in pd.read_csv(
         data_dir / "train.csv",
         parse_dates=["date"],
@@ -90,7 +96,7 @@ def load_series(data_dir: Path, store: int, family: str) -> pd.DataFrame:
         raise ValueError(f"no rows in train.csv for store {store} / {family}")
     series_rows = pd.concat(keep, ignore_index=True)
 
-    # Rows before the first real sale are artifacts: start the series there.
+    # The first day with a non-zero sale marks the real start of the series.
     first_sale = series_rows.loc[series_rows["sales"].ne(0.0), "date"].min()
     series_rows = series_rows[series_rows["date"] >= first_sale]
     if series_rows.empty:
@@ -104,7 +110,8 @@ def load_series(data_dir: Path, store: int, family: str) -> pd.DataFrame:
         series_rows["date"].min(), series_rows["date"].max(), freq="D"
     )
     filled = series_rows.set_index("date").reindex(dates)
-    # Missing days are the recorded Christmas closures: zero sales, no promos.
+    # The source omits closure days instead of writing zero rows, so reindex
+    # leaves NaN here. Fill both columns with zero.
     filled["sales"] = filled["sales"].fillna(0.0)
     filled["onpromotion"] = filled["onpromotion"].fillna(0.0)
 

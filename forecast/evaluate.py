@@ -1,4 +1,4 @@
-"""Evaluation: metrics, summary table, and the two comparison plots."""
+"""Evaluation metrics, summary table, and two comparison plots."""
 
 from __future__ import annotations
 
@@ -20,6 +20,13 @@ COLORS = {
 
 
 def evaluate(predictions: np.ndarray, actuals: np.ndarray) -> tuple[float, float]:
+    """Compute the mean absolute error (MAE) and root mean squared error (RMSE).
+
+    The app passes sales after invert_sales, so both numbers are in item
+    units for the selected store and family. RMSE squares the residuals
+    before averaging, so a large miss raises RMSE more than MAE. The final
+    square root keeps RMSE in those units.
+    """
     mae = np.mean(np.abs(predictions - actuals))
     rmse = np.sqrt(np.mean((predictions - actuals) ** 2))
     return float(mae), float(rmse)

@@ -1,13 +1,10 @@
-"""Interactive five-model demand forecaster.
+"""Interactive five-model demand forecasting application.
 
-    uv run app.py
-
-Pick a store and a product family at the prompt (store number, then
-family by name, unique prefix, or list number), and the real pipeline
-runs: only that pair's rows are ever loaded from train.csv, all five
-models (RNN, GRU, LSTM, HGB, SARIMAX) train on the 80/20 chronological
-split, the summary table prints, and two chart windows open with the
-test-period predictions and errors.
+Run with 'uv run app.py'. The prompt takes a store number, then a family by
+name, unique prefix, or list number. The app streams only that pair's rows
+from train.csv, trains five forecasters (RNN, GRU, LSTM, HGB, SARIMAX) on an
+80/20 chronological split, prints the error table, and opens two chart
+windows with the test-period predictions and errors.
 """
 
 from __future__ import annotations
@@ -49,6 +46,8 @@ def main() -> None:
         sys.exit(f"error: {err}")
 
     print("\nTraining five models (RNN, GRU, LSTM, HGB, SARIMAX)...")
+    # Only the PyTorch RNN takes this device. The Keras models follow the
+    # TensorFlow backend, and HGB and SARIMAX stay on CPU.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     predictions = train_all(dataset, device)
     actual_sales = invert_sales(dataset["y_test"], dataset["sales_scaler"])
@@ -62,6 +61,9 @@ def main() -> None:
     plot_predictions(dataset["test_dates"], actual_sales, predictions, store, family)
     plot_errors(metrics, store, family)
 
+    # plot_predictions and plot_errors save each PNG before plt.show, so a
+    # headless backend loses only the chart window.
+    # Ref: https://matplotlib.org/stable/users/explain/figure/backends.html
     backend = os.environ.get("MPLBACKEND", "").lower()
     if backend in {"agg", "pdf", "svg", "ps"}:
         print(

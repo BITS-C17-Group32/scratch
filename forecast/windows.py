@@ -1,8 +1,8 @@
-"""Windowing: clean daily series -> scaled windows and an 80/20 split.
+"""Transform a clean daily series into scaled windows and an 80/20 split.
 
-Scope: everything between a clean series and model-ready arrays —
-channel building, scaling, sliding windows, chronological split. Every
-model receives the same dataset dict so results stay comparable.
+Build feature channels, scale inputs, construct sliding windows, and split arrays
+chronologically. Every model receives the same dataset dictionary so results
+stay comparable.
 """
 
 from __future__ import annotations
@@ -15,14 +15,13 @@ from sklearn.preprocessing import MinMaxScaler
 
 LOOKBACK = 28
 
-# Below ~120 train windows the models stop reliably beating a naive
-# weekly (t-7) baseline (measured in A/B tests), so shorter series are
-# refused rather than forecast on.
+# Models trained on fewer than ~120 windows do not reliably beat a naive weekly
+# t-7 baseline in A/B tests, so shorter series are rejected.
 MIN_TRAIN = 120
 
 
 class Dataset(TypedDict):
-    """The make_dataset payload every trainer consumes."""
+    """Dataset dictionary that make_dataset produces and every trainer consumes."""
 
     X_seq_train: np.ndarray
     X_today_train: np.ndarray
@@ -37,14 +36,14 @@ class Dataset(TypedDict):
 
 
 def make_dataset(series: pd.DataFrame, lookback: int = LOOKBACK) -> Dataset:
-    """Scale, window, split.
+    """Scale, window, and split the series into chronological training and test sets.
 
-    Two input pieces per target day t:
-      * a history sequence over rows t-lookback..t-1 with channels
-        [sales, log-promo, is_holiday, is_event, dow_sin, dow_cos];
-      * a "known today" vector from row t with the target day's own
-        known-in-advance features [log-promo, is_holiday, is_event,
-        dow_sin, dow_cos] (no sales — that is the label).
+    Each target day t receives two inputs. The first is a history sequence over
+    rows t-lookback to t-1 with channels [sales, log-promo, is_holiday,
+    is_event, dow_sin, dow_cos]. The second is a known-today vector from row t
+    holding the same-day features known in advance, [log-promo, is_holiday,
+    is_event, dow_sin, dow_cos]. Sales is absent from the second vector because
+    it is the label.
     """
     sales = series["sales"].to_numpy(dtype=np.float32)
     promo = series["onpromotion"].to_numpy(dtype=np.float32)
@@ -70,14 +69,18 @@ def make_dataset(series: pd.DataFrame, lookback: int = LOOKBACK) -> Dataset:
     dow_sin = np.sin(2 * np.pi * weekday / 7).astype(np.float32)
     dow_cos = np.cos(2 * np.pi * weekday / 7).astype(np.float32)
 
-    # Raw-unit targets: log-space training cost ~2x MAE in absolute units
-    # in an A/B test. Promotion counts have a huge skewed tail, so
-    # log-compress them before scaling (their scale also shifts in 2017).
+    # Scale sales with MinMax instead of a log transform. An A/B test showed
+    # log-space training roughly doubled MAE in absolute units.
+    # Ref: https://scikit-learn.org/stable/modules/preprocessing.html
     sales_scaler = MinMaxScaler(feature_range=(0, 1)).fit(sales.reshape(-1, 1))
     scaled_sales = (
         sales_scaler.transform(sales.reshape(-1, 1)).astype(np.float32).flatten()
     )
 
+    # Promotion counts have a skewed tail and their scale shifts in 2017, so
+    # log-compress them before scaling. Use log1p rather than log because
+    # promotion counts are often zero and log(0) is undefined.
+    # Ref: https://numpy.org/doc/stable/reference/generated/numpy.log1p.html
     log_promo = np.log1p(promo).reshape(-1, 1)
     promo_scaler = MinMaxScaler(feature_range=(0, 1)).fit(log_promo)
     scaled_promo = promo_scaler.transform(log_promo).astype(np.float32).flatten()
