@@ -490,12 +490,22 @@ def predict_frame(checkpoint_path, frame, score_start):
     return pd.DataFrame(rows)
 
 
-def fit_predict_frozen(tier, fit_frame, predict_frame, config=None):
+def fit_predict_frozen(
+    tier="deep-lstm", fit_frame=None, predict_frame=None, config=None
+):
     """S1 freeze entrypoint."""
     import os
 
     if os.environ.get("FREEZE_RUN") != "1":
         raise RuntimeError("fit_predict_frozen requires FREEZE_RUN=1")
+
+    if isinstance(tier, pd.DataFrame):
+        predict_frame = fit_frame
+        fit_frame = tier
+        tier = "deep-lstm"
+
+    if fit_frame is None or predict_frame is None:
+        raise ValueError("fit_frame and predict_frame are required")
 
     import numpy as np
     import torch
@@ -535,15 +545,17 @@ def fit_predict_frozen(tier, fit_frame, predict_frame, config=None):
         raise ValueError("predict_frame has no dates after fit_frame")
 
     earliest_required = pd.Timestamp(score_start) - pd.Timedelta(days=cfg.lookback_days)
-    if pd.to_datetime(predict_frame["date"]).min() > earliest_required:
-        raise ValueError(
-            "Frame requires history starting at {}, but got {}".format(
-                earliest_required, pd.to_datetime(predict_frame["date"]).min()
-            )
-        )
+
+    # Compose missing pre-roll from tail of fit_frame
+    cutoff = fit_max - pd.Timedelta(days=cfg.lookback_days - 1)
+    fit_tail = fit_frame[pd.to_datetime(fit_frame["date"]) >= cutoff]
+    combined = pd.concat([fit_tail, predict_frame], ignore_index=True)
+
+    if pd.to_datetime(combined["date"]).min() > earliest_required:
+        raise ValueError(f"need history from {earliest_required}")
 
     panels = build_series_panels(
-        predict_frame.copy(), cat_maps, scaler, cfg.lookback_days, cfg.horizon_days
+        combined, cat_maps, scaler, cfg.lookback_days, cfg.horizon_days
     )
     model = DeepForecaster(
         arch=arch,

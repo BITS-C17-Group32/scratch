@@ -460,19 +460,6 @@ def main(argv=None) -> int:
     train_df = pd.read_parquet(repo_root / "splits" / "train.parquet")
     valid_df = pd.read_parquet(repo_root / "splits" / "valid.parquet")
 
-    if os.environ.get("FREEZE_RUN") == "1":
-        set_seed(cfg.seed)
-        from deep.data import fit_predict_frozen
-
-        preds = fit_predict_frozen(
-            args.arch,
-            train_df,
-            valid_df,
-            config={"max_epochs": 1, "train_window_stride": 32},
-        )
-        print(f"FREEZE_RUN=1: produced {len(preds)} predictions")
-        sys.exit(0)
-
     if args.smoke:
         set_seed(cfg.seed)
 
