@@ -48,8 +48,10 @@ def main() -> None:
     print("\nTraining five models (RNN, GRU, LSTM, HGB, SARIMAX)...")
     # Only the PyTorch RNN takes this device. CUDA is preferred when a GPU is
     # present, then Apple's MPS on Apple Silicon Macs, and CPU is the fallback.
-    # The Keras models follow the TensorFlow backend, and HGB and SARIMAX stay
-    # on CPU.
+    # AMD GPUs also use the CUDA branch. A ROCm build of PyTorch reports
+    # torch.cuda.is_available() as True and selects the AMD GPU with
+    # device("cuda"). The Keras models follow the TensorFlow backend, and HGB
+    # and SARIMAX stay on CPU.
     if torch.cuda.is_available():
         device = torch.device("cuda")
     elif torch.backends.mps.is_available():
