@@ -1,0 +1,465 @@
+{
+  "schema_version": "1.0",
+  "status": "complete",
+  "track": "S4",
+  "generated_at": "2026-11-13T12:51:15Z",
+  "git_sha": "356725b91e2a2658e0548717130bef9bc394417f",
+  "data_fingerprint": {
+    "manifest_sha256": "308e7ec5af085e76fd810ce085b662e1726d9bfa0d6e4db5be9798d4953bae18",
+    "columns_sha256": "c003c6e9bcc6a84ecc808d3fa33411ec0e214021561da9492e7432287aea1f99",
+    "train_rows": 2106324,
+    "valid_rows": 299376,
+    "train_bounds": [
+      "2013-01-01",
+      "2016-03-27"
+    ],
+    "valid_bounds": [
+      "2016-03-28",
+      "2016-09-11"
+    ]
+  },
+  "shared_config": {
+    "lookback_days": 60,
+    "horizon_days": 16,
+    "num_layers": 2,
+    "hidden_size": 128,
+    "dropout": 0.2,
+    "batch_size": 256,
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001,
+    "grad_clip": 1.0,
+    "max_epochs": 30,
+    "patience": 5,
+    "min_delta": 0.0001,
+    "seed": 42,
+    "train_window_stride": 8,
+    "eval_block_days": 16,
+    "target_transform": "log1p",
+    "loss": "mse",
+    "embedding_dims": {
+      "store_nbr": 8,
+      "family": 8,
+      "city": 4,
+      "state": 4,
+      "store_type": 2,
+      "cluster": 4
+    },
+    "numeric_features": [
+      "onpromotion_scaled",
+      "sales_log_scaled",
+      "earthquake_decay",
+      "is_event",
+      "is_national_holiday",
+      "is_regional_holiday",
+      "is_local_holiday",
+      "is_holiday",
+      "is_national_holiday_tomorrow",
+      "is_national_holiday_in_2days",
+      "is_regional_holiday_tomorrow",
+      "is_regional_holiday_in_2days",
+      "is_local_holiday_tomorrow",
+      "is_local_holiday_in_2days",
+      "is_holiday_tomorrow",
+      "is_holiday_in_2days",
+      "is_event_tomorrow",
+      "is_event_in_2days",
+      "dow_sin",
+      "dow_cos",
+      "doy_sin",
+      "doy_cos"
+    ],
+    "categorical_features": [
+      "store_nbr",
+      "family",
+      "city",
+      "state",
+      "store_type",
+      "cluster"
+    ],
+    "calendar_encoding": true,
+    "fit_rows_mask": true,
+    "train_start": null,
+    "dtype": "float32",
+    "device": "cuda",
+    "torch_version": "2.15.0+cu132",
+    "num_workers": 0,
+    "amp": false
+  },
+  "config_sha256": "acbe73c590a52c8d976d4456c948168dca5aee4ca52210bc79fbf08a32729551",
+  "tiers": [
+    {
+      "tier": "deep-rnn",
+      "architecture": "rnn",
+      "checkpoint": "artifacts/deep_rnn.pt",
+      "checkpoint_bytes": 276485,
+      "checkpoint_sha256": "258e4272bca6765a23582dc636a1bbc33961f9ef451283a9e2b6fe1d336257bc",
+      "params": 66572,
+      "status": "complete",
+      "train": {
+        "rows_available": 1898523,
+        "rows_used": 1898523,
+        "rows_masked": 207801,
+        "windows": 221958,
+        "epochs_run": 17,
+        "best_epoch": 12,
+        "stop_reason": "early_stopping",
+        "seconds": 360.73156476020813,
+        "seconds_per_epoch": 21.21950380942401,
+        "device": "cuda",
+        "torch_version": "2.15.0+cu132"
+      },
+      "valid": {
+        "n_rows": 299376,
+        "n_active": 245303,
+        "full_grid": {
+          "rmsle": 0.5227377850412972,
+          "mae": 107.39474995847962,
+          "rmse": 558.877493795013
+        },
+        "active_slice": {
+          "rmsle": 0.4922493644589814,
+          "mae": 130.39004979785065,
+          "rmse": 616.8211700501951
+        },
+        "per_horizon_rmsle": [
+          0.47616128199223534,
+          0.48319223797062855,
+          0.47406740092832106,
+          0.5306626218614066,
+          0.5081183170443209,
+          0.526923806299983,
+          0.5117429462367533,
+          0.5373955404038665,
+          0.5431608890897304,
+          0.5162000500495553,
+          0.5184388589489335,
+          0.5076084718379954,
+          0.5817546727453032,
+          0.5557813194373143,
+          0.5753473262957595,
+          0.5929318969752836
+        ],
+        "inference_seconds": 5.565114498138428
+      },
+      "fold_metrics": [
+        {
+          "rmsle": 0.4571604085071045,
+          "mae": 89.71104595843016,
+          "rmse": 344.52969767918756,
+          "rmsle_active": 0.47300035161648596,
+          "mae_active": 109.6000922714277,
+          "rmse_active": 380.94073924541334,
+          "n_rows": 28512,
+          "n_rows_active": 23322
+        },
+        {
+          "rmsle": 0.7289947499675822,
+          "mae": 89.70190855662025,
+          "rmse": 336.7205073441058,
+          "rmsle_active": 0.46906197571486186,
+          "mae_active": 104.62856487971072,
+          "rmse_active": 363.4569176559883,
+          "n_rows": 28512,
+          "n_rows_active": 23173
+        },
+        {
+          "rmsle": 0.5370288536048924,
+          "mae": 114.94689021583648,
+          "rmse": 450.0044203884836,
+          "rmsle_active": 0.500990218056123,
+          "mae_active": 142.59867158650684,
+          "rmse_active": 501.63499502419853,
+          "n_rows": 28512,
+          "n_rows_active": 22944
+        }
+      ]
+    },
+    {
+      "tier": "deep-lstm",
+      "architecture": "lstm",
+      "checkpoint": "artifacts/deep_lstm.pt",
+      "checkpoint_bytes": 952349,
+      "checkpoint_sha256": "4f5cf43fa6d54bd379581b25543dfcb4e2c654f7e216fd6922ee6821a9cd1d95",
+      "params": 235532,
+      "status": "complete",
+      "train": {
+        "rows_available": 1898523,
+        "rows_used": 1898523,
+        "rows_masked": 207801,
+        "windows": 221958,
+        "epochs_run": 11,
+        "best_epoch": 6,
+        "stop_reason": "early_stopping",
+        "seconds": 178.91821146011353,
+        "seconds_per_epoch": 16.265291950919412,
+        "device": "cuda",
+        "torch_version": "2.15.0+cu132"
+      },
+      "valid": {
+        "n_rows": 299376,
+        "n_active": 245303,
+        "full_grid": {
+          "rmsle": 0.5064287845393184,
+          "mae": 97.62355033955676,
+          "rmse": 528.253322594629
+        },
+        "active_slice": {
+          "rmsle": 0.45921187140138325,
+          "mae": 118.41726816216463,
+          "rmse": 582.8150710047989
+        },
+        "per_horizon_rmsle": [
+          0.4482272922588674,
+          0.46922859489151036,
+          0.47602159842318365,
+          0.5013074986578774,
+          0.5224382113836339,
+          0.5130955018944515,
+          0.5162563970242976,
+          0.501192391688908,
+          0.5105076451048738,
+          0.5179462058533265,
+          0.4983241485798423,
+          0.5199533939905318,
+          0.5147409967251088,
+          0.5380439242064944,
+          0.5202744749747317,
+          0.53646500761493
+        ],
+        "inference_seconds": 4.65242600440979
+      },
+      "fold_metrics": [
+        {
+          "rmsle": 0.44124621225149474,
+          "mae": 80.11374547023104,
+          "rmse": 297.1441698986707,
+          "rmsle_active": 0.4354667105422922,
+          "mae_active": 97.840936251334,
+          "rmse_active": 328.5471647572939,
+          "n_rows": 28512,
+          "n_rows_active": 23322
+        },
+        {
+          "rmsle": 0.712936657502576,
+          "mae": 69.55789940709265,
+          "rmse": 260.8471095736133,
+          "rmsle_active": 0.44848631573683795,
+          "mae_active": 79.39835509886669,
+          "rmse_active": 272.31692912200833,
+          "n_rows": 28512,
+          "n_rows_active": 23173
+        },
+        {
+          "rmsle": 0.5204711507563695,
+          "mae": 99.1427496160058,
+          "rmse": 400.4052415545476,
+          "rmsle_active": 0.4799719655820955,
+          "mae_active": 122.93513597826707,
+          "rmse_active": 446.340200009215,
+          "n_rows": 28512,
+          "n_rows_active": 22944
+        }
+      ]
+    },
+    {
+      "tier": "deep-gru",
+      "architecture": "gru",
+      "checkpoint": "artifacts/deep_gru.pt",
+      "checkpoint_bytes": 727045,
+      "checkpoint_sha256": "5bf43f0731bad625c6701de7e8e7b4e120e593d508be9c86d91f5455b99befec",
+      "params": 179212,
+      "status": "complete",
+      "train": {
+        "rows_available": 1898523,
+        "rows_used": 1898523,
+        "rows_masked": 207801,
+        "windows": 221958,
+        "epochs_run": 9,
+        "best_epoch": 4,
+        "stop_reason": "early_stopping",
+        "seconds": 158.1856722831726,
+        "seconds_per_epoch": 17.5761858092414,
+        "device": "cuda",
+        "torch_version": "2.15.0+cu132"
+      },
+      "valid": {
+        "n_rows": 299376,
+        "n_active": 245303,
+        "full_grid": {
+          "rmsle": 0.5134337932282145,
+          "mae": 96.39216549449199,
+          "rmse": 503.7805620052702
+        },
+        "active_slice": {
+          "rmsle": 0.4694846525693201,
+          "mae": 116.9402377559573,
+          "rmse": 555.7712990399086
+        },
+        "per_horizon_rmsle": [
+          0.504173305084602,
+          0.5071590853721066,
+          0.4988288262091121,
+          0.5510844031901893,
+          0.5413515254725109,
+          0.530791088016928,
+          0.5393094135861983,
+          0.5719379451790303,
+          0.5352690309279561,
+          0.5259781461539331,
+          0.5150512897513729,
+          0.5136161905554201,
+          0.5744042036929874,
+          0.5487300850800175,
+          0.5707349127676168,
+          0.6035017486902511
+        ],
+        "inference_seconds": 4.389489412307739
+      },
+      "fold_metrics": [
+        {
+          "rmsle": 0.44756132771491924,
+          "mae": 76.23114874633451,
+          "rmse": 277.2058037616565,
+          "rmsle_active": 0.457505770648171,
+          "mae_active": 93.11707803789628,
+          "rmse_active": 306.50172772751097,
+          "n_rows": 28512,
+          "n_rows_active": 23322
+        },
+        {
+          "rmsle": 0.716214091033989,
+          "mae": 70.3868020014603,
+          "rmse": 242.22462859674323,
+          "rmsle_active": 0.457963061450333,
+          "mae_active": 80.4465801570179,
+          "rmse_active": 251.39198575467802,
+          "n_rows": 28512,
+          "n_rows_active": 23173
+        },
+        {
+          "rmsle": 0.5684066626200434,
+          "mae": 90.06935906186224,
+          "rmse": 350.82200003615594,
+          "rmsle_active": 0.48058271701179195,
+          "mae_active": 111.55397344403445,
+          "rmse_active": 391.0651706526783,
+          "n_rows": 28512,
+          "n_rows_active": 22944
+        }
+      ]
+    }
+  ],
+  "ablation_2015plus": {
+    "status": "run",
+    "architecture": "lstm",
+    "train_start": "2015-01-01",
+    "train_rows_available": 762927,
+    "train_rows_used": 762927,
+    "train_rows_masked": 42537,
+    "epochs_run": 6,
+    "best_epoch": 1,
+    "stop_reason": "early_stopping",
+    "valid": {
+      "n_rows": 299376,
+      "n_active": 245303,
+      "full_grid": {
+        "rmsle": 0.5684707668524538,
+        "mae": 140.05709834472412,
+        "rmse": 705.5114745123219
+      },
+      "active_slice": {
+        "rmsle": 0.5046614466634487,
+        "mae": 170.0777669786972,
+        "rmse": 778.7944940510483
+      },
+      "per_horizon_rmsle": [
+        0.5018487902965031,
+        0.5094536925519619,
+        0.5431514664146396,
+        0.5642706370359455,
+        0.573446058581816,
+        0.5733763547319647,
+        0.5895607166741901,
+        0.5498248682892094,
+        0.5598095975253693,
+        0.5887048247374953,
+        0.57452014755838,
+        0.5899997128827758,
+        0.5767895003144033,
+        0.6200647494330671,
+        0.5857439389885629,
+        0.595940951557992
+      ],
+      "inference_seconds": 2.142305850982666
+    },
+    "delta_vs_full_history_rmsle": null,
+    "reason": ""
+  },
+  "comparison": {
+    "status": "pending_s3",
+    "source_artifact": "artifacts/classical_results.json",
+    "source_sha256": null,
+    "protocol": "three_tail_folds",
+    "protocol_match": false,
+    "baseline_tier": "hgb",
+    "baseline_full_grid_rmsle": null,
+    "best_deep_tier": "deep-lstm",
+    "best_deep_full_grid_rmsle": 0.5697564146799625,
+    "delta_rmsle": null,
+    "beats_hgb": null,
+    "rows_match": true,
+    "active_comparison": "unavailable",
+    "seed_check": {
+      "status": "not_run",
+      "seeds": [],
+      "rmsle_range": null
+    },
+    "training_cost": {
+      "hgb_seconds": null,
+      "deep_seconds": null,
+      "hgb_params": null,
+      "deep_params": null
+    },
+    "reason": "S3's artifacts/classical_results.json is not on this branch yet; re-run within 24 h of S3 landing"
+  },
+  "runtime_tradeoff": {
+    "headline_device": "cuda",
+    "devices": [
+      {
+        "device": "mps",
+        "torch_version": "2.15.0",
+        "steps": 50,
+        "seconds": 1.0909,
+        "seconds_per_step": 0.021817,
+        "peak_memory_mb": 5.637,
+        "notes": "50-step LSTM benchmark at the headline config (batch 256, lookback 60, hidden 128); measured wall clock around a full training step, device synchronised, not a projection; peak_memory_mb is the largest allocator reading taken while the gradients were still allocated, because torch.mps exposes no peak API"
+      },
+      {
+        "device": "cpu",
+        "torch_version": "2.15.0",
+        "steps": 50,
+        "seconds": 6.4201,
+        "seconds_per_step": 0.128402,
+        "peak_memory_mb": null,
+        "notes": "50-step LSTM benchmark at the headline config (batch 256, lookback 60, hidden 128); measured wall clock around a full training step, device synchronised, not a projection"
+      }
+    ],
+    "colab_gpu_hours_used": null
+  },
+  "notes": [
+    "earthquake history contamination: the fold windows contain no quake rows, every window starts after 2016-05-15, the end of the earthquake_decay tail",
+    "the per-store pre-opening training mask means store 52 trains on zero windows and stores 20, 21, 22, 29, 36, 42 and 53 train only from their own opening dates",
+    "absence of local_test: this track never reads, scores or tunes on it; the freeze scores it once, on S1's side",
+    "percentage-error metric excluded at 35.2% zeros in train+valid",
+    "calendar encoding decision: the day-of-week and day-of-year sine and cosine features are calendar-built and future-known by design",
+    "rolling-origin protocol: the three 16-day windows at the tail of valid are each predicted from a history that stops at its origin",
+    "the fold metrics are re-predicted from the checkpoints, one history per fold, with the history stopping at each fold's origin",
+    "the fold rows are the valid rows inside each window: 28,512 per fold and 85,536 pooled over the three",
+    "the fold re-prediction ran on cuda; the checkpoints are device-neutral and were trained on the device recorded in shared_config.device",
+    "the fold SCORING path does not apply the training mask: S1's contract says scoring paths never see fit_rows, and the masked history would leave store 52 without a lookback and drop the fold from the pinned 28,512 rows",
+    "the runtime_tradeoff benchmark was measured on the machine that re-scored the folds, one device entry per device it could run, each carrying its own torch version; the headline runs used the device in shared_config.device (cuda)",
+    "the git_sha names the commit this artifact was generated on top of, because a commit cannot carry its own sha",
+    "the three folds were re-predicted in 57.3 s wall time in total on cuda; the forward passes alone take 1.9 s, the rest is history construction and panel building",
+    "comparison.best_deep_full_grid_rmsle is the RMSLE of the three tail folds scored jointly (85,536 rows), the number S3's pooled block carries, so the two sides are comparable"
+  ]
+}
