@@ -7,7 +7,10 @@ model receives the same dataset dict so results stay comparable.
 
 from __future__ import annotations
 
+from typing import TypedDict
+
 import numpy as np
+import pandas as pd
 from sklearn.preprocessing import MinMaxScaler
 
 LOOKBACK = 28
@@ -18,7 +21,22 @@ LOOKBACK = 28
 MIN_TRAIN = 120
 
 
-def make_dataset(series, lookback: int = LOOKBACK) -> dict:
+class Dataset(TypedDict):
+    """The make_dataset payload every trainer consumes."""
+
+    X_seq_train: np.ndarray
+    X_today_train: np.ndarray
+    y_train: np.ndarray
+    X_seq_test: np.ndarray
+    X_today_test: np.ndarray
+    y_test: np.ndarray
+    sales_scaler: MinMaxScaler
+    raw_sales: np.ndarray
+    first_test_index: int
+    test_dates: np.ndarray
+
+
+def make_dataset(series: pd.DataFrame, lookback: int = LOOKBACK) -> Dataset:
     """Scale, window, split.
 
     Two input pieces per target day t:

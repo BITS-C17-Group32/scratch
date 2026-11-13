@@ -62,7 +62,7 @@ def load_series(data_dir: Path, store: int, family: str) -> pd.DataFrame:
     (zero sales, no promos). Returns a contiguous daily frame with date,
     sales, onpromotion, is_holiday, is_event.
     """
-    keep = []
+    keep: list[pd.DataFrame] = []
     usecols = ["date", "store_nbr", "family", "sales", "onpromotion"]
     for chunk in pd.read_csv(
         data_dir / "train.csv",

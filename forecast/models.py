@@ -10,19 +10,23 @@ from __future__ import annotations
 import copy
 import os
 import warnings
+from collections.abc import Callable
 
 # Quiet TensorFlow before it loads.
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 os.environ.setdefault("KERAS_BACKEND", "tensorflow")
 
+import keras
 import numpy as np
 import tensorflow as tf
 import torch
 import torch.nn as nn
 from keras import layers
 from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.preprocessing import MinMaxScaler
 from statsmodels.tsa.statespace.sarimax import SARIMAX
-from tensorflow import keras
+
+from forecast.windows import Dataset
 
 tf.get_logger().setLevel("ERROR")
 
@@ -35,7 +39,9 @@ SEED = 42
 
 
 class DemandRNN(nn.Module):
-    def __init__(self, hist_size, today_size, hidden_layer_size=HIDDEN):
+    def __init__(
+        self, hist_size: int, today_size: int, hidden_layer_size: int = HIDDEN
+    ) -> None:
         super().__init__()
         self.hidden_layer_size = hidden_layer_size
         self.rnn = nn.RNN(
@@ -47,7 +53,7 @@ class DemandRNN(nn.Module):
         )
         self.linear = nn.Linear(hidden_layer_size + today_size, 1)
 
-    def forward(self, x_seq, x_today):
+    def forward(self, x_seq: torch.Tensor, x_today: torch.Tensor) -> torch.Tensor:
         batch_size = x_seq.size(0)
         h0 = torch.zeros(self.rnn.num_layers, batch_size, self.hidden_layer_size).to(
             x_seq.device
@@ -57,12 +63,12 @@ class DemandRNN(nn.Module):
         return self.linear(head_in)
 
 
-def invert_sales(preds_scaled, sales_scaler) -> np.ndarray:
+def invert_sales(preds_scaled: np.ndarray, sales_scaler: MinMaxScaler) -> np.ndarray:
     """Undo MinMax: scaled sales back to unit demand."""
     return sales_scaler.inverse_transform(preds_scaled.reshape(-1, 1)).flatten()
 
 
-def train_rnn(data, device):
+def train_rnn(data: Dataset, device: torch.device) -> np.ndarray:
     torch.manual_seed(SEED)
     X_seq = torch.tensor(data["X_seq_train"], dtype=torch.float32).to(device)
     X_today = torch.tensor(data["X_today_train"], dtype=torch.float32).to(device)
@@ -118,7 +124,7 @@ def train_rnn(data, device):
     return invert_sales(preds_scaled, data["sales_scaler"])
 
 
-def build_gru(lookback, hist_size, today_size):
+def build_gru(lookback: int, hist_size: int, today_size: int) -> keras.Model:
     seq_in = layers.Input(shape=(lookback, hist_size), name="history")
     today_in = layers.Input(shape=(today_size,), name="known_today")
     x = layers.GRU(HIDDEN)(seq_in)
@@ -127,7 +133,7 @@ def build_gru(lookback, hist_size, today_size):
     return keras.Model([seq_in, today_in], out)
 
 
-def build_lstm(lookback, hist_size, today_size):
+def build_lstm(lookback: int, hist_size: int, today_size: int) -> keras.Model:
     seq_in = layers.Input(shape=(lookback, hist_size), name="history")
     today_in = layers.Input(shape=(today_size,), name="known_today")
     x = layers.LSTM(HIDDEN, return_sequences=True)(seq_in)
@@ -139,7 +145,9 @@ def build_lstm(lookback, hist_size, today_size):
     return keras.Model([seq_in, today_in], out)
 
 
-def train_keras(name, build_model, data):
+def train_keras(
+    name: str, build_model: Callable[..., keras.Model], data: Dataset
+) -> np.ndarray:
     keras.utils.set_random_seed(SEED)
     lookback = data["X_seq_train"].shape[1]
     model = build_model(
@@ -173,7 +181,7 @@ def train_keras(name, build_model, data):
     return invert_sales(preds_scaled, data["sales_scaler"])
 
 
-def train_hgb(data):
+def train_hgb(data: Dataset) -> np.ndarray:
     """Flatten the windows into a tabular row: lookback*channels + today."""
     x_train = np.concatenate(
         [
@@ -195,7 +203,7 @@ def train_hgb(data):
     return invert_sales(model.predict(x_test), data["sales_scaler"])
 
 
-def train_sarimax(data):
+def train_sarimax(data: Dataset) -> np.ndarray:
     """SARIMAX(1,1,1)(1,0,1,7) on raw sales; appending the test observations
     keeps the Kalman filter state, so its one-step predictions use actual
     history exactly like the other models."""
@@ -215,7 +223,7 @@ def train_sarimax(data):
     return np.asarray(preds, dtype=np.float64)
 
 
-def train_all(data, device) -> dict[str, np.ndarray]:
+def train_all(data: Dataset, device: torch.device) -> dict[str, np.ndarray]:
     """Train all five models on one dataset and return raw-unit predictions."""
     return {
         "RNN": train_rnn(data, device),

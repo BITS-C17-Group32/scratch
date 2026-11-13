@@ -19,13 +19,13 @@ COLORS = {
 }
 
 
-def evaluate(predictions, actuals):
+def evaluate(predictions: np.ndarray, actuals: np.ndarray) -> tuple[float, float]:
     mae = np.mean(np.abs(predictions - actuals))
     rmse = np.sqrt(np.mean((predictions - actuals) ** 2))
     return float(mae), float(rmse)
 
 
-def print_summary(metrics):
+def print_summary(metrics: dict[str, tuple[float, float]]) -> None:
     print("\n=== Summary (lower is better) ===")
     for name, (mae, rmse) in metrics.items():
         print(f"{name:>7}:  MAE {mae:8.2f}   RMSE {rmse:8.2f}")
@@ -36,7 +36,12 @@ def slugify(text: str) -> str:
 
 
 def plot_predictions(
-    test_dates, actuals, preds, store, family, out_dir: Path = FIGURES_DIR
+    test_dates: np.ndarray,
+    actuals: np.ndarray,
+    preds: dict[str, np.ndarray],
+    store: int,
+    family: str,
+    out_dir: Path = FIGURES_DIR,
 ) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"fork_actual_vs_predicted_s{store}_{slugify(family)}.png"
@@ -63,7 +68,12 @@ def plot_predictions(
     return path
 
 
-def plot_errors(metrics, store, family, out_dir: Path = FIGURES_DIR) -> Path:
+def plot_errors(
+    metrics: dict[str, tuple[float, float]],
+    store: int,
+    family: str,
+    out_dir: Path = FIGURES_DIR,
+) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"fork_error_comparison_s{store}_{slugify(family)}.png"
     models = list(metrics)

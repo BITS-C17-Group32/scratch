@@ -1,0 +1,3 @@
+"""Minimal hand-written type stubs for keras.utils (see __init__.pyi)."""
+
+def set_random_seed(seed: int) -> None: ...
