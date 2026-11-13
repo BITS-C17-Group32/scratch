@@ -27,6 +27,12 @@ dev = [
 
 [tool.basedpyright]
 typeCheckingMode = "strict"
+
+# Pin import resolution to the project venv: priority 1 in pyright's
+# environment selection, ahead of whatever interpreter an editor has selected.
+venvPath = "."
+venv = ".venv"
+
 reportUnknownArgumentType = false
 reportUnknownMemberType = false
 reportUnknownVariableType = false
