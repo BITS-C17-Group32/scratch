@@ -42,3 +42,8 @@ class Model:
         x: Sequence[np.ndarray],
         verbose: int = ...,
     ) -> np.ndarray: ...
+    def __call__(
+        self,
+        x: Sequence[np.ndarray],
+        training: bool = ...,
+    ) -> np.ndarray: ...

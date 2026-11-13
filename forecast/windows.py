@@ -1,8 +1,8 @@
 """Transform a clean daily series into scaled windows and an 80/20 split.
 
-Build feature channels, scale inputs, construct sliding windows, and split arrays
-chronologically. Every model receives the same dataset dictionary so results
-stay comparable.
+scaled_channels builds the feature matrices, make_dataset constructs sliding
+windows from them and splits arrays chronologically. Every model receives the
+same dataset dictionary so results stay comparable.
 """
 
 from __future__ import annotations
@@ -19,6 +19,10 @@ LOOKBACK = 28
 # t-7 baseline in A/B tests, so shorter series are rejected.
 MIN_TRAIN = 120
 
+# Rollouts compound each model's own error, so beyond about 90 days the
+# numbers are directional at best.
+MAX_HORIZON = 90
+
 
 class Dataset(TypedDict):
     """Dataset dictionary that make_dataset produces and every trainer consumes."""
@@ -30,9 +34,62 @@ class Dataset(TypedDict):
     X_today_test: np.ndarray
     y_test: np.ndarray
     sales_scaler: MinMaxScaler
+    promo_scaler: MinMaxScaler
     raw_sales: np.ndarray
     first_test_index: int
     test_dates: np.ndarray
+
+
+def scaled_channels(
+    series: pd.DataFrame,
+    sales_scaler: MinMaxScaler | None = None,
+    promo_scaler: MinMaxScaler | None = None,
+) -> tuple[np.ndarray, np.ndarray, MinMaxScaler, MinMaxScaler]:
+    """Build the scaled history and known-today channel matrices for a frame.
+
+    Each history row carries the channels [sales, log-promo, is_holiday,
+    is_event, dow_sin, dow_cos], and the known-today matrix drops sales
+    because it is the label. The two MinMax scalers are fitted when not
+    supplied, so callers holding fitted scalers reuse the same transform.
+    Pass both or neither, so a partial pair never fits one scaler on the
+    frame being transformed.
+    """
+    if (sales_scaler is None) != (promo_scaler is None):
+        raise ValueError("pass both scalers or neither")
+    sales = series["sales"].to_numpy(dtype=np.float32)
+    promo = series["onpromotion"].to_numpy(dtype=np.float32)
+    is_holiday = series["is_holiday"].to_numpy(dtype=np.float32)
+    is_event = series["is_event"].to_numpy(dtype=np.float32)
+
+    weekday = series["date"].dt.weekday.to_numpy()
+    dow_sin = np.sin(2 * np.pi * weekday / 7).astype(np.float32)
+    dow_cos = np.cos(2 * np.pi * weekday / 7).astype(np.float32)
+
+    # Scale sales with MinMax instead of a log transform. An A/B test showed
+    # log-space training roughly doubled MAE in absolute units.
+    # Ref: https://scikit-learn.org/stable/modules/preprocessing.html
+    if sales_scaler is None:
+        sales_scaler = MinMaxScaler(feature_range=(0, 1)).fit(sales.reshape(-1, 1))
+    scaled_sales = (
+        sales_scaler.transform(sales.reshape(-1, 1)).astype(np.float32).flatten()
+    )
+
+    # Promotion counts have a skewed tail and their scale shifts in 2017, so
+    # log-compress them before scaling. Use log1p rather than log because
+    # promotion counts are often zero and log(0) is undefined.
+    # Ref: https://numpy.org/doc/stable/reference/generated/numpy.log1p.html
+    log_promo = np.log1p(promo).reshape(-1, 1)
+    if promo_scaler is None:
+        promo_scaler = MinMaxScaler(feature_range=(0, 1)).fit(log_promo)
+    scaled_promo = promo_scaler.transform(log_promo).astype(np.float32).flatten()
+
+    hist_channels = np.stack(
+        [scaled_sales, scaled_promo, is_holiday, is_event, dow_sin, dow_cos], axis=1
+    )
+    today_channels = np.stack(
+        [scaled_promo, is_holiday, is_event, dow_sin, dow_cos], axis=1
+    )
+    return hist_channels, today_channels, sales_scaler, promo_scaler
 
 
 def make_dataset(series: pd.DataFrame, lookback: int = LOOKBACK) -> Dataset:
@@ -46,9 +103,6 @@ def make_dataset(series: pd.DataFrame, lookback: int = LOOKBACK) -> Dataset:
     it is the label.
     """
     sales = series["sales"].to_numpy(dtype=np.float32)
-    promo = series["onpromotion"].to_numpy(dtype=np.float32)
-    is_holiday = series["is_holiday"].to_numpy(dtype=np.float32)
-    is_event = series["is_event"].to_numpy(dtype=np.float32)
 
     total_days = len(sales)
     if total_days <= lookback:
@@ -65,38 +119,14 @@ def make_dataset(series: pd.DataFrame, lookback: int = LOOKBACK) -> Dataset:
             f"{split_index} train windows (minimum {MIN_TRAIN})"
         )
 
-    weekday = series["date"].dt.weekday.to_numpy()
-    dow_sin = np.sin(2 * np.pi * weekday / 7).astype(np.float32)
-    dow_cos = np.cos(2 * np.pi * weekday / 7).astype(np.float32)
-
-    # Scale sales with MinMax instead of a log transform. An A/B test showed
-    # log-space training roughly doubled MAE in absolute units.
-    # Ref: https://scikit-learn.org/stable/modules/preprocessing.html
-    sales_scaler = MinMaxScaler(feature_range=(0, 1)).fit(sales.reshape(-1, 1))
-    scaled_sales = (
-        sales_scaler.transform(sales.reshape(-1, 1)).astype(np.float32).flatten()
-    )
-
-    # Promotion counts have a skewed tail and their scale shifts in 2017, so
-    # log-compress them before scaling. Use log1p rather than log because
-    # promotion counts are often zero and log(0) is undefined.
-    # Ref: https://numpy.org/doc/stable/reference/generated/numpy.log1p.html
-    log_promo = np.log1p(promo).reshape(-1, 1)
-    promo_scaler = MinMaxScaler(feature_range=(0, 1)).fit(log_promo)
-    scaled_promo = promo_scaler.transform(log_promo).astype(np.float32).flatten()
-
-    hist_channels = np.stack(
-        [scaled_sales, scaled_promo, is_holiday, is_event, dow_sin, dow_cos], axis=1
-    )
-    today_channels = np.stack(
-        [scaled_promo, is_holiday, is_event, dow_sin, dow_cos], axis=1
-    )
+    hist_channels, today_channels, sales_scaler, promo_scaler = scaled_channels(series)
 
     X_seq, X_today, y = [], [], []
     for i in range(lookback, total_days):
         X_seq.append(hist_channels[i - lookback : i])
         X_today.append(today_channels[i])
-        y.append(scaled_sales[i])
+        # The sales channel is the MinMax-scaled target the models train on.
+        y.append(hist_channels[i, 0])
     seq_windows = np.array(X_seq)
     today_windows = np.array(X_today)
     targets = np.array(y)
@@ -115,6 +145,7 @@ def make_dataset(series: pd.DataFrame, lookback: int = LOOKBACK) -> Dataset:
         "X_today_test": today_windows[split_index:],
         "y_test": targets[split_index:],
         "sales_scaler": sales_scaler,
+        "promo_scaler": promo_scaler,
         "raw_sales": sales,
         "first_test_index": first_test,
         "test_dates": series["date"].to_numpy()[first_test:],

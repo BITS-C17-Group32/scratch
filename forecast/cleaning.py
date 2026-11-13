@@ -64,6 +64,24 @@ def _calendars(
     return store_holidays, events
 
 
+def store_calendars(
+    data_dir: Path, store: int
+) -> tuple[set[pd.Timestamp], set[pd.Timestamp]]:
+    """Return the holiday and event dates a store observes.
+
+    Reads the store's city and state from stores.csv and applies the locale
+    scoping in _calendars. The sets are built from the full calendar file,
+    not just the recorded train.csv span, and the holiday and event sets end
+    on different dates, so each must be checked for coverage on its own.
+    The holiday set is scoped to the store's locale while the event set is
+    global.
+    """
+    stores_table = pd.read_csv(data_dir / "stores.csv")
+    store_entry = stores_table[stores_table["store_nbr"].eq(store)].iloc[0]
+    city, state = str(store_entry["city"]), str(store_entry["state"])
+    return _calendars(data_dir, city, state)
+
+
 def load_series(data_dir: Path, store: int, family: str) -> pd.DataFrame:
     """Stream train.csv once and keep only the selected store and family slice.
 
@@ -102,10 +120,6 @@ def load_series(data_dir: Path, store: int, family: str) -> pd.DataFrame:
     if series_rows.empty:
         raise ValueError(f"store {store} / {family} records no sales in train.csv")
 
-    stores_table = pd.read_csv(data_dir / "stores.csv")
-    store_entry = stores_table[stores_table["store_nbr"].eq(store)].iloc[0]
-    city, state = str(store_entry["city"]), str(store_entry["state"])
-
     dates = pd.date_range(
         series_rows["date"].min(), series_rows["date"].max(), freq="D"
     )
@@ -115,7 +129,7 @@ def load_series(data_dir: Path, store: int, family: str) -> pd.DataFrame:
     filled["sales"] = filled["sales"].fillna(0.0)
     filled["onpromotion"] = filled["onpromotion"].fillna(0.0)
 
-    holidays, events = _calendars(data_dir, city, state)
+    holidays, events = store_calendars(data_dir, store)
     is_holiday = np.zeros(len(dates), dtype=np.float32)
     is_event = np.zeros(len(dates), dtype=np.float32)
     for i, day in enumerate(dates):

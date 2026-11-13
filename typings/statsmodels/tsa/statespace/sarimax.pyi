@@ -24,6 +24,7 @@ class SARIMAXResults:
         start: int | str | None = ...,
         end: int | str | None = ...,
     ) -> PredictionResults: ...
+    def forecast(self, steps: int) -> np.ndarray: ...
 
 class PredictionResults:
     predicted_mean: np.ndarray
