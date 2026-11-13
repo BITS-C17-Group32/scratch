@@ -52,17 +52,7 @@ import argparse
 import contextlib
 import copy
 import errno
-
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows
-    import types
-
-    fcntl = types.SimpleNamespace()
-    fcntl.flock = lambda *a, **k: None
-    fcntl.LOCK_EX = 0
-    fcntl.LOCK_NB = 0
-    fcntl.LOCK_UN = 0
+import fcntl
 import importlib
 import json
 import math
