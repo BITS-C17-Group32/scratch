@@ -1,4 +1,4 @@
-"""Evaluation metrics, summary table, and two comparison plots."""
+"""Evaluation metrics, summary table, and two plots."""
 
 from __future__ import annotations
 
@@ -56,7 +56,18 @@ def plot_predictions(
     store: int,
     family: str,
     out_dir: Path = FIGURES_DIR,
+    *,
+    future: tuple[np.ndarray, dict[str, np.ndarray]] | None = None,
 ) -> Path:
+    """Plot test-period actuals against each model's predictions.
+
+    When a future rollout is supplied, each model's dashed forecast
+    continues from its own last test prediction through the end date, and
+    one shared legend entry marks the forecast style. The dashed part
+    comes from the separate full-series retrain, so the first dashed
+    segment joins the test-period fit's last prediction to the retrained
+    model's first forecast.
+    """
     path = out_dir / f"fork_actual_vs_predicted_s{store}_{slugify(family)}.png"
     plt.figure(figsize=(14, 6))
     plt.plot(
@@ -71,7 +82,31 @@ def plot_predictions(
         plt.plot(
             test_dates, pred, label=f"{name} Predictions", color=COLORS[name], alpha=0.8
         )
-    plt.title(f"Actual vs. Predicted Demand, store {store} / {family}")
+    if future is not None:
+        future_dates, future_preds = future
+        # Each dashed forecast anchors at its model's own last test
+        # prediction, so the first dashed segment joins the test-period
+        # fit to the full-series retrain.
+        for name, pred in future_preds.items():
+            plt.plot(
+                np.concatenate([test_dates[-1:], future_dates]),
+                np.concatenate([preds[name][-1:], pred]),
+                color=COLORS[name],
+                alpha=0.8,
+                linestyle="--",
+                marker="o",
+                markersize=3,
+                label="_nolegend_",
+            )
+        plt.plot(
+            [],
+            [],
+            color="gray",
+            linestyle="--",
+            label="Forecast (dashed, promotions assumed zero)",
+        )
+    suffix = " and Forecast" if future is not None else ""
+    plt.title(f"Actual vs. Predicted{suffix} Demand, store {store} / {family}")
     plt.xlabel("Date")
     plt.ylabel("Sales Quantity")
     plt.legend()
