@@ -113,8 +113,8 @@ def main():
     metrics = {name: evaluate(name, pred, actuals) for name, pred in preds.items()}
     print_summary(metrics)
 
-    plot_predictions(data["test_dates"], actuals, preds, store, family, HERE)
-    plot_errors(metrics, store, family, HERE)
+    plot_predictions(data["test_dates"], actuals, preds, store, family)
+    plot_errors(metrics, store, family)
 
     if not args.no_show:
         plt.show()

@@ -1,15 +1,9 @@
-.DS_Store
+# Generated output: run charts and Python/tool caches. Nothing here is
+# source; charts regenerate when app.py or fork_forecast.py runs.
+*.png
 __pycache__/
 *.pyc
+.ruff_cache/
 .venv/
 .python-version
-.ruff_cache/
-/splits/
-
-# artifacts/ holds generated output: deep-learning checkpoints, temp files
-# and the per-invocation run manifest. Only the pinned registry files are
-# tracked; the run manifest is force-added once, in the Day-5 freeze PR.
-/artifacts/*
-!/artifacts/classical_results.json
-!/artifacts/deep_results.json
-!/artifacts/freeze_results.json
+.DS_Store

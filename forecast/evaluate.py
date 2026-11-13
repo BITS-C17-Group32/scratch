@@ -8,6 +8,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
+FIGURES_DIR = Path(__file__).resolve().parent.parent / "figures"
+
 COLORS = {
     "RNN": "blue",
     "GRU": "orange",
@@ -36,7 +38,10 @@ def slugify(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_").lower()
 
 
-def plot_predictions(test_dates, actuals, preds, store, family, out_dir: Path) -> Path:
+def plot_predictions(
+    test_dates, actuals, preds, store, family, out_dir: Path = FIGURES_DIR
+) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"fork_actual_vs_predicted_s{store}_{slugify(family)}.png"
     plt.figure(figsize=(14, 6))
     plt.plot(
@@ -61,7 +66,8 @@ def plot_predictions(test_dates, actuals, preds, store, family, out_dir: Path) -
     return path
 
 
-def plot_errors(metrics, store, family, out_dir: Path) -> Path:
+def plot_errors(metrics, store, family, out_dir: Path = FIGURES_DIR) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"fork_error_comparison_s{store}_{slugify(family)}.png"
     models = list(metrics)
     mae_values = [metrics[m][0] for m in models]

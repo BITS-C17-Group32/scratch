@@ -56,13 +56,13 @@ def main() -> None:
     metrics = {name: evaluate(name, pred, actuals) for name, pred in preds.items()}
     print_summary(metrics)
 
-    plot_predictions(data["test_dates"], actuals, preds, store, family, HERE)
-    plot_errors(metrics, store, family, HERE)
+    plot_predictions(data["test_dates"], actuals, preds, store, family)
+    plot_errors(metrics, store, family)
 
     if os.environ.get("MPLBACKEND", "").lower() in {"agg", "pdf", "svg", "ps"}:
         print(
             f"\nnote: MPLBACKEND={os.environ['MPLBACKEND']} cannot open chart "
-            "windows; the plots are still saved as PNGs next to this script. "
+            "windows; the plots are still saved as PNGs in figures/. "
             "Run `unset MPLBACKEND` and start again to see them."
         )
 
