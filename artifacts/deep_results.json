@@ -2,10 +2,10 @@
   "schema_version": "1.0",
   "status": "complete",
   "track": "S4",
-  "generated_at": "2026-11-11T19:27:44Z",
-  "git_sha": "39154942a99b5ba78e1cefdf4002f3787020e005",
+  "generated_at": "2026-11-13T12:51:15Z",
+  "git_sha": "356725b91e2a2658e0548717130bef9bc394417f",
   "data_fingerprint": {
-    "manifest_sha256": "ffcb1d0fae03a94aff3225f5194c16f6d84d9ce8a98fb0df9249079820a511ba",
+    "manifest_sha256": "308e7ec5af085e76fd810ce085b662e1726d9bfa0d6e4db5be9798d4953bae18",
     "columns_sha256": "c003c6e9bcc6a84ecc808d3fa33411ec0e214021561da9492e7432287aea1f99",
     "train_rows": 2106324,
     "valid_rows": 299376,
@@ -143,32 +143,32 @@
       },
       "fold_metrics": [
         {
-          "rmsle": 0.457144833059507,
-          "mae": 89.71965706574025,
-          "rmse": 344.58155084331264,
-          "rmsle_active": 0.47295986254220845,
-          "mae_active": 109.61057558122583,
-          "rmse_active": 380.99807239702585,
+          "rmsle": 0.4571604085071045,
+          "mae": 89.71104595843016,
+          "rmse": 344.52969767918756,
+          "rmsle_active": 0.47300035161648596,
+          "mae_active": 109.6000922714277,
+          "rmse_active": 380.94073924541334,
           "n_rows": 28512,
           "n_rows_active": 23322
         },
         {
-          "rmsle": 0.7289914584139003,
-          "mae": 89.712680468081,
-          "rmse": 336.7828311804028,
-          "rmsle_active": 0.4690271861083539,
-          "mae_active": 104.6420843642883,
-          "rmse_active": 363.52901381927177,
+          "rmsle": 0.7289947499675822,
+          "mae": 89.70190855662025,
+          "rmse": 336.7205073441058,
+          "rmsle_active": 0.46906197571486186,
+          "mae_active": 104.62856487971072,
+          "rmse_active": 363.4569176559883,
           "n_rows": 28512,
           "n_rows_active": 23173
         },
         {
-          "rmsle": 0.5370508479886972,
-          "mae": 114.95963470431651,
-          "rmse": 450.0889831811506,
-          "rmsle_active": 0.500956712879766,
-          "mae_active": 142.6143881559253,
-          "rmse_active": 501.7292650727989,
+          "rmsle": 0.5370288536048924,
+          "mae": 114.94689021583648,
+          "rmse": 450.0044203884836,
+          "rmsle_active": 0.500990218056123,
+          "mae_active": 142.59867158650684,
+          "rmse_active": 501.63499502419853,
           "n_rows": 28512,
           "n_rows_active": 22944
         }
@@ -230,32 +230,32 @@
       },
       "fold_metrics": [
         {
-          "rmsle": 0.44125984980635735,
-          "mae": 80.12701729358675,
-          "rmse": 297.24284086641313,
-          "rmsle_active": 0.43542264108474915,
-          "mae_active": 97.85705521961295,
-          "rmse_active": 328.65626345502557,
+          "rmsle": 0.44124621225149474,
+          "mae": 80.11374547023104,
+          "rmse": 297.1441698986707,
+          "rmsle_active": 0.4354667105422922,
+          "mae_active": 97.840936251334,
+          "rmse_active": 328.5471647572939,
           "n_rows": 28512,
           "n_rows_active": 23322
         },
         {
-          "rmsle": 0.7129224650153294,
-          "mae": 69.5665766620781,
-          "rmse": 260.9188496235433,
-          "rmsle_active": 0.448437305877683,
-          "mae_active": 79.41054097274754,
-          "rmse_active": 272.41123190946433,
+          "rmsle": 0.712936657502576,
+          "mae": 69.55789940709265,
+          "rmse": 260.8471095736133,
+          "rmsle_active": 0.44848631573683795,
+          "mae_active": 79.39835509886669,
+          "rmse_active": 272.31692912200833,
           "n_rows": 28512,
           "n_rows_active": 23173
         },
         {
-          "rmsle": 0.5205428459767458,
-          "mae": 99.16864398171431,
-          "rmse": 400.52328276150723,
-          "rmsle_active": 0.47994256116646644,
-          "mae_active": 122.96701840992229,
-          "rmse_active": 446.4717836148771,
+          "rmsle": 0.5204711507563695,
+          "mae": 99.1427496160058,
+          "rmse": 400.4052415545476,
+          "rmsle_active": 0.4799719655820955,
+          "mae_active": 122.93513597826707,
+          "rmse_active": 446.340200009215,
           "n_rows": 28512,
           "n_rows_active": 22944
         }
@@ -317,32 +317,32 @@
       },
       "fold_metrics": [
         {
-          "rmsle": 0.44755923872590275,
-          "mae": 76.23508420863236,
-          "rmse": 277.2323656374895,
-          "rmsle_active": 0.45747754096703974,
-          "mae_active": 93.12182339471721,
-          "rmse_active": 306.53109668628736,
+          "rmsle": 0.44756132771491924,
+          "mae": 76.23114874633451,
+          "rmse": 277.2058037616565,
+          "rmsle_active": 0.457505770648171,
+          "mae_active": 93.11707803789628,
+          "rmse_active": 306.50172772751097,
           "n_rows": 28512,
           "n_rows_active": 23322
         },
         {
-          "rmsle": 0.7162092534721336,
-          "mae": 70.38659323065417,
-          "rmse": 242.21676856671795,
-          "rmsle_active": 0.4579340233377671,
-          "mae_active": 80.44675706732028,
-          "rmse_active": 251.38712135698105,
+          "rmsle": 0.716214091033989,
+          "mae": 70.3868020014603,
+          "rmse": 242.22462859674323,
+          "rmsle_active": 0.457963061450333,
+          "mae_active": 80.4465801570179,
+          "rmse_active": 251.39198575467802,
           "n_rows": 28512,
           "n_rows_active": 23173
         },
         {
-          "rmsle": 0.5684545630223384,
-          "mae": 90.07858916351287,
-          "rmse": 350.86400185064394,
-          "rmsle_active": 0.48056960811659316,
-          "mae_active": 111.56524391912623,
-          "rmse_active": 391.1119914332499,
+          "rmsle": 0.5684066626200434,
+          "mae": 90.06935906186224,
+          "rmse": 350.82200003615594,
+          "rmsle_active": 0.48058271701179195,
+          "mae_active": 111.55397344403445,
+          "rmse_active": 391.0651706526783,
           "n_rows": 28512,
           "n_rows_active": 22944
         }
@@ -404,7 +404,7 @@
     "baseline_tier": "hgb",
     "baseline_full_grid_rmsle": null,
     "best_deep_tier": "deep-lstm",
-    "best_deep_full_grid_rmsle": 0.5697758479356108,
+    "best_deep_full_grid_rmsle": 0.5697564146799625,
     "delta_rmsle": null,
     "beats_hgb": null,
     "rows_match": true,
@@ -420,7 +420,7 @@
       "hgb_params": null,
       "deep_params": null
     },
-    "reason": "S3's artifacts/classical_results.json is not on this branch yet; the comparison is re-run once it lands"
+    "reason": "S3's artifacts/classical_results.json is not on this branch yet; re-run within 24 h of S3 landing"
   },
   "runtime_tradeoff": {
     "headline_device": "cuda",
@@ -455,11 +455,11 @@
     "rolling-origin protocol: the three 16-day windows at the tail of valid are each predicted from a history that stops at its origin",
     "the fold metrics are re-predicted from the checkpoints, one history per fold, with the history stopping at each fold's origin",
     "the fold rows are the valid rows inside each window: 28,512 per fold and 85,536 pooled over the three",
-    "the fold re-prediction ran on mps; the checkpoints are device-neutral and were trained on the device recorded in shared_config.device",
+    "the fold re-prediction ran on cuda; the checkpoints are device-neutral and were trained on the device recorded in shared_config.device",
     "the fold SCORING path does not apply the training mask: S1's contract says scoring paths never see fit_rows, and the masked history would leave store 52 without a lookback and drop the fold from the pinned 28,512 rows",
     "the runtime_tradeoff benchmark was measured on the machine that re-scored the folds, one device entry per device it could run, each carrying its own torch version; the headline runs used the device in shared_config.device (cuda)",
     "the git_sha names the commit this artifact was generated on top of, because a commit cannot carry its own sha",
-    "the three folds were re-predicted in 17.2 s wall time in total on mps; the forward passes alone take 0.8 s, the rest is history construction and panel building",
+    "the three folds were re-predicted in 57.3 s wall time in total on cuda; the forward passes alone take 1.9 s, the rest is history construction and panel building",
     "comparison.best_deep_full_grid_rmsle is the RMSLE of the three tail folds scored jointly (85,536 rows), the number S3's pooled block carries, so the two sides are comparable"
   ]
 }

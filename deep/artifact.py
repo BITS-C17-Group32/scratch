@@ -675,13 +675,16 @@ def write_artifact(
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(tmp, path)
-    directory = os.open(str(path.parent), os.O_RDONLY)
     try:
-        os.fsync(directory)
+        directory = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        except OSError:
+            pass
+        finally:
+            os.close(directory)
     except OSError:
         pass
-    finally:
-        os.close(directory)
 
 
 def load_artifact(path: Path) -> dict[str, Any]:

@@ -250,12 +250,24 @@ def _comparison_block(
             },
             "reason": (
                 "S3's artifacts/classical_results.json is not on this branch "
-                "yet; the comparison is re-run once it lands"
+                "yet; re-run within 24 h of S3 landing"
             ),
         }
 
     hgb = json.loads(hgb_path.read_text(encoding="utf-8"))
     baseline = _hgb_tier(hgb)
+    # name the baseline family S3 actually carries (e.g. SARIMAX)
+    _baseline_name = BASELINE_TIER
+    for key in ("models", "tiers"):
+        entries = hgb.get(key)
+        if not entries:
+            continue
+        if isinstance(entries, dict):
+            entries = list(entries.values())
+        if entries:
+            _entry = entries[0]
+            _baseline_name = str(_entry.get("name", _entry.get("tier", BASELINE_TIER)))
+            break
     protocol_match = _protocol_matches(hgb)
     # The baseline's own pooled row count, when S3's artifact carries one:
     # the two sides have to be scored on the same rows for the comparison
@@ -274,7 +286,7 @@ def _comparison_block(
             "source_sha256": _sha256_file(hgb_path),
             "protocol": PROTOCOL,
             "protocol_match": protocol_match,
-            "baseline_tier": BASELINE_TIER,
+            "baseline_tier": _baseline_name,
             "baseline_full_grid_rmsle": None,
             "best_deep_tier": best_name,
             "best_deep_full_grid_rmsle": float(best_pooled["rmsle"]),
