@@ -1,0 +1,55 @@
+name: Package branch
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch to package
+        required: true
+        default: main
+      notes:
+        description: Release notes
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.branch }}
+
+      - name: Build the zip
+        id: pkg
+        env:
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          SAFE=$(printf '%s' "$BRANCH" | tr '/' '-' | tr -cd '[:alnum:]._-' )
+          TAG="package-${SAFE}-${GITHUB_RUN_NUMBER}"
+          ZIP="${TAG}.zip"
+          git archive --format=zip --prefix="${GITHUB_REPOSITORY#*/}/" -o "$ZIP" HEAD
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+
+      - name: Write the release notes verbatim
+        if: inputs.notes != ''
+        env:
+          NOTES: ${{ inputs.notes }}
+        run: printf '%s' "$NOTES" > notes.md
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.pkg.outputs.tag }}
+          ZIP: ${{ steps.pkg.outputs.zip }}
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          if [ -s notes.md ]; then
+            gh release create "$TAG" "$ZIP" --title "$BRANCH" --notes-file notes.md
+          else
+            gh release create "$TAG" "$ZIP" --title "$BRANCH" --generate-notes
+          fi
