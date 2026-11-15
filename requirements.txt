@@ -26,6 +26,8 @@ click==8.5.0
     #   uvicorn
 cloudpickle==3.1.2
     # via joblib
+colorama==0.4.6 ; sys_platform == 'win32'
+    # via tqdm
 contourpy==1.4.0
     # via matplotlib
 cuda-bindings==13.5.0 ; sys_platform == 'linux'
@@ -246,7 +248,11 @@ termcolor==3.3.0
     # via tensorflow
 threadpoolctl==3.8.0
     # via scikit-learn
-torch==2.15.0
+torch==2.15.0 ; sys_platform != 'linux' and sys_platform != 'win32'
+    # via demand-forecasting-lstm
+torch==2.15.0+cu132 ; sys_platform == 'linux' or sys_platform == 'win32'
+    # via demand-forecasting-lstm
+tqdm==4.70.1
     # via demand-forecasting-lstm
 triton==3.9.0 ; sys_platform == 'linux'
     # via torch
