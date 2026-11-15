@@ -1,0 +1,79 @@
+{
+  "version": "1.0.0",
+  "updated_at": "2026-11-12T00:00:00Z",
+  "dataset_summary": {
+    "total_rows": 3008016,
+    "n_stores": 54,
+    "n_families": 33,
+    "date_range": ["2013-01-01", "2017-08-15"],
+    "zero_sales_pct": 35.2,
+    "zero_sales_pct_full_grid": 31.5
+  },
+  "insights": [
+    {
+      "id": "INSIGHT-01",
+      "category": "Trend",
+      "title": "Macro Unit Volume Expansion",
+      "finding": "Total units sold expanded from [FIG01_2013_UNITS]M in 2013 to [FIG01_2015_UNITS]M in 2015, alongside a contraction in zero-sales rows.",
+      "implication": "Global trend features must be included to capture baseline expansion separate from seasonality.",
+      "associated_figure": "reports/figures/fig01_annual_trend_zero_share.png"
+    },
+    {
+      "id": "INSIGHT-02",
+      "category": "Seasonality",
+      "title": "Day-of-Week Weekend Surges",
+      "finding": "Retail patterns are weekend-heavy, with Store Type A demonstrating a Saturday index of 128.0.",
+      "implication": "Models must utilize robust day-of-week embeddings to capture intra-week cyclicality.",
+      "associated_figure": "reports/figures/fig02_weekly_seasonality_dow.png"
+    },
+    {
+      "id": "INSIGHT-03",
+      "category": "Seasonality",
+      "title": "Bi-Monthly Quincena (Payday) Spikes",
+      "finding": "Public sector payrolls drive mid-month (Index: 97.6) and month-end (Index: 103.2) demand spikes, which spill heavily into the 1st of the next month (Index: 111.7).",
+      "implication": "Day-of-month embeddings or explicit payday boolean flags are critical for peak prediction.",
+      "associated_figure": "reports/figures/fig03_payday_seasonality_bimonthly.png"
+    },
+    {
+      "id": "INSIGHT-04",
+      "category": "Shock",
+      "title": "2016 Manabí Earthquake Reallocation",
+      "finding": "Post-earthquake, emergency staples surged by +118.2% over pre-quake baselines.",
+      "implication": "The 30-day linear earthquake_decay feature is essential to prevent models from learning the shock as permanent seasonality.",
+      "associated_figure": "reports/figures/fig04_earthquake_impact_decay.png"
+    },
+    {
+      "id": "INSIGHT-05",
+      "category": "Seasonality",
+      "title": "Holiday Lead Anticipation",
+      "finding": "The day preceding a holiday (is_holiday_tomorrow) generates an average volume uplift of +5.11%.",
+      "implication": "Future-looking calendar flags are required to capture anticipation buying prior to event-day store closures.",
+      "associated_figure": "reports/figures/fig05_holiday_lead_anticipation.png"
+    },
+    {
+      "id": "INSIGHT-06",
+      "category": "Sparsity",
+      "title": "Store 52 Pre-Opening Anomaly",
+      "finding": "Store 52 contributes 51,810 structural grid zeros before opening on 2017-04-20.",
+      "implication": "Pre-opening zeros must be masked during training loss calculation to prevent suppressing baseline forecasts.",
+      "associated_figure": "reports/figures/fig06_store52_pre_opening_timeline.png"
+    },
+    {
+      "id": "INSIGHT-07",
+      "category": "Sparsity",
+      "title": "Product Family Pareto Concentration",
+      "finding": "The top 3 categories account for 62.43% of total volume, with extreme sparsity in the long tail.",
+      "implication": "Loss functions should be resilient to zero-inflation (e.g., RMSLE or Tweedie) rather than standard MSE.",
+      "associated_figure": "reports/figures/fig07_family_volume_dispersion.png"
+    },
+    {
+      "id": "INSIGHT-08",
+      "category": "Trend",
+      "title": "Geographic Volume Distribution",
+      "finding": "Store Cluster 5 moves 8.82x more volume than Cluster 7.",
+      "implication": "Hierarchical modeling or cluster-level embeddings are needed to scale predictions across varying geographic baselines.",
+      "associated_figure": "reports/figures/fig08_cluster_geographic_sales.png"
+    }
+  ]
+}
+

@@ -5,6 +5,7 @@ __pycache__/
 .python-version
 .ruff_cache/
 /splits/
+/reports/figures/
 
 # artifacts/ holds generated output: deep-learning checkpoints, temp files
 # and the per-invocation run manifest. Only the pinned registry files are
