@@ -19,23 +19,34 @@ COLORS = {
 }
 
 
-def evaluate(predictions: np.ndarray, actuals: np.ndarray) -> tuple[float, float]:
-    """Compute the mean absolute error (MAE) and root mean squared error (RMSE).
+def evaluate(
+    predictions: np.ndarray, actuals: np.ndarray
+) -> tuple[float, float, float]:
+    """Compute the MAE, RMSE, and RMSLE of raw-unit demand predictions.
 
-    The app passes sales after invert_sales, so both numbers are in item
+    The app passes sales after invert_sales, so MAE and RMSE are in item
     units for the selected store and family. RMSE squares the residuals
-    before averaging, so a large miss raises RMSE more than MAE. The final
-    square root keeps RMSE in those units.
+    before averaging, so a large miss raises RMSE more than MAE, and the
+    final square root keeps RMSE in those units. RMSLE compares log1p
+    values instead, so it scores relative misses: the same percentage
+    miss costs the same on a small day and a big day, and it is not
+    dominated by the largest sales days. Its unit is log-space, so the
+    number is not comparable to item-unit errors. The models can emit
+    small negative predictions while actual sales are never negative, so
+    predictions are clipped at zero before the log.
     """
     mae = np.mean(np.abs(predictions - actuals))
     rmse = np.sqrt(np.mean((predictions - actuals) ** 2))
-    return float(mae), float(rmse)
+    log_pred = np.log1p(np.clip(predictions, 0.0, None))
+    log_actual = np.log1p(actuals)
+    rmsle = np.sqrt(np.mean((log_pred - log_actual) ** 2))
+    return float(mae), float(rmse), float(rmsle)
 
 
-def print_summary(metrics: dict[str, tuple[float, float]]) -> None:
+def print_summary(metrics: dict[str, tuple[float, float, float]]) -> None:
     print("\n=== Summary (lower is better) ===")
-    for name, (mae, rmse) in metrics.items():
-        print(f"{name:>7}:  MAE {mae:8.2f}   RMSE {rmse:8.2f}")
+    for name, (mae, rmse, rmsle) in metrics.items():
+        print(f"{name:>7}:  MAE {mae:8.2f}   RMSE {rmse:8.2f}   RMSLE {rmsle:8.2f}")
 
 
 def slugify(text: str) -> str:
@@ -115,7 +126,7 @@ def plot_predictions(
 
 
 def plot_errors(
-    metrics: dict[str, tuple[float, float]],
+    metrics: dict[str, tuple[float, float, float]],
     store: int,
     family: str,
     out_dir: Path = FIGURES_DIR,
@@ -124,12 +135,14 @@ def plot_errors(
     models = list(metrics)
     mae_values = [metrics[m][0] for m in models]
     rmse_values = [metrics[m][1] for m in models]
+    rmsle_values = [metrics[m][2] for m in models]
 
     x = np.arange(len(models))
-    width = 0.35
+    width = 0.25
     plt.figure(figsize=(10, 5))
-    plt.bar(x - width / 2, mae_values, width, label="MAE", color="skyblue")
-    plt.bar(x + width / 2, rmse_values, width, label="RMSE", color="salmon")
+    plt.bar(x - width, mae_values, width, label="MAE", color="skyblue")
+    plt.bar(x, rmse_values, width, label="RMSE", color="salmon")
+    plt.bar(x + width, rmsle_values, width, label="RMSLE", color="lightgreen")
     plt.title(f"Error Metrics, store {store} / {family}")
     plt.xlabel("Forecasting Models")
     plt.ylabel("Error Value (Lower is Better)")
