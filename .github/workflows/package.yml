@@ -22,6 +22,8 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ inputs.branch }}
+          # Full history, so the notes can list every commit on the branch.
+          fetch-depth: 0
 
       - name: Build the zip
         id: pkg
@@ -36,10 +38,14 @@ jobs:
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
 
       - name: Write the release notes
-        if: inputs.notes != ''
         env:
           NOTES: ${{ inputs.notes }}
-        run: printf '%s' "$NOTES" > notes.md
+        run: |
+          if [ -n "$NOTES" ]; then
+            printf '%s' "$NOTES" > notes.md
+          else
+            git log --pretty=format:'- %h %s' HEAD > notes.md
+          fi
 
       - name: Create the release
         env:
@@ -48,8 +54,7 @@ jobs:
           ZIP: ${{ steps.pkg.outputs.zip }}
           BRANCH: ${{ inputs.branch }}
         run: |
-          if [ -s notes.md ]; then
-            gh release create "$TAG" "$ZIP" --title "$BRANCH" --notes-file notes.md
-          else
-            gh release create "$TAG" "$ZIP" --title "$BRANCH" --generate-notes
-          fi
+          gh release create "$TAG" "$ZIP" \
+            --title "$BRANCH" \
+            --notes-file notes.md \
+            --target "$(git rev-parse HEAD)"
