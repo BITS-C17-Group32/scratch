@@ -35,7 +35,7 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
 
-      - name: Write the release notes verbatim
+      - name: Write the release notes
         if: inputs.notes != ''
         env:
           NOTES: ${{ inputs.notes }}
